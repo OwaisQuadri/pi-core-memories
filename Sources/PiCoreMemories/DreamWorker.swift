@@ -1,0 +1,570 @@
+import CoreMemories
+import Darwin
+import Foundation
+
+enum WorkerError: Error, Equatable {
+  case protocolFailure, cancelled, modelFailure
+}
+
+enum WorkerJSON {
+  static func object(_ data: Data) throws -> [String: Any] {
+    guard String(data: data, encoding: .utf8) != nil else { throw WorkerError.protocolFailure }
+    var scanner = Scanner(bytes: Array(data))
+    try scanner.value(depth: 0)
+    scanner.space()
+    guard scanner.index == scanner.bytes.count,
+      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { throw WorkerError.protocolFailure }
+    return object
+  }
+
+  private struct Scanner {
+    let bytes: [UInt8]
+    var index = 0
+
+    mutating func space() {
+      while index < bytes.count && [9, 10, 13, 32].contains(bytes[index]) { index += 1 }
+    }
+
+    mutating func take(_ byte: UInt8) throws {
+      space()
+      guard index < bytes.count, bytes[index] == byte else { throw WorkerError.protocolFailure }
+      index += 1
+    }
+
+    mutating func string() throws -> String {
+      space()
+      let start = index
+      try take(34)
+      while index < bytes.count {
+        let byte = bytes[index]
+        index += 1
+        if byte == 92 {
+          guard index < bytes.count else { throw WorkerError.protocolFailure }
+          index += 1
+        } else if byte == 34 {
+          guard
+            let text = try JSONSerialization.jsonObject(
+              with: Data(bytes[start..<index]), options: [.fragmentsAllowed]) as? String
+          else { throw WorkerError.protocolFailure }
+          return text
+        }
+      }
+      throw WorkerError.protocolFailure
+    }
+
+    mutating func value(depth: Int) throws {
+      space()
+      guard depth < 32, index < bytes.count else { throw WorkerError.protocolFailure }
+      switch bytes[index] {
+      case 123:
+        index += 1
+        space()
+        if index < bytes.count, bytes[index] == 125 {
+          index += 1
+          return
+        }
+        var keys: Set<String> = []
+        while true {
+          let key = try string()
+          guard keys.insert(key).inserted else { throw WorkerError.protocolFailure }
+          try take(58)
+          try value(depth: depth + 1)
+          space()
+          guard index < bytes.count else { throw WorkerError.protocolFailure }
+          if bytes[index] == 125 {
+            index += 1
+            return
+          }
+          try take(44)
+        }
+      case 91:
+        index += 1
+        space()
+        if index < bytes.count, bytes[index] == 93 {
+          index += 1
+          return
+        }
+        while true {
+          try value(depth: depth + 1)
+          space()
+          guard index < bytes.count else { throw WorkerError.protocolFailure }
+          if bytes[index] == 93 {
+            index += 1
+            return
+          }
+          try take(44)
+        }
+      case 34:
+        _ = try string()
+      default:
+        let start = index
+        while index < bytes.count && ![9, 10, 13, 32, 44, 93, 125].contains(bytes[index]) {
+          index += 1
+        }
+        guard index > start else { throw WorkerError.protocolFailure }
+        _ = try JSONSerialization.jsonObject(
+          with: Data(bytes[start..<index]), options: [.fragmentsAllowed])
+      }
+    }
+  }
+
+  static func fields(_ object: [String: Any], _ keys: Set<String>) throws {
+    guard Set(object.keys) == keys else { throw WorkerError.protocolFailure }
+  }
+
+  static func text(_ object: [String: Any], _ key: String, maximum: Int = 4096) throws -> String {
+    guard let text = object[key] as? String, text.utf8.count <= maximum,
+      !text.contains("\0")
+    else { throw WorkerError.protocolFailure }
+    return text
+  }
+
+  static func identifier(_ object: [String: Any], _ key: String) throws -> String {
+    let text = try text(object, key, maximum: 256)
+    guard !text.isEmpty,
+      text.utf8.allSatisfy({
+        (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)
+          || [45, 46, 58, 95].contains($0)
+      })
+    else { throw WorkerError.protocolFailure }
+    return text
+  }
+
+  static func header(_ object: [String: Any]) throws -> String {
+    guard let version = object["version"] as? NSNumber,
+      CFGetTypeID(version) != CFBooleanGetTypeID(), version.stringValue == "1"
+    else { throw WorkerError.protocolFailure }
+    return try text(object, "type", maximum: 32)
+  }
+}
+
+private struct WorkerStart {
+  let invocationID: String
+  let state: URL
+  let sessions: URL
+  let memory: URL
+  let snippets: URL?
+  let prompts: URL?
+  let globalAgents: URL?
+  let selection: DreamSelectedCall
+  let resume: DreamResumeAction
+  let batchTextBytes: Int
+
+  init(_ object: [String: Any]) throws {
+    try WorkerJSON.fields(
+      object,
+      ["version", "type", "invocationID", "roots", "selection", "resume", "batchTextBytes"])
+    guard let budget = object["batchTextBytes"] as? Int, !(object["batchTextBytes"] is Bool),
+      (65_536...1_048_576).contains(budget)
+    else { throw WorkerError.protocolFailure }
+    batchTextBytes = budget
+    guard try WorkerJSON.header(object) == "start",
+      let roots = object["roots"] as? [String: Any],
+      let selected = object["selection"] as? [String: Any]
+    else { throw WorkerError.protocolFailure }
+    try WorkerJSON.fields(
+      roots, ["state", "sessions", "memory", "snippets", "prompts", "globalAgents"])
+    try WorkerJSON.fields(selected, ["provider", "modelID", "thinkingLevel"])
+    invocationID = try WorkerJSON.identifier(object, "invocationID")
+    func root(_ key: String) throws -> URL {
+      let path = try WorkerJSON.text(roots, key)
+      guard path.hasPrefix("/") else { throw WorkerError.protocolFailure }
+      return URL(fileURLWithPath: path)
+    }
+    state = try root("state")
+    sessions = try root("sessions")
+    memory = try root("memory")
+    snippets = roots["snippets"] is NSNull ? nil : try root("snippets")
+    prompts = roots["prompts"] is NSNull ? nil : try root("prompts")
+    globalAgents = roots["globalAgents"] is NSNull ? nil : try root("globalAgents")
+    selection = try DreamSelectedCall(
+      provider: WorkerJSON.text(selected, "provider", maximum: 256),
+      modelID: WorkerJSON.text(selected, "modelID", maximum: 256),
+      thinkingLevel: WorkerJSON.text(selected, "thinkingLevel", maximum: 256))
+    switch try WorkerJSON.text(object, "resume", maximum: 32) {
+    case "inspectOrContinue": resume = .inspectOrContinue
+    case "retryInterruptedCall": resume = .retryInterruptedCall
+    case "replaceInvalidResponse": resume = .replaceInvalidResponse
+    default: throw WorkerError.protocolFailure
+    }
+  }
+}
+
+private final class WorkerInput: @unchecked Sendable {
+  static let maximumStartBytes = 65_536
+  static let maximumReplyBytes = 262_144 * 6 + 8192
+  static let maximumAggregateBytes = maximumStartBytes + maximumReplyBytes + 2048
+  private let condition = NSCondition()
+  private var start: WorkerStart?
+  private var request: DreamModelRequest?
+  private var reply: String?
+  private var failure: WorkerError?
+  private var isStopped = false
+  private var isCancelledFlag = false
+  private var isCancelReceived = false
+  private var isReplyReceived = false
+
+  func launch() {
+    Thread.detachNewThread { self.read() }
+  }
+
+  var isCancelled: Bool {
+    condition.lock()
+    defer { condition.unlock() }
+    var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+    let available = Darwin.poll(&descriptor, 1, 0)
+    return isCancelledFlag || failure != nil
+      || (start != nil && available > 0 && descriptor.revents != 0)
+  }
+
+  var isProtocolFailure: Bool {
+    condition.lock()
+    defer { condition.unlock() }
+    if case .protocolFailure? = failure { return true }
+    return false
+  }
+
+  func awaitStart() throws -> WorkerStart {
+    condition.lock()
+    defer { condition.unlock() }
+    while start == nil && failure == nil && !isStopped { condition.wait() }
+    guard let start else { throw failure ?? WorkerError.protocolFailure }
+    return start
+  }
+
+  func expect(_ request: DreamModelRequest) throws {
+    condition.lock()
+    defer { condition.unlock() }
+    guard self.request == nil, !isCancelledFlag, failure == nil else {
+      throw failure ?? WorkerError.cancelled
+    }
+    self.request = request
+  }
+
+  func awaitReply() throws -> DreamCompletedResponse {
+    condition.lock()
+    defer { condition.unlock() }
+    while reply == nil && failure == nil && !isCancelledFlag { condition.wait() }
+    guard failure == nil, !isCancelledFlag, let reply else {
+      throw failure ?? WorkerError.cancelled
+    }
+    return try DreamCompletedResponse(text: reply)
+  }
+
+  private func consume(_ bytes: Data) throws {
+    let object = try WorkerJSON.object(bytes)
+    let type = try WorkerJSON.header(object)
+    guard failure == nil else { throw WorkerError.protocolFailure }
+    if start == nil {
+      guard bytes.count <= Self.maximumStartBytes else { throw WorkerError.protocolFailure }
+      start = try WorkerStart(object)
+      return
+    }
+    guard let start,
+      try WorkerJSON.identifier(object, "invocationID") == start.invocationID
+    else { throw WorkerError.protocolFailure }
+    if type == "cancel" {
+      try WorkerJSON.fields(object, ["version", "type", "invocationID"])
+      guard !isCancelReceived else { throw WorkerError.protocolFailure }
+      isCancelReceived = true
+      isCancelledFlag = true
+      return
+    }
+    guard let request, !isReplyReceived, !isCancelReceived,
+      type == "modelResponse" || type == "modelFailure"
+    else { throw WorkerError.protocolFailure }
+    try WorkerJSON.fields(
+      object,
+      [
+        "version", "type", "invocationID", "requestID", "runID", "inputHash", "contextHash",
+        "requestHash",
+        type == "modelResponse" ? "text" : "category",
+      ])
+    for (key, expected) in [
+      ("requestID", request.runID + ":" + request.requestHash.rawValue),
+      ("runID", request.runID), ("inputHash", request.inputHash.rawValue),
+      ("contextHash", request.contextHash.rawValue), ("requestHash", request.requestHash.rawValue),
+    ] {
+      guard try WorkerJSON.identifier(object, key) == expected else {
+        throw WorkerError.protocolFailure
+      }
+    }
+    isReplyReceived = true
+    if type == "modelResponse" {
+      guard let text = object["text"] as? String, !text.isEmpty,
+        text.utf8.count <= 262_144
+      else { throw WorkerError.protocolFailure }
+      reply = text
+    } else {
+      let category = try WorkerJSON.text(object, "category", maximum: 16)
+      guard ["failed", "cancelled", "incomplete"].contains(category) else {
+        throw WorkerError.protocolFailure
+      }
+      failure = category == "cancelled" ? .cancelled : .modelFailure
+      if category == "cancelled" { isCancelledFlag = true }
+    }
+  }
+
+  private func isInputFinished(buffer: inout [UInt8], frame: inout Data, total: inout Int) throws
+    -> Bool
+  {
+    condition.lock()
+    var isValid = false
+    defer {
+      if !isValid {
+        failure = .protocolFailure
+        isCancelledFlag = true
+      }
+      condition.broadcast()
+      condition.unlock()
+    }
+    let count = Darwin.read(STDIN_FILENO, &buffer, buffer.count)
+    if count < 0 {
+      if errno == EINTR {
+        isValid = true
+        return false
+      }
+      throw WorkerError.protocolFailure
+    }
+    if count == 0 {
+      isCancelledFlag = true
+      isStopped = true
+      if !frame.isEmpty || start == nil { failure = .protocolFailure }
+      isValid = true
+      return true
+    }
+    guard total <= Self.maximumAggregateBytes - count else { throw WorkerError.protocolFailure }
+    total += count
+    for byte in buffer.prefix(count) {
+      if byte == 10 {
+        try consume(frame)
+        frame.removeAll(keepingCapacity: true)
+      } else {
+        if start != nil && (request == nil || isReplyReceived) { isCancelledFlag = true }
+        let maximum = start == nil ? Self.maximumStartBytes : Self.maximumReplyBytes
+        guard frame.count < maximum else { throw WorkerError.protocolFailure }
+        frame.append(byte)
+      }
+    }
+    isValid = true
+    return false
+  }
+
+  private func read() {
+    var frame = Data()
+    var total = 0
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    do {
+      while true {
+        var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        let ready = Darwin.poll(&descriptor, 1, -1)
+        if ready < 0 && errno == EINTR { continue }
+        guard ready > 0 else { throw WorkerError.protocolFailure }
+        let isFinished = try isInputFinished(buffer: &buffer, frame: &frame, total: &total)
+        if isFinished { return }
+      }
+    } catch {
+      condition.lock()
+      failure = .protocolFailure
+      isCancelledFlag = true
+      isStopped = true
+      condition.broadcast()
+      condition.unlock()
+    }
+  }
+}
+
+private enum WorkerOutput {
+  static func emit(_ object: [String: Any], maximum: Int) throws {
+    let bytes = try JSONSerialization.data(
+      withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+    guard bytes.count <= maximum else { throw WorkerError.protocolFailure }
+    try FileHandle.standardOutput.write(contentsOf: bytes + Data([10]))
+  }
+
+  static func selection(_ selection: DreamSelectedCall) -> [String: Any] {
+    [
+      "provider": selection.provider, "modelID": selection.modelID,
+      "thinkingLevel": selection.thinkingLevel,
+    ]
+  }
+
+  static func sources(_ sources: [PrimaryTextID]) -> [[String: Any]] {
+    sources.map {
+      [
+        "sessionID": $0.citation.session, "entryID": $0.citation.entry,
+        "partIndex": $0.part,
+      ]
+    }
+  }
+
+  static func proposals(_ proposals: [DreamProposalReceipt]) -> [[String: Any]] {
+    proposals.map {
+      [
+        "ref": $0.ref, "commit": $0.commit, "base": $0.base, "path": $0.path,
+        "sources": sources($0.sources), "contradictions": $0.contradictions,
+      ]
+    }
+  }
+
+  static func final(
+    _ invocationID: String, _ result: DreamTransactionResult?, reason: String? = nil,
+    detail: String? = nil, isBusy: Bool = false, isProtocolFailure: Bool = false
+  ) throws {
+    var object: [String: Any] = [
+      "version": 1, "type": "final", "invocationID": invocationID,
+      "status": isBusy ? "busy" : "blocked", "generation": "0", "runID": NSNull(),
+      "base": NSNull(), "proposals": [], "notes": [], "isBacklog": false,
+      "isRecovered": false, "reason": reason as Any? ?? NSNull(),
+      "detail": detail.map {
+        String(
+          decoding: $0.replacingOccurrences(of: "\0", with: "\\u{0}").utf8.prefix(1020),
+          as: UTF8.self)
+      } as Any? ?? NSNull(),
+      "unfinishedTails": 0,
+    ]
+    if let result {
+      switch result {
+      case .completed(let report):
+        object["status"] = "completed"
+        object["generation"] = String(report.generation)
+        object["runID"] = report.runID
+        object["base"] = report.approvedBase
+        object["proposals"] = proposals(report.proposals)
+        object["notes"] = report.notes.map { note -> [String: Any] in
+          [
+            "kind": note.kind, "sources": sources(note.sources), "explanation": note.explanation,
+            "reasonCode": note.reasonCode as Any? ?? NSNull(),
+            "ownerReference": note.ownerReference as Any? ?? NSNull(),
+            "contradictions": note.contradictions,
+          ]
+        }
+        object["isBacklog"] = report.isBacklog
+        object["isRecovered"] = report.isRecovered
+      case .pending(let report):
+        object["status"] = isProtocolFailure ? "blocked" : "pending"
+        object["generation"] = String(report.generation)
+        object["runID"] = report.runID
+        object["base"] = report.approvedBase
+        object["proposals"] = proposals(report.proposals)
+        object["reason"] = isProtocolFailure ? "protocolFailure" : report.reason.rawValue
+        if !isProtocolFailure, let error = report.validationError {
+          object["detail"] = String(describing: error)
+        }
+      case .noNewRecords(let generation, let tails):
+        object["status"] = "noNewRecords"
+        object["generation"] = String(generation)
+        object["unfinishedTails"] = tails.count
+      }
+    }
+    try emit(object, maximum: 32 * 1_048_576 * 6 + 65_536)
+  }
+}
+
+func executeDreamWorker(arguments: [String]) -> Int32 {
+  signal(SIGPIPE, SIG_IGN)
+  let input = WorkerInput()
+  input.launch()
+  var invocationID: String?
+  var isFinalAttempted = false
+  do {
+    guard arguments == ["dream-worker"] else { throw WorkerError.protocolFailure }
+    let start = try input.awaitStart()
+    invocationID = start.invocationID
+    guard !input.isCancelled else { throw WorkerError.cancelled }
+    let store = try DreamRunStore(
+      stateRoot: start.state, sessionsRoot: start.sessions, memoryRepository: start.memory,
+      strippingRoots: [start.snippets, start.prompts].compactMap { $0 },
+      globalAgents: start.globalAgents, isCancelled: { input.isCancelled })
+    var coverageFrame: [String: Any]?
+    var backlog: DreamBacklog?
+    let result = try store.run(
+      selection: start.selection, resume: start.resume,
+      prepare: { progress in
+        guard !input.isCancelled else { throw WorkerError.cancelled }
+        let sources = store.acceptedSources
+        var index = 0
+        let snippets: URL?
+        if start.snippets != nil {
+          snippets = sources.stripping[index]
+          index += 1
+        } else {
+          snippets = nil
+        }
+        let prompts = start.prompts == nil ? nil : sources.stripping[index]
+        return try SessionReader(sessions: sources.sessions, snippets: snippets, prompts: prompts)
+          .prepare(
+            progress: progress, limits: DreamInputLimits(maximumBatchBytes: start.batchTextBytes),
+            backlog: { backlog = $0 }, isCancelled: { input.isCancelled })
+      },
+      call: { request in
+        try input.expect(request)
+        try WorkerOutput.emit(
+          [
+            "version": 1, "type": "modelRequest", "invocationID": start.invocationID,
+            "requestID": request.runID + ":" + request.requestHash.rawValue,
+            "runID": request.runID, "generation": String(request.generation),
+            "inputHash": request.inputHash.rawValue, "contextHash": request.contextHash.rawValue,
+            "requestHash": request.requestHash.rawValue,
+            "selection": WorkerOutput.selection(request.selection),
+            "systemPrompt": request.systemPrompt,
+            "messages": request.messages.map {
+              [
+                "role": $0.role.rawValue, "text": $0.text,
+                "timestampMilliseconds": $0.timestampMilliseconds,
+              ] as [String: Any]
+            },
+          ], maximum: 32 * 1_048_576 * 6 + 65_536)
+        do {
+          return try input.awaitReply()
+        } catch WorkerError.cancelled {
+          throw CancellationError()
+        }
+      }, observe: { progress, batch, isRepeated, estimate in
+        let frame: [String: Any] = [
+          "version": 1, "type": "progress", "invocationID": start.invocationID,
+          "backlogBytes": backlog.map { $0.backlogBytes as Any } ?? NSNull(),
+          "backlogLimitBytes": backlog.map { _ in SessionReader.dreamBacklogBytes as Any } ?? NSNull(),
+          "undreamtBytes": backlog.map { $0.undreamtBytes as Any } ?? NSNull(),
+          "nextBytes": backlog.map { $0.nextBytes as Any } ?? NSNull(),
+          "plannedBytes": batch.keptBytes, "completedBytes": 0,
+          "repeatedRecords": isRepeated ? batch.exactSourceRecords.filter {
+            if case .primaryEvidence = $0.disposition { return true }
+            return false
+          }.count : 0,
+          "estimateSeconds": estimate.map { $0 as Any } ?? NSNull(),
+        ]
+        coverageFrame = frame
+        try WorkerOutput.emit(frame, maximum: 8192)
+      })
+    if var frame = coverageFrame, case .completed = result {
+      frame["completedBytes"] = frame["plannedBytes"]
+      try WorkerOutput.emit(frame, maximum: 8192)
+    }
+    isFinalAttempted = true
+    if case .noNewRecords = result, input.isCancelled {
+      try WorkerOutput.final(
+        start.invocationID, nil,
+        reason: input.isProtocolFailure ? "protocolFailure" : "cancelled")
+    } else {
+      try WorkerOutput.final(start.invocationID, result, isProtocolFailure: input.isProtocolFailure)
+    }
+    return 0
+  } catch {
+    if let invocationID, !isFinalAttempted {
+      do {
+        try WorkerOutput.final(
+          invocationID, nil,
+          reason: input.isProtocolFailure
+            ? "protocolFailure"
+            : ((error as? WorkerError) == .cancelled ? "cancelled" : "workerFailure"),
+          detail: String(describing: error), isBusy: (error as? DreamRunError) == .busy)
+        return 0
+      } catch {}
+    }
+    try? FileHandle.standardError.write(
+      contentsOf: Data("dream-worker: \(String(describing: error).prefix(1024))\n".utf8))
+    return 1
+  }
+}

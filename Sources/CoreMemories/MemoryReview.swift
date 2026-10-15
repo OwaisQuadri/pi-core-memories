@@ -142,6 +142,8 @@ package final class MemoryReviewController {
   package func list() throws -> [MemoryReviewCandidate] {
     try locked {
       try refresh()
+      var currentSnapshot: ApprovedDecisionSnapshot?
+      var frozenSnapshot: ApprovedDecisionSnapshot?
       return try candidates.keys.sorted().map { id in
         let (change, _, limitations) = candidates[id]!
         let disposition = try selection(id)
@@ -151,7 +153,8 @@ package final class MemoryReviewController {
             frozenLimitations: limitations)
         }
         do {
-          _ = try currentTarget(change)
+          _ = try currentTarget(
+            change, currentSnapshot: &currentSnapshot, frozenSnapshot: &frozenSnapshot)
           return MemoryReviewCandidate(
             change: change, disposition: disposition, limitation: nil,
             frozenLimitations: limitations)
@@ -171,7 +174,10 @@ package final class MemoryReviewController {
       guard let (change, admission, _) = candidates[id],
         try selection(id) == .pending || selection(id) == .deferred
       else { throw MemoryError("candidate is not selectable") }
-      let target = try currentTarget(change)
+      var currentSnapshot: ApprovedDecisionSnapshot?
+      var frozenSnapshot: ApprovedDecisionSnapshot?
+      let target = try currentTarget(
+        change, currentSnapshot: &currentSnapshot, frozenSnapshot: &frozenSnapshot)
       let identity = try change.entryID ?? Self.assignedIdentity(id)
       guard
         !target.snapshot.reviewEntries().contains(where: {
@@ -391,13 +397,24 @@ package final class MemoryReviewController {
     try recoverApprovals()
   }
 
-  private func currentTarget(_ change: AtomicMemoryChange) throws -> (
+  private func currentTarget(
+    _ change: AtomicMemoryChange,
+    currentSnapshot: inout ApprovedDecisionSnapshot?,
+    frozenSnapshot: inout ApprovedDecisionSnapshot?
+  ) throws -> (
     snapshot: ApprovedDecisionSnapshot, bytes: Data, range: Range<Int>,
     locator: MemoryDocument.EntryLocator?
   ) {
     let base = try store.approvedCommit()
-    let snapshot = try store.reviewSnapshot(base: base)
-    let frozen = try store.reviewSnapshot(base: change.base)
+    if currentSnapshot?.base != base {
+      currentSnapshot = try store.reviewSnapshot(base: base)
+    }
+    let snapshot = currentSnapshot!
+    if frozenSnapshot?.base != change.base {
+      frozenSnapshot =
+        change.base == base ? snapshot : try store.reviewSnapshot(base: change.base)
+    }
+    let frozen = frozenSnapshot!
     let original = frozen.documents.first(where: { $0.path == change.path })?.bytes
     guard change.documentHash == original.map(SourceDigest.init(bytes:)) else {
       throw MemoryError("frozen target document changed")

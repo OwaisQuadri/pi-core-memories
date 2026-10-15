@@ -506,7 +506,7 @@ func reviewRecoveryRefusesCorruptAuthorityRatherThanTrustOutcome(failure: String
   let preview = try controller!.preview(
     candidateID: id, clockDate: Date(timeIntervalSince1970: 1_783_036_799))
   let approval = try controller!.apply(preview)
-  controller = nil
+  _ = try controller!.list()
   let git = Git(repo: fixture.memory, environment: [:])
   switch failure {
   case "symbolic-audit": _ = try git.data(["symbolic-ref", approval.auditRef, "refs/heads/main"])
@@ -526,6 +526,8 @@ func reviewRecoveryRefusesCorruptAuthorityRatherThanTrustOutcome(failure: String
   }
   let main = try fixture.main()
   let before = try fixture.snapshot(state)
+  #expect(throws: (any Error).self) { try controller!.list() }
+  controller = nil
   #expect(throws: (any Error).self) {
     let reopened = try MemoryReviewController(
       repository: fixture.memory, stateRoot: state, sources: fixture.store(), environment: [:])

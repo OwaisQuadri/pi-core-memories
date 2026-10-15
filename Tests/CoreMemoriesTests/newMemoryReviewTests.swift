@@ -253,3 +253,52 @@ func reviewStateRefusesProtectedOrUnsafeRootsWithoutAdmission(failure: String) t
   #expect(throws: (any Error).self) { try controller.list() }
   #expect(try fixture.snapshot(state) == before)
 }
+
+@Test func reviewListKeepsMixedFrozenBasesAndRechecksMainAfterEarlierList() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: ["Keep A.", "Keep B.", "Keep C.", "Keep D."])
+  let sources = try fixture.store()
+  _ = try transactionCompleted(
+    sources.run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { try transactionAdd($0) }))
+  let controller = try MemoryReviewController(
+    repository: fixture.memory, stateRoot: fixture.root.appendingPathComponent("review"),
+    sources: sources, environment: [:])
+  let original = try controller.list()
+  try controller.reject(candidateID: original[0].change.id)
+  try controller.deferCandidate(candidateID: original[1].change.id)
+  try controller.confirmDetach(controller.checkoutPreview())
+  _ = try controller.apply(
+    controller.preview(
+      candidateID: original[2].change.id, clockDate: Date(timeIntervalSince1970: 1_783_036_799)))
+  try fixture.append(dreamUser("later", nil, dreamOld, "Keep E.") + "\n")
+  _ = try transactionCompleted(
+    sources.run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { try transactionAdd($0) }))
+  let rows = try controller.list()
+  #expect(rows.count == 5)
+  #expect(rows.map(\.change.id.rawValue) == rows.map(\.change.id.rawValue).sorted())
+  #expect(Set(rows.filter { $0.disposition == .pending }.map(\.change.base)).count == 2)
+  for (index, disposition) in [
+    MemoryReviewDisposition.rejected, .deferred, .approved, .pending,
+  ].enumerated() {
+    let row = rows.first { $0.change.id == original[index].change.id }!
+    #expect(row.disposition == disposition)
+    #expect(row.change.documentHash == original[index].change.documentHash)
+  }
+  let git = Git(repo: fixture.memory, environment: [:])
+  let base = try fixture.main()
+  let tree = try git.text(["rev-parse", "\(base)^{tree}"])
+  let next = try git.text(
+    ["commit-tree", tree, "-p", base], input: Data("Synthetic external advance\n".utf8),
+    additions: Git.proposalIdentity)
+  _ = try git.data(["update-ref", "refs/heads/main", next, base])
+  let changed = try controller.list()
+  #expect(changed.map(\.change.id) == rows.map(\.change.id))
+  #expect(changed.filter { $0.disposition == .blocked }.count == 3)
+  #expect(changed.filter { $0.disposition == .approved }.count == 1)
+  #expect(changed.filter { $0.disposition == .rejected }.count == 1)
+}

@@ -5,6 +5,36 @@ import XCTest
 
 @testable import CoreMemories
 
+@Test func dreamRunDecodePreservesNoncanonicalHistoryAndRejectsUnknownFields() throws {
+  let value = DreamRunEncoding.State(
+    schemaVersion: 2, generation: 7, generationHash: "hash/path", admissionHash: nil, runID: nil)
+  let canonical = try DreamRunEncoding.encode(value)
+  let historical = Data(
+    #"{ "generationHash": "hash\/path", "generation": 7, "schemaVersion": 2 }"#.utf8)
+  #expect(canonical != historical)
+  for bytes in [canonical, historical] {
+    let decoded = try DreamRunEncoding.decode(DreamRunEncoding.State.self, bytes: bytes)
+    #expect(try DreamRunEncoding.encode(decoded) == canonical)
+  }
+  for text in [
+    #"{"generation":7,"generationHash":"hash/path","schemaVersion":2,"unknown":0}"#,
+    #"{"generation":7,"generationHash":"hash/path","schemaVersion":2,"runID":null}"#,
+    #"{"generation":"seven","generationHash":"hash/path","schemaVersion":2}"#,
+  ] {
+    #expect(throws: DreamRunError.corruption) {
+      try DreamRunEncoding.decode(DreamRunEncoding.State.self, bytes: Data(text.utf8))
+    }
+  }
+  #expect(throws: DreamRunError.unsupportedSchema) {
+    try DreamRunEncoding.decode(
+      DreamRunEncoding.State.self,
+      bytes: DreamRunEncoding.encode(
+        DreamRunEncoding.State(
+          schemaVersion: 1, generation: 7, generationHash: "hash/path", admissionHash: nil,
+          runID: nil)))
+  }
+}
+
 private func transactionMutate(_ file: URL, _ change: (inout [String: Any]) -> Void) throws {
   var value = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
   change(&value)

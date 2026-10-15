@@ -236,13 +236,22 @@ public struct MemoryStore: Sendable {
   public func decisionSnapshot(
     base: String, projectKeys: [String], limits: DreamDecisionLimits = try! DreamDecisionLimits()
   ) throws -> ApprovedDecisionSnapshot {
+    try decisionSnapshot(
+      base: base, projectKeys: projectKeys, limits: limits, entries: nil, objects: nil)
+  }
+
+  private func decisionSnapshot(
+    base: String, projectKeys: [String], limits: DreamDecisionLimits,
+    entries suppliedEntries: [TreeEntry]?, objects: ReviewGitObjects?
+  ) throws -> ApprovedDecisionSnapshot {
     guard Self.isFullOID(base),
-      try git.text(["rev-parse", "--verify", "\(base)^{commit}"]) == base,
+      try objects.map({ try $0.info(base).type == "commit" })
+        ?? (git.text(["rev-parse", "--verify", "\(base)^{commit}"]) == base),
       Set(projectKeys).count == projectKeys.count,
       projectKeys.allSatisfy({ MemoryDocument.isMatch(#"\A[0-9a-f]{64}\z"#, $0) })
     else { throw DreamDecisionError.context("snapshot identity") }
     try limits.check(projectKeys.count, maximum: limits.maximumProjectKeys)
-    let entries = try treeEntries(base).sorted { $0.path < $1.path }
+    let entries = try (suppliedEntries ?? treeEntries(base)).sorted { $0.path < $1.path }
     try limits.check(entries.count, maximum: limits.maximumLayoutEntries)
     guard entries.contains(where: { $0.path == "MEMORY.md" }),
       entries.allSatisfy({
@@ -254,7 +263,9 @@ public struct MemoryStore: Sendable {
       let tuple = Data("\(entry.path)\0\(entry.mode)\0\(entry.oid)\0".utf8)
       try limits.check(tuple.count, maximum: limits.maximumLayoutBytes - layout.count)
       layout.append(tuple)
-      guard try git.text(["cat-file", "-t", entry.oid]) == "blob" else {
+      guard
+        try (objects?.info(entry.oid).type ?? git.text(["cat-file", "-t", entry.oid])) == "blob"
+      else {
         throw DreamDecisionError.context("snapshot object")
       }
     }
@@ -265,12 +276,17 @@ public struct MemoryStore: Sendable {
         return ApprovedDecisionDocument(
           path: path, mode: nil, blob: nil, digest: nil, bytes: nil, diagnostics: [])
       }
-      guard let size = Int(try git.text(["cat-file", "-s", entry.oid])) else {
+      guard
+        let size = try objects?.info(entry.oid).size
+          ?? Int(git.text(["cat-file", "-s", entry.oid]))
+      else {
         throw DreamDecisionError.context("snapshot object size")
       }
       try limits.check(size, maximum: limits.maximumDocumentBytes)
       try limits.accumulate(size, total: &total, maximum: limits.maximumSnapshotBytes)
-      let bytes = try git.data(["cat-file", "blob", entry.oid])
+      let bytes =
+        try objects?.contents(entry.oid, type: "blob", maximumBytes: size)
+        ?? git.data(["cat-file", "blob", entry.oid])
       guard bytes.count == size, let text = String(data: bytes, encoding: .utf8),
         !text.contains("\0")
       else { throw DreamDecisionError.context("snapshot encoding") }
@@ -288,8 +304,16 @@ public struct MemoryStore: Sendable {
   package func reviewSnapshot(
     base: String, limits: DreamDecisionLimits = try! DreamDecisionLimits()
   ) throws -> ApprovedDecisionSnapshot {
+    try reviewSnapshot(base: base, limits: limits, objects: nil)
+  }
+
+  func reviewSnapshot(
+    base: String, limits: DreamDecisionLimits = try! DreamDecisionLimits(),
+    objects: ReviewGitObjects?
+  ) throws -> ApprovedDecisionSnapshot {
     guard Self.isFullOID(base) else { throw DreamDecisionError.context("review snapshot base") }
-    let paths = try treeEntries(base).map(\.path)
+    let entries = try treeEntries(base)
+    let paths = entries.map(\.path)
     guard paths.allSatisfy(MemoryDocument.isAllowedPath) else {
       throw DreamDecisionError.context("review snapshot layout")
     }
@@ -297,7 +321,7 @@ public struct MemoryStore: Sendable {
       base: base,
       projectKeys: paths.filter { $0 != "MEMORY.md" }.map {
         String($0.dropFirst(9).dropLast(3))
-      }, limits: limits)
+      }, limits: limits, entries: entries, objects: objects)
   }
 
   package func verifySavedProposal(

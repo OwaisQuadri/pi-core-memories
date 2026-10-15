@@ -452,8 +452,30 @@ package final class MemoryReviewController {
 
   private func recoverApprovals() throws {
     let git = store.reviewGit
+    let limits = try DreamDecisionLimits()
+    let attempts = try root.names().filter { $0.hasPrefix("attempt-") }
+    let objects = try attempts.isEmpty ? nil : ReviewGitObjects(git: git)
+    defer { objects?.close() }
+    var snapshots: [String: ApprovedDecisionSnapshot] = [:]
+    var retainedBytes = 0
+    func snapshot(_ base: String) throws -> ApprovedDecisionSnapshot {
+      if let value = snapshots[base] { return value }
+      let value = try store.reviewSnapshot(base: base, objects: objects)
+      guard snapshots.count < limits.maximumLayoutEntries else { return value }
+      let available = limits.maximumSnapshotBytes - retainedBytes
+      var size = value.layoutByteCount
+      guard size <= available else { return value }
+      for document in value.documents {
+        let count = document.bytes?.count ?? 0
+        guard count <= available - size else { return value }
+        size += count
+      }
+      snapshots[base] = value
+      retainedBytes += size
+      return value
+    }
     var recovered: [String: ReviewAttempt] = [:]
-    for name in try root.names() where name.hasPrefix("attempt-") {
+    for name in attempts {
       let attempt = try MemoryReviewEncoding.decode(
         ReviewAttempt.self, bytes: root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
       guard attempt.schemaVersion == 1, name == "attempt-\(attempt.previewHash).json",
@@ -463,10 +485,11 @@ package final class MemoryReviewController {
         candidates[attempt.preview.candidateID] != nil,
         Self.isCommitID(attempt.resultCommit), Self.isCommitID(attempt.resultTree)
       else { throw DreamRunError.corruption }
-      guard let actual = try directAudit(attempt.auditRef) else { continue }
+      guard let actual = try directAudit(attempt.auditRef, objects: objects) else { continue }
       guard actual == attempt.resultCommit else { throw DreamRunError.corruption }
-      try validatePayload(attempt.preview)
-      let raw = try git.data(["cat-file", "commit", actual])
+      try validatePayload(attempt.preview, loadSnapshot: snapshot)
+      let raw = try objects!.contents(
+        actual, type: "commit", maximumBytes: MemoryReviewEncoding.maximumStateBytes)
       guard let text = String(data: raw, encoding: .utf8), let separator = text.range(of: "\n\n")
       else {
         throw DreamRunError.corruption
@@ -482,7 +505,7 @@ package final class MemoryReviewController {
         try git.committedChangedPathBytes(from: attempt.preview.currentBase, to: actual)
           == Data((attempt.preview.path + "\0").utf8)
       else { throw DreamRunError.corruption }
-      let result = try store.reviewSnapshot(base: actual)
+      let result = try snapshot(actual)
       guard let document = result.documents.first(where: { $0.path == attempt.preview.path }),
         document.mode == "100644", document.bytes == attempt.preview.replacement,
         result.reviewEntries().filter({ $0.entry.identity == attempt.preview.identity }).count == 1,
@@ -508,7 +531,10 @@ package final class MemoryReviewController {
     try recoverDetach()
   }
 
-  private func validatePayload(_ payload: ReviewPreviewPayload) throws {
+  private func validatePayload(
+    _ payload: ReviewPreviewPayload,
+    loadSnapshot: ((String) throws -> ApprovedDecisionSnapshot)? = nil
+  ) throws {
     guard let (change, admission, _) = candidates[payload.candidateID],
       payload.admissionHash
         == SourceDigest(bytes: try MemoryReviewEncoding.encode(admission)).rawValue,
@@ -519,7 +545,9 @@ package final class MemoryReviewController {
         == MemoryDocument.reviewedBytes(
           change.after, identity: payload.identity, instant: payload.instant)
     else { throw DreamRunError.corruption }
-    let snapshot = try store.reviewSnapshot(base: payload.currentBase)
+    let snapshot =
+      try loadSnapshot?(payload.currentBase)
+      ?? store.reviewSnapshot(base: payload.currentBase)
     let bytes = snapshot.documents.first(where: { $0.path == payload.path })?.bytes ?? Data()
     guard payload.originalDocument == bytes,
       payload.start >= 0, payload.end >= payload.start, payload.end <= bytes.count,
@@ -598,7 +626,7 @@ package final class MemoryReviewController {
     }
   }
 
-  private func directAudit(_ ref: String) throws -> String? {
+  private func directAudit(_ ref: String, objects: ReviewGitObjects? = nil) throws -> String? {
     let git = store.reviewGit
     guard try git.run(["symbolic-ref", "--quiet", ref]).status == 1 else {
       throw DreamRunError.corruption
@@ -607,7 +635,9 @@ package final class MemoryReviewController {
     if result.status == 1 { return nil }
     guard result.status == 0 else { throw DreamRunError.corruption }
     let commit = result.text.trimmingCharacters(in: .newlines)
-    guard Self.isCommitID(commit), try git.text(["cat-file", "-t", commit]) == "commit" else {
+    guard Self.isCommitID(commit),
+      try (objects?.info(commit).type ?? git.text(["cat-file", "-t", commit])) == "commit"
+    else {
       throw DreamRunError.corruption
     }
     return commit

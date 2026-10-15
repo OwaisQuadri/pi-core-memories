@@ -1,7 +1,23 @@
+import CryptoKit
 import Foundation
 import Testing
 
 @testable import CoreMemories
+
+@Test func sourceDigestPreservesLeadingZerosAndLowercaseSHA256Bytes() {
+  #expect(
+    SourceDigest(bytes: Data()).rawValue
+      == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+  #expect(
+    SourceDigest(bytes: Data("abc".utf8)).rawValue
+      == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+  for byte in UInt8.min...UInt8.max {
+    let bytes = Data([byte])
+    let expected = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    #expect(SourceDigest(bytes: bytes).rawValue == expected)
+  }
+  #expect(SessionReader.sha256("café 🐟/\n") == SourceDigest(bytes: Data("café 🐟/\n".utf8)).rawValue)
+}
 
 private struct DreamInputFileState: Equatable {
   let bytes: Data

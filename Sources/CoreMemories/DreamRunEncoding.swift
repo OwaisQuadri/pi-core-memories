@@ -48,8 +48,10 @@ enum DreamRunEncoding {
       let schema = try decoder.decode(Schema.self, from: bytes)
       guard schema.schemaVersion == 2 else { throw DreamRunError.unsupportedSchema }
       let value = try decoder.decode(type, from: bytes)
+      let encoded = try encode(value)
+      if bytes == encoded { return value }
       guard let supplied = try JSONSerialization.jsonObject(with: bytes) as? NSDictionary,
-        let reconstructed = try JSONSerialization.jsonObject(with: encode(value)) as? NSDictionary,
+        let reconstructed = try JSONSerialization.jsonObject(with: encoded) as? NSDictionary,
         supplied == reconstructed
       else { throw DreamRunError.corruption }
       return value

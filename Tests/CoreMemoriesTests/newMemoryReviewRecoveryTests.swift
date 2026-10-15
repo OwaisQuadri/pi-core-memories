@@ -493,6 +493,53 @@ func reviewPrivateWriteFailureDoesNotRejectOrApprove(failure: String) throws {
   #expect(try controller.list().allSatisfy { $0.disposition == .blocked })
 }
 
+@Test(arguments: [false, true])
+func reviewRecoveryValidatesSharedBasesWithAndWithoutSnapshotRetention(isLarge: Bool) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let git = Git(repo: fixture.memory, environment: [:])
+  if isLarge {
+    for index in 0..<3 {
+      let key = SourceDigest(bytes: Data("project-\(index)".utf8)).rawValue
+      try fixture.write(
+        "# " + String(repeating: "x", count: 750_000) + "\n",
+        file: fixture.memory.appendingPathComponent("projects/\(key).md"))
+    }
+    _ = try git.data(["add", "projects"])
+    _ = try git.data(
+      ["commit", "-m", "Synthetic large snapshots"], additions: Git.proposalIdentity)
+  }
+  let sources = try reviewCompletedSiblings(fixture)
+  let state = fixture.root.appendingPathComponent("review")
+  var controller: MemoryReviewController? = try MemoryReviewController(
+    repository: fixture.memory, stateRoot: state, sources: sources, environment: [:])
+  let rows = try controller!.list()
+  #expect(rows.count == 2)
+  try controller!.confirmDetach(controller!.checkoutPreview())
+  var approvals: [MemoryReviewApproval] = []
+  for row in rows {
+    let preview = try controller!.preview(
+      candidateID: row.change.id, clockDate: Date(timeIntervalSince1970: 1_783_036_799))
+    if let previous = approvals.last { #expect(preview.currentBase == previous.commit) }
+    approvals.append(try controller!.apply(preview))
+  }
+  let snapshot = try MemoryStore(repo: fixture.memory, environment: [:]).reviewSnapshot(
+    base: fixture.main())
+  let size = snapshot.layoutByteCount + snapshot.documents.reduce(0) { $0 + ($1.bytes?.count ?? 0) }
+  #expect((size > (try DreamDecisionLimits()).maximumSnapshotBytes / 2) == isLarge)
+  #expect(try controller!.list().map(\.disposition) == [.approved, .approved])
+  controller = nil
+  let reopened = try MemoryReviewController(
+    repository: fixture.memory, stateRoot: state, sources: fixture.store(), environment: [:])
+  #expect(try reopened.list().map(\.disposition) == [.approved, .approved])
+  _ = try git.data(["update-ref", "-d", approvals[0].auditRef])
+  let main = try fixture.main()
+  let before = try fixture.snapshot(state)
+  #expect(throws: (any Error).self) { try reopened.list() }
+  #expect(try fixture.main() == main)
+  #expect(try fixture.snapshot(state) == before)
+}
+
 @Test(arguments: ["symbolic-audit", "missing-audit", "changed-attempt", "hardlink-state"])
 func reviewRecoveryRefusesCorruptAuthorityRatherThanTrustOutcome(failure: String) throws {
   let fixture = try TransactionFixture()

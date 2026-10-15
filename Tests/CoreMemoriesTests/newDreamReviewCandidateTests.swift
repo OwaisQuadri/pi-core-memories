@@ -78,3 +78,32 @@ func completedReviewRefusesChangedAuthorityWithoutWriting(payload: String) throw
   #expect(throws: (any Error).self) { try store.verifiedCompletedReviewCandidates() }
   #expect(try fixture.snapshot(fixture.root) == before)
 }
+
+@Test(arguments: ["input.json", "rejected-1.json"])
+func completedReviewRechecksChangedAuthorityAfterSuccessfulRead(payload: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let store = try fixture.store()
+  _ = try transactionPending(
+    store.run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { _ in try DreamCompletedResponse(text: "Invalid reply") }), reason: .invalidDecision)
+  _ = try transactionCompleted(
+    store.run(
+      selection: fixture.selection, resume: .replaceInvalidResponse,
+      prepare: transactionUncalledPrepare, call: { try transactionAdd($0) }))
+  #expect(try store.verifiedCompletedReviewCandidates().flatMap(\.changes).count == 1)
+  let file = try fixture.payload(payload)
+  let modified =
+    try file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+  var bytes = try Data(contentsOf: file)
+  bytes[bytes.count - 1] = 32
+  try bytes.write(to: file)
+  if let modified {
+    try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: file.path)
+  }
+  let before = try fixture.snapshot(fixture.root)
+  #expect(throws: (any Error).self) { try store.verifiedCompletedReviewCandidates() }
+  #expect(try fixture.snapshot(fixture.root) == before)
+}

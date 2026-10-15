@@ -355,16 +355,7 @@ public struct DreamDecisionContext: Sendable {
 
   fileprivate static func binding(_ run: FrozenDreamRun, limits: DreamDecisionLimits) throws -> Data
   {
-    try DreamRunEncoding.validate(
-      progress: run.progress, batch: run.batch,
-      limits: DreamRunLimits(
-        maximumFrozenBytes: limits.maximumFrozenBytes, maximumPositions: Int.max))
-    return try DreamRunEncoding.input(
-      runID: run.runID,
-      context: DreamRunContext(selection: run.selection, currentApprovedBase: run.approvedBase),
-      bindingHash: SourceDigest(bytes: Data()), progress: run.progress, batch: run.batch,
-      limits: DreamRunLimits(maximumFrozenBytes: Int.max, maximumPositions: Int.max),
-      predecessorProgressHash: run.predecessorProgressHash)
+    try run.decisionBinding(maximumFrozenBytes: limits.maximumFrozenBytes)
   }
 }
 

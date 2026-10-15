@@ -1,5 +1,38 @@
 import Foundation
 
+public struct FrozenDreamRun: Sendable {
+  public let runID: String
+  public let selection: DreamSelectedCall
+  public let approvedBase: String
+  public let inputHash: SourceDigest
+  public let progress: DreamProgress
+  public let batch: PreparedSessionBatch
+  let predecessorProgressHash: SourceDigest?
+  private let validatedByteCount: Int
+  private let bindingBytes: Data
+
+  fileprivate init(
+    runID: String, selection: DreamSelectedCall, approvedBase: String, inputHash: SourceDigest,
+    progress: DreamProgress, batch: PreparedSessionBatch,
+    predecessorProgressHash: SourceDigest?, validatedByteCount: Int, bindingBytes: Data
+  ) {
+    self.runID = runID
+    self.selection = selection
+    self.approvedBase = approvedBase
+    self.inputHash = inputHash
+    self.progress = progress
+    self.batch = batch
+    self.predecessorProgressHash = predecessorProgressHash
+    self.validatedByteCount = validatedByteCount
+    self.bindingBytes = bindingBytes
+  }
+
+  func decisionBinding(maximumFrozenBytes: Int) throws -> Data {
+    guard validatedByteCount <= maximumFrozenBytes else { throw DreamRunError.limitExceeded }
+    return bindingBytes
+  }
+}
+
 enum DreamRunEncoding {
   static let maximumMetadataBytes = 1_048_576
 
@@ -67,17 +100,27 @@ enum DreamRunEncoding {
       else { throw DreamRunError.limitExceeded }
       let progress = try input.progress.domain()
       let batch = try input.batch.domain()
-      try validate(progress: progress, batch: batch, limits: limits)
+      let validatedByteCount = try validate(progress: progress, batch: batch, limits: limits)
+      let predecessorProgressHash = try input.predecessorProgressHash.map(SourceDigest.init)
+      let bindingBytes = try encode(
+        Input(
+          schemaVersion: 2, runID: input.runID,
+          bindingHash: SourceDigest(bytes: Data()).rawValue,
+          selection: Selection(selection), approvedBase: context.currentApprovedBase,
+          progress: Progress(progress), batch: Batch(batch),
+          predecessorProgressHash: predecessorProgressHash?.rawValue))
       return FrozenDreamRun(
         runID: input.runID, selection: selection, approvedBase: context.currentApprovedBase,
         inputHash: hash, progress: progress, batch: batch,
-        predecessorProgressHash: try input.predecessorProgressHash.map(SourceDigest.init))
+        predecessorProgressHash: predecessorProgressHash,
+        validatedByteCount: validatedByteCount, bindingBytes: bindingBytes)
     } catch let error as DreamRunError { throw error } catch { throw DreamRunError.corruption }
   }
 
+  @discardableResult
   static func validate(
     progress: DreamProgress, batch: PreparedSessionBatch, limits: DreamRunLimits
-  ) throws {
+  ) throws -> Int {
     guard batch.predecessorGeneration == progress.generation else {
       throw DreamRunError.staleGeneration
     }
@@ -225,6 +268,7 @@ enum DreamRunEncoding {
         batch.selections.isEmpty, !batch.isBacklog
       else { throw DreamRunError.corruption }
     }
+    return aggregate
   }
 
   private static func validateCitation(_ citation: Citation) throws {

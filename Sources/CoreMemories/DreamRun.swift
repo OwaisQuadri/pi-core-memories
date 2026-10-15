@@ -64,30 +64,6 @@ public struct DreamRunLimits: Sendable {
 
 }
 
-public struct FrozenDreamRun: Sendable {
-  public let runID: String
-  public let selection: DreamSelectedCall
-  public let approvedBase: String
-  public let inputHash: SourceDigest
-  public let progress: DreamProgress
-  public let batch: PreparedSessionBatch
-  let predecessorProgressHash: SourceDigest?
-
-  init(
-    runID: String, selection: DreamSelectedCall, approvedBase: String, inputHash: SourceDigest,
-    progress: DreamProgress, batch: PreparedSessionBatch,
-    predecessorProgressHash: SourceDigest? = nil
-  ) {
-    self.runID = runID
-    self.selection = selection
-    self.approvedBase = approvedBase
-    self.inputHash = inputHash
-    self.progress = progress
-    self.batch = batch
-    self.predecessorProgressHash = predecessorProgressHash
-  }
-}
-
 public struct DreamCompletedResponse: Sendable {
   public let text: String
 
@@ -1245,7 +1221,6 @@ public final class DreamRunStore {
       guard !(try sealed.directory.isPresent("response.json")),
         !(try sealed.directory.isPresent("call-started.json"))
       else { throw DreamRunError.corruption }
-      try DreamRunEncoding.validate(progress: run.progress, batch: run.batch, limits: limits)
       validated = nil
     } else {
       let callSelection = try loadCallSelection(sealed, attempt: attempt)

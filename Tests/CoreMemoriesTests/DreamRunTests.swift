@@ -1121,7 +1121,7 @@ private func transactionWait(_ fixture: TransactionFixture, process: Process) th
     limits: DreamRunLimits())
   for kind in [
     "runID", "binding", "base", "schema", "path", "kind", "date", "tag", "range", "noBytes",
-    "skippedBytes", "spanAtZero",
+    "skippedBytes", "spanAtZero", "noProvenance", "forgedText", "forgedClassification",
   ] {
     var object = try JSONSerialization.jsonObject(with: original) as! [String: Any]
     switch kind {
@@ -1136,14 +1136,21 @@ private func transactionWait(_ fixture: TransactionFixture, process: Process) th
         var positions = batch["positionsAfter"] as! [[String: Any]]
         positions[0]["relativePath"] = "../escape"
         batch["positionsAfter"] = positions
-      case "kind", "date":
+      case "kind", "date", "forgedText":
         var evidence = batch["evidence"] as! [[String: Any]]
         if kind == "kind" {
           evidence[0]["kind"] = "picked"
-        } else {
+        } else if kind == "date" {
           evidence[0]["timestampBits"] = Double.infinity.bitPattern
+        } else {
+          evidence[0]["exactText"] = "Forged primary evidence."
         }
         batch["evidence"] = evidence
+      case "noProvenance": batch["provenance"] = nil
+      case "forgedClassification":
+        var provenance = batch["provenance"] as! [String: Any]
+        provenance["sessions"] = []
+        batch["provenance"] = provenance
       default:
         var records = batch["exactSourceRecords"] as! [[String: Any]]
         if kind == "tag" {
@@ -1286,4 +1293,36 @@ func dreamRunInvalidTimingDoesNotBlockRetryOrRecovery(kind: String) throws {
   let recovered = try fixture.store().run(selection: fixture.selection,
     resume: .retryInterruptedCall, prepare: transactionUncalledPrepare, call: transactionUncalled)
   guard case .completed = recovered else { Issue.record("commit was not durable"); return }
+}
+
+@Test(arguments: [false, true])
+func dreamRunValidatedBindingPreservesCanonicalBytesAndPredecessor(isPredecessorPresent: Bool) throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let progress = try DreamProgress()
+  let batch = try fixture.prepare(progress)
+  let context = try DreamRunContext(
+    selection: fixture.selection, currentApprovedBase: fixture.main())
+  let runID = UUID().uuidString.lowercased()
+  let binding = SourceDigest(bytes: Data("roots".utf8))
+  let predecessor = isPredecessorPresent ? SourceDigest(bytes: Data("predecessor".utf8)) : nil
+  var input = try DreamRunEncoding.input(
+    runID: runID, context: context, bindingHash: binding, progress: progress, batch: batch,
+    limits: DreamRunLimits(), predecessorProgressHash: predecessor)
+  let run = try DreamRunEncoding.frozen(
+    bytes: input, runID: runID, inputHash: SourceDigest(bytes: input), bindingHash: binding,
+    limits: DreamRunLimits())
+  let expected = try DreamRunEncoding.input(
+    runID: runID, context: context, bindingHash: SourceDigest(bytes: Data()),
+    progress: progress, batch: batch,
+    limits: DreamRunLimits(maximumFrozenBytes: Int.max, maximumPositions: Int.max),
+    predecessorProgressHash: predecessor)
+  input[0] = 0
+  var returned = try run.decisionBinding(maximumFrozenBytes: Int.max)
+  #expect(returned == expected)
+  returned[0] = 0
+  #expect(try run.decisionBinding(maximumFrozenBytes: Int.max) == expected)
+  #expect(run.predecessorProgressHash == predecessor)
 }

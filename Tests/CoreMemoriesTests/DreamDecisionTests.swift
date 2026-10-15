@@ -881,10 +881,21 @@ func dreamDecisionNativeBlockRangesKeepOriginalLineEndings(ending: String) throw
     [decisionAdd(context.primaryCatalogue[0].id)], context: context)
   let differentSelection = try DreamSelectedCall(
     provider: "synthetic", modelID: "other", thinkingLevel: "off")
-  let otherRun = FrozenDreamRun(
-    runID: fixture.run.runID, selection: differentSelection,
-    approvedBase: fixture.run.approvedBase, inputHash: fixture.run.inputHash,
-    progress: fixture.run.progress, batch: fixture.run.batch)
+  let bindingHash = SourceDigest(bytes: Data("synthetic".utf8))
+  let changedInput = try DreamRunEncoding.input(
+    runID: fixture.run.runID,
+    context: DreamRunContext(
+      selection: differentSelection, currentApprovedBase: fixture.run.approvedBase),
+    bindingHash: bindingHash, progress: fixture.run.progress, batch: fixture.run.batch,
+    limits: DreamRunLimits())
+  #expect(throws: DreamRunError.corruption) {
+    try DreamRunEncoding.frozen(
+      bytes: changedInput, runID: fixture.run.runID, inputHash: fixture.run.inputHash,
+      bindingHash: bindingHash, limits: DreamRunLimits())
+  }
+  let otherRun = try DreamRunEncoding.frozen(
+    bytes: changedInput, runID: fixture.run.runID, inputHash: SourceDigest(bytes: changedInput),
+    bindingHash: bindingHash, limits: DreamRunLimits())
   let changed = DurableDreamResponse(
     run: otherRun, response: response.response,
     responseHash: response.responseHash, isReplay: true, isBaseCurrent: false)

@@ -299,6 +299,13 @@ public struct SessionReader: Sendable {
     #"<file name="[^"]*">[\s\S]*?</file>"#,
     #"<persistent-memory-recall>[\s\S]*?</persistent-memory-recall>"#,
   ].map { try! NSRegularExpression(pattern: $0) }
+  private static let skillEnvelope = try! NSRegularExpression(
+    pattern:
+      #"\A<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n</skill>(?:\n\n([\s\S]+))?\z"#)
+  private static let templatePlaceholder = try! NSRegularExpression(
+    pattern: #"\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)"#)
+  private static let frontmatter = try! NSRegularExpression(
+    pattern: #"\A---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)\z"#)
   static let pathExtensions = [
     ".md", ".swift", ".ts", ".rs", ".toml", ".json", ".zsh", ".sh", ".py",
   ]
@@ -470,9 +477,7 @@ public struct SessionReader: Sendable {
   static func humanText(
     _ raw: String, snippets: [String], templates: [String] = [], isClipped: Bool = true
   ) -> HumanText {
-    let skillPattern =
-      #"\A<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n</skill>(?:\n\n([\s\S]+))?\z"#
-    guard let skill = groups(skillPattern, in: raw) else {
+    guard let skill = groups(skillEnvelope, in: raw) else {
       return plainText(raw, snippets: snippets, templates: templates, isClipped: isClipped)
     }
     return commandArguments(skill[4], snippets: snippets, isClipped: isClipped)
@@ -534,12 +539,10 @@ public struct SessionReader: Sendable {
   }
 
   static func templatePattern(_ body: String) -> String {
-    let placeholder =
-      #"\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)"#
-    guard let expression = try? NSRegularExpression(pattern: placeholder) else { return "(?!)" }
     var pattern = "\\A"
     var literalStart = body.startIndex
-    for match in expression.matches(in: body, range: NSRange(body.startIndex..., in: body)) {
+    for match in templatePlaceholder.matches(in: body, range: NSRange(body.startIndex..., in: body))
+    {
       guard let range = Range(match.range, in: body) else { continue }
       pattern += NSRegularExpression.escapedPattern(
         for: String(body[literalStart..<range.lowerBound]))
@@ -550,10 +553,7 @@ public struct SessionReader: Sendable {
   }
 
   static func templateArguments(_ captures: ArraySlice<String?>, template: String) -> String? {
-    let placeholder =
-      #"\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)"#
-    guard let expression = try? NSRegularExpression(pattern: placeholder) else { return nil }
-    let matches = expression.matches(
+    let matches = templatePlaceholder.matches(
       in: template, range: NSRange(template.startIndex..., in: template))
     var kept: [String] = []
     for (capture, match) in zip(captures, matches) {
@@ -752,15 +752,19 @@ public struct SessionReader: Sendable {
 
   static func snippetBody(_ raw: String) -> String? {
     guard
-      let parts = groups(#"\A---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)\z"#, in: raw),
+      let parts = groups(frontmatter, in: raw),
       let body = parts[2]?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty
     else { return nil }
     return body
   }
 
   static func groups(_ pattern: String, in text: String) -> [String?]? {
-    guard let expression = try? NSRegularExpression(pattern: pattern),
-      let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text))
+    guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
+    return groups(expression, in: text)
+  }
+
+  private static func groups(_ expression: NSRegularExpression, in text: String) -> [String?]? {
+    guard let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text))
     else { return nil }
     return (0..<match.numberOfRanges).map { group in
       Range(match.range(at: group), in: text).map { String(text[$0]) }

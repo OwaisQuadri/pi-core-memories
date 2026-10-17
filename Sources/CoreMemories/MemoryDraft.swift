@@ -57,8 +57,10 @@ package final class MemoryDraftStore {
     guard lstat(repository.path, &status) == 0, status.st_mode & S_IFMT == S_IFDIR else {
       throw DreamRunError.unsafeState
     }
-    binding = SourceDigest(
-      bytes: Data("\(repository.path)\0\(status.st_dev)\0\(status.st_ino)".utf8)).rawValue
+    binding =
+      SourceDigest(
+        bytes: Data("\(repository.path)\0\(status.st_dev)\0\(status.st_ino)".utf8)
+      ).rawValue
     root = try DreamStateDirectory.openRoot(journal)
     try locked {
       try root.installReviewFile(Data(binding.utf8), name: "repository")
@@ -87,6 +89,9 @@ package final class MemoryDraftStore {
       guard expectedRevision < UInt64.max, operations.count <= 256 else {
         throw DreamRunError.limitExceeded
       }
+      if try DreamRunEncoding.encode(operations) == DreamRunEncoding.encode(previous.operations) {
+        return previous
+      }
       let draft = MemoryDraft(
         schemaVersion: 1, draftID: draftID, revision: expectedRevision + 1,
         repositoryBinding: binding, baseCommit: previous.baseCommit,
@@ -114,25 +119,33 @@ package final class MemoryDraftStore {
         !idempotencyKey.contains("\0"), !draft.operations.isEmpty
       else { throw MemoryError("Save requires changes and a bounded idempotency key") }
       let digest = SourceDigest(bytes: try DreamRunEncoding.encode(draft)).rawValue
-      let auditRef = "refs/memory-management/drafts/" + SourceDigest(
-        bytes: Data("\(binding)\0\(draftID)\0\(idempotencyKey)".utf8)).rawValue
-      if let receipt = try recover(draft: draft, digest: digest, auditRef: auditRef, idempotencyKey: idempotencyKey) {
+      let auditRef =
+        "refs/memory-management/drafts/"
+        + SourceDigest(
+          bytes: Data("\(binding)\0\(draftID)\0\(idempotencyKey)".utf8)
+        ).rawValue
+      if let receipt = try recover(
+        draft: draft, digest: digest, auditRef: auditRef, idempotencyKey: idempotencyKey)
+      {
         return receipt
       }
       _ = try current(draftID, revision: expectedRevision)
       guard try store.approvedCommit() == draft.baseCommit else {
-        throw MemoryError("draft base changed; preserve this draft and reconcile against a new catalog")
+        throw MemoryError(
+          "draft base changed; preserve this draft and reconcile against a new catalog")
       }
       let (replacements, changes) = try compose(draft)
       let publication = DraftPublication(
         schemaVersion: 1, draft: draft, contentDigest: digest, idempotencyKey: idempotencyKey,
         changes: changes.map(\.audit))
-      let message = Data("Core memory draft Save\n\n".utf8)
+      let message =
+        Data("Core memory draft Save\n\n".utf8)
         + (try DreamRunEncoding.encode(publication)) + Data([10])
       let checkout = try git.reviewCheckout()
       return try checkout.withLeaseState { state in
         let witness = try checkout.witness()
-        guard witness.head == Data((witness.commit + "\n").utf8), witness.main == draft.baseCommit else {
+        guard witness.head == Data((witness.commit + "\n").utf8), witness.main == draft.baseCommit
+        else {
           throw MemoryError("Save requires the unchanged base and a prepared detached checkout")
         }
         try checkout.lock(state: state, detachedHead: witness.head)
@@ -157,7 +170,8 @@ package final class MemoryDraftStore {
     }
   }
 
-  private func compose(_ draft: MemoryDraft) throws -> ([String: Data], [PreparedManagementChange]) {
+  private func compose(_ draft: MemoryDraft) throws -> ([String: Data], [PreparedManagementChange])
+  {
     let snapshot = try store.reviewSnapshot(base: draft.baseCommit)
     let manager = try MemoryManagement(repository: repository)
     var changes: [PreparedManagementChange] = []
@@ -167,29 +181,37 @@ package final class MemoryDraftStore {
       else { throw MemoryError("draft contains a non-CRUD operation or a foreign base") }
       let hex = SourceDigest(bytes: Data("\(draft.draftID):\(index)".utf8)).rawValue
       let raw = Array(hex.prefix(32))
-      let id = String(raw[0..<8]) + "-" + String(raw[8..<12]) + "-"
+      let id =
+        String(raw[0..<8]) + "-" + String(raw[8..<12]) + "-"
         + String(raw[12..<16]) + "-" + String(raw[16..<20]) + "-" + String(raw[20..<32])
-      changes.append(try manager.prepare(
-        operation, snapshot: snapshot, date: draft.created, newIdentity: UUID(uuidString: id)!))
+      changes.append(
+        try manager.prepare(
+          operation, snapshot: snapshot, date: draft.created, newIdentity: UUID(uuidString: id)!))
     }
     var replacements: [String: Data] = [:]
     for path in Set(changes.map(\.path)) {
       var document = snapshot.documents.first { $0.path == path }?.bytes ?? Data("# Memory\n".utf8)
       let edits = changes.filter { $0.path == path }
-      let targets = edits.filter { !$0.range.isEmpty }.sorted { $0.range.lowerBound < $1.range.lowerBound }
+      let targets = edits.filter { !$0.range.isEmpty }.sorted {
+        $0.range.lowerBound < $1.range.lowerBound
+      }
       for pair in zip(targets, targets.dropFirst()) {
         guard pair.0.range.upperBound <= pair.1.range.lowerBound else {
-        throw MemoryError("overlapping draft targets")
+          throw MemoryError("overlapping draft targets")
         }
       }
       for edit in targets.reversed() {
         document.replaceSubrange(edit.range, with: edit.insertion)
       }
       for edit in edits where edit.range.isEmpty {
-        let separator = document.suffix(2) == Data([10, 10]) ? Data()
-        : document.last == 10 ? Data([10]) : Data([10, 10])
-        let original = snapshot.documents.first { $0.path == path }?.bytes ?? Data("# Memory\n".utf8)
-        let prefixCount = original.suffix(2) == Data([10, 10]) ? 0 : original.last == 10 ? 1 : 2
+        let separator =
+          document.isEmpty || document.suffix(2) == Data([10, 10])
+          ? Data()
+          : document.last == 10 ? Data([10]) : Data([10, 10])
+        let original =
+          snapshot.documents.first { $0.path == path }?.bytes ?? Data("# Memory\n".utf8)
+        let prefixCount =
+          original.isEmpty || original.suffix(2) == Data([10, 10]) ? 0 : original.last == 10 ? 1 : 2
         document.append(separator)
         document.append(edit.insertion.dropFirst(prefixCount))
       }
@@ -201,8 +223,12 @@ package final class MemoryDraftStore {
     return (replacements, changes)
   }
 
-  private func recover(draft: MemoryDraft, digest: String, auditRef: String, idempotencyKey: String) throws -> MemoryDraftReceipt? {
-    let refs = try git.text(["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", auditRef])
+  private func recover(draft: MemoryDraft, digest: String, auditRef: String, idempotencyKey: String)
+    throws -> MemoryDraftReceipt?
+  {
+    let refs = try git.text([
+      "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", auditRef,
+    ])
     let exact = refs.split(separator: "\n").filter { $0.hasPrefix(auditRef + "\0") }
     if exact.isEmpty { return nil }
     guard exact.count == 1 else { throw DreamRunError.corruption }
@@ -215,11 +241,14 @@ package final class MemoryDraftStore {
     guard let split = raw.range(of: Data([10, 10])) else { throw DreamRunError.corruption }
     let parents = String(decoding: raw[..<split.lowerBound], as: UTF8.self)
       .split(separator: "\n").filter { $0.hasPrefix("parent ") }
-    guard parents == [Substring("parent " + draft.baseCommit)] else { throw DreamRunError.corruption }
+    guard parents == [Substring("parent " + draft.baseCommit)] else {
+      throw DreamRunError.corruption
+    }
     let bytes = Data(raw[split.upperBound...])
     let prefix = Data("Core memory draft Save\n\n".utf8)
     guard bytes.starts(with: prefix) else { throw DreamRunError.corruption }
-    let publication = try JSONDecoder().decode(DraftPublication.self, from: bytes.dropFirst(prefix.count))
+    let publication = try JSONDecoder().decode(
+      DraftPublication.self, from: bytes.dropFirst(prefix.count))
     let (replacements, changes) = try compose(draft)
     let expected = DraftPublication(
       schemaVersion: 1, draft: draft, contentDigest: digest, idempotencyKey: idempotencyKey,
@@ -229,13 +258,18 @@ package final class MemoryDraftStore {
     }
     let before = try store.reviewSnapshot(base: draft.baseCommit)
     let after = try store.reviewSnapshot(base: commit)
-    var layout = Dictionary(uniqueKeysWithValues: before.layoutEntries.map { ($0.path, ($0.mode, $0.blob)) })
+    var layout = Dictionary(
+      uniqueKeysWithValues: before.layoutEntries.map { ($0.path, ($0.mode, $0.blob)) })
     for (path, replacement) in replacements {
-      layout[path] = ("100644", try git.text(["hash-object", "--stdin", "--no-filters"], input: replacement))
+      layout[path] = (
+        "100644", try git.text(["hash-object", "--stdin", "--no-filters"], input: replacement)
+      )
     }
-    guard after.layoutEntries.count == layout.count, after.layoutEntries.allSatisfy({ entry in
-      layout[entry.path].map { $0.0 == entry.mode && $0.1 == entry.blob } ?? false
-    }) else { throw MemoryError("Save receipt tree differs from the saved draft") }
+    guard after.layoutEntries.count == layout.count,
+      after.layoutEntries.allSatisfy({ entry in
+        layout[entry.path].map { $0.0 == entry.mode && $0.1 == entry.blob } ?? false
+      })
+    else { throw MemoryError("Save receipt tree differs from the saved draft") }
     return MemoryDraftReceipt(
       draftID: draft.draftID, revision: draft.revision, contentDigest: digest,
       base: draft.baseCommit, commit: commit, auditRef: auditRef)
@@ -243,7 +277,8 @@ package final class MemoryDraftStore {
 
   private func persist(_ draft: MemoryDraft) throws {
     try root.installReviewFile(
-      DreamRunEncoding.encode(draft), name: "\(draft.draftID.uuidString)-current.json", isReplacing: true)
+      DreamRunEncoding.encode(draft), name: "\(draft.draftID.uuidString)-current.json",
+      isReplacing: true)
   }
 
   private func drafts() throws -> [MemoryDraft] {
@@ -270,12 +305,14 @@ package final class MemoryDraftStore {
     let draft = try JSONDecoder().decode(
       MemoryDraft.self, from: root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
     guard draft.schemaVersion == 1, draft.repositoryBinding == binding,
-      draft.draftID == id, draft.revision == revision else { throw DreamRunError.corruption }
+      draft.draftID == id, draft.revision == revision
+    else { throw DreamRunError.corruption }
     return draft
   }
 
   private func current(_ id: UUID, revision: UInt64) throws -> MemoryDraft {
-    guard let draft = try drafts().first(where: { $0.draftID == id }), draft.revision == revision else {
+    guard let draft = try drafts().first(where: { $0.draftID == id }), draft.revision == revision
+    else {
       throw MemoryError("stale draft revision or discarded draft")
     }
     return draft
@@ -283,7 +320,10 @@ package final class MemoryDraftStore {
 
   private func locked<T>(_ operation: () throws -> T) throws -> T {
     let lock = try root.openLock().descriptor
-    defer { _ = flock(lock, LOCK_UN); _ = close(lock) }
+    defer {
+      _ = flock(lock, LOCK_UN)
+      _ = close(lock)
+    }
     guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
     try root.verifyLock(lock)
     return try operation()

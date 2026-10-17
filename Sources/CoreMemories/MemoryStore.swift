@@ -45,7 +45,18 @@ public struct ApprovedDecisionSnapshot: Sendable {
       Set(documents.map(\.path)).count == documents.count
     else { throw DreamDecisionError.context("snapshot identity or ordering") }
     try limits.check(layoutEntries.count, maximum: limits.maximumLayoutEntries)
-    try limits.check(documents.count - 1, maximum: limits.maximumProjectKeys)
+    let projectKeys = Set(documents.compactMap { document -> String? in
+      switch DreamMemoryScope(path: document.path) {
+      case .project(let key), .deviceProject(_, let key): return key
+      default: return nil
+      }
+    })
+    try limits.check(projectKeys.count, maximum: limits.maximumProjectKeys)
+    let (scopeLimit, isScopeOverflow) = limits.maximumProjectKeys.multipliedReportingOverflow(by: 2)
+    let (documentLimit, isDocumentOverflow) = scopeLimit.addingReportingOverflow(2)
+    if !isScopeOverflow && !isDocumentOverflow {
+      try limits.check(documents.count, maximum: max(limits.maximumLayoutEntries, documentLimit))
+    }
     var layout = Data()
     for entry in layoutEntries {
       guard MemoryDocument.isAllowedPath(entry.path),
@@ -225,7 +236,11 @@ public struct MemoryStore: Sendable {
     try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     let commit = try approvedCommit()
     let key = try Self.projectKey(cwd: cwd, environment: git.environment, projectBindings: projectBindings)
-    let paths = MemoryScopeConfiguration.paths(projectKeys: key.map { [$0] } ?? [], deviceKey: deviceKey)
+    var paths = ["MEMORY.md"] + (key.map { ["projects/\($0).md"] } ?? [])
+    if let deviceKey {
+      paths.append("devices/\(deviceKey)/MEMORY.md")
+      if let key { paths.append("devices/\(deviceKey)/projects/\(key).md") }
+    }
     let entries = try treeEntries(commit, paths: paths)
     guard entries.contains(where: { $0.path == "MEMORY.md" }) else {
       throw MemoryError("missing committed MEMORY.md")

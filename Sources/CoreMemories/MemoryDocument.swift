@@ -11,6 +11,7 @@ public enum MemoryDocument {
   /// - Throws: Nothing.
   public static func isAllowedPath(_ path: String) -> Bool {
     path == "MEMORY.md" || isMatch(#"\Aprojects/[0-9a-f]{64}\.md\z"#, path)
+      || isMatch(#"\Adevices/[0-9a-f]{64}/(MEMORY\.md|projects/[0-9a-f]{64}\.md)\z"#, path)
   }
 
   /// Checks annotations on Markdown paragraphs and list items.
@@ -159,6 +160,18 @@ public enum MemoryDocument {
       + (previous?.lastReview.map { "; reviewed: \($0.rawValue)" } ?? "")
       + "; revised: \(instant.rawValue)]" + suffix
     return Data(text.utf8)
+  }
+
+  package static func editableEntry(_ bytes: Data) throws -> String {
+    guard var text = String(data: bytes, encoding: .utf8) else { throw MemoryError("invalid entry encoding") }
+    let metadata = reviewMetadata(in: bytes)
+    guard metadata.failure == nil else { throw MemoryError("entry metadata is not mutable") }
+    if let range = metadata.range {
+      let start = range.lowerBound > text.startIndex && text[text.index(before: range.lowerBound)] == " "
+        ? text.index(before: range.lowerBound) : range.lowerBound
+      text.removeSubrange(start..<range.upperBound)
+    }
+    return text
   }
 
   static func sourceAnnotations(in bytes: Data) -> [String] {

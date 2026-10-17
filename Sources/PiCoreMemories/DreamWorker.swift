@@ -150,11 +150,20 @@ private struct WorkerStart {
   let selection: DreamSelectedCall
   let resume: DreamResumeAction
   let batchTextBytes: Int
+  let deviceKey: String?
+  let projectBindings: [String: String]
 
   init(_ object: [String: Any]) throws {
+    let optional = Set(object.keys).intersection(["deviceKey", "projectBindings"])
     try WorkerJSON.fields(
       object,
-      ["version", "type", "invocationID", "roots", "selection", "resume", "batchTextBytes"])
+      Set(["version", "type", "invocationID", "roots", "selection", "resume", "batchTextBytes"]).union(optional))
+    deviceKey = try object["deviceKey"].map { _ in try WorkerJSON.text(object, "deviceKey", maximum: 64) }
+    if object["projectBindings"] != nil {
+      guard let bindings = object["projectBindings"] as? [String: String] else { throw WorkerError.protocolFailure }
+      projectBindings = bindings
+    } else { projectBindings = [:] }
+    try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     guard let budget = object["batchTextBytes"] as? Int, !(object["batchTextBytes"] is Bool),
       (65_536...1_048_576).contains(budget)
     else { throw WorkerError.protocolFailure }
@@ -476,7 +485,7 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
     let store = try DreamRunStore(
       stateRoot: start.state, sessionsRoot: start.sessions, memoryRepository: start.memory,
       strippingRoots: [start.snippets, start.prompts].compactMap { $0 },
-      globalAgents: start.globalAgents, isCancelled: { input.isCancelled })
+      globalAgents: start.globalAgents, deviceKey: start.deviceKey, projectBindings: start.projectBindings, isCancelled: { input.isCancelled })
     var coverageFrame: [String: Any]?
     var backlog: DreamBacklog?
     let result = try store.run(

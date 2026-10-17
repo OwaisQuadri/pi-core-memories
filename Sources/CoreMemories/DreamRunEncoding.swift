@@ -663,7 +663,7 @@ extension DreamRunEncoding {
     {
       guard schemaVersion == 2, runID == run.runID, generation == run.progress.generation,
         inputHash == run.inputHash.rawValue, contextHash == context.contextHash.rawValue,
-        systemPrompt == DreamDecisionContext.systemPrompt, messages.count == 1,
+        systemPrompt == context.savedSystemPrompt, messages.count == 1,
         messages[0].role == .user,
         messages
           == (try context.requestMessages(
@@ -705,6 +705,7 @@ extension DreamRunEncoding {
   struct ScopeValue: Codable {
     let kind: String
     let key: String?
+    var deviceKey: String?
 
     init(_ scope: DreamMemoryScope) {
       switch scope {
@@ -714,10 +715,26 @@ extension DreamRunEncoding {
       case .project(let value):
         kind = "project"
         key = value
+      case .device(let value):
+        kind = "device"
+        key = nil
+        deviceKey = value
+      case .deviceProject(let device, let project):
+        kind = "deviceProject"
+        key = project
+        deviceKey = device
       }
     }
 
     func domain() throws -> DreamMemoryScope {
+      if let deviceKey {
+        let scope: DreamMemoryScope
+        if kind == "device", key == nil { scope = .device(deviceKey) }
+        else if kind == "deviceProject", let key { scope = .deviceProject(device: deviceKey, project: key) }
+        else { throw DreamRunError.corruption }
+        guard MemoryDocument.isAllowedPath(scope.path) else { throw DreamRunError.corruption }
+        return scope
+      }
       if kind == "global", key == nil { return .global }
       guard kind == "project", let key,
         MemoryDocument.isAllowedPath("projects/\(key).md")
@@ -840,6 +857,8 @@ extension DreamRunEncoding {
   }
 
   private struct ContextPayload: Decodable {
+    let deviceKey: String?
+    let projectBindings: [String: String]?
     let schemaVersion: Int
     let run: Data
     let inputHash: String
@@ -1000,7 +1019,8 @@ extension DreamRunEncoding {
       let context = try DreamDecisionContext(
         run: run, snapshot: snapshot, scopes: scopes,
         owners: payload.owners.map { try $0.domain() }, addedDate: payload.date,
-        limits: limits, limitations: payload.limitations)
+        limits: limits, limitations: payload.limitations, deviceKey: payload.deviceKey,
+        projectBindings: payload.projectBindings ?? [:])
       guard context.canonicalBytes == bytes else { throw DreamRunError.corruption }
       return context
     } catch let error as DreamRunError { throw error } catch { throw DreamRunError.corruption }

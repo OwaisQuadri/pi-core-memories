@@ -89,18 +89,34 @@ public struct DreamDecisionLimits: Sendable, Encodable {
 public enum DreamMemoryScope: Hashable, Sendable {
   case global
   case project(String)
+  case device(String)
+  case deviceProject(device: String, project: String)
 
-  var path: String {
+  public var path: String {
     switch self {
     case .global: "MEMORY.md"
     case .project(let key): "projects/\(key).md"
+    case .device(let key): "devices/\(key)/MEMORY.md"
+    case .deviceProject(let device, let project): "devices/\(device)/projects/\(project).md"
     }
+  }
+
+  public init?(path: String) {
+    guard MemoryDocument.isAllowedPath(path) else { return nil }
+    let parts = path.split(separator: "/").map(String.init)
+    if path == "MEMORY.md" { self = .global }
+    else if parts[0] == "projects" { self = .project(String(parts[1].dropLast(3))) }
+    else if parts.count == 3 { self = .device(parts[1]) }
+    else { self = .deviceProject(device: parts[1], project: String(parts[3].dropLast(3))) }
   }
 
   fileprivate var json: DecisionJSON {
     switch self {
     case .global: .object(["kind": .string("global")])
     case .project(let key): .object(["kind": .string("project"), "key": .string(key)])
+    case .device(let key): .object(["kind": .string("device"), "deviceKey": .string(key)])
+    case .deviceProject(let device, let project):
+      .object(["kind": .string("deviceProject"), "deviceKey": .string(device), "key": .string(project)])
     }
   }
 }
@@ -110,8 +126,14 @@ public enum PinnedScopeResolution: Sendable {
   case outsideGit(isGlobalEligible: Bool)
   case unresolved
 
-  func isEligible(for scope: DreamMemoryScope) -> Bool {
-    switch (self, scope) {
+  func isEligible(for scope: DreamMemoryScope, deviceKey: String? = nil) -> Bool {
+    if case .device(let key) = scope {
+      return key == deviceKey && isEligible(for: .global)
+    }
+    if case .deviceProject(let device, let project) = scope {
+      return device == deviceKey && isEligible(for: .project(project))
+    }
+    return switch (self, scope) {
     case (.project(let key, _), .project(let target)): key == target
     case (.project(_, let isEligible), .global), (.outsideGit(let isEligible), .global): isEligible
     default: false
@@ -206,6 +228,9 @@ public struct DreamOwnerAnchor: Equatable, Sendable {
 }
 
 public struct DreamDecisionContext: Sendable {
+  public let deviceKey: String?
+  public let projectBindings: [String: String]
+
   public let run: FrozenDreamRun
   public let snapshot: ApprovedDecisionSnapshot
   public let scopes: [PinnedEvidenceScope]
@@ -224,8 +249,10 @@ public struct DreamDecisionContext: Sendable {
   public init(
     run: FrozenDreamRun, snapshot: ApprovedDecisionSnapshot, scopes: [PinnedEvidenceScope],
     owners: [PinnedOwnerInput], addedDate: String,
-    limits: DreamDecisionLimits = try! DreamDecisionLimits(), limitations: [String] = []
+    limits: DreamDecisionLimits = try! DreamDecisionLimits(), limitations: [String] = [],
+    deviceKey: String? = nil, projectBindings: [String: String] = [:]
   ) throws {
+    try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     guard limitations.count <= limits.maximumOwners + limits.maximumProjectKeys,
       limitations.allSatisfy({ !$0.isEmpty && $0.utf8.count <= limits.maximumTextBytes })
     else { throw DreamDecisionError.limitExceeded }
@@ -252,7 +279,7 @@ public struct DreamDecisionContext: Sendable {
       }
     }
     try limits.check(projects.count, maximum: limits.maximumProjectKeys)
-    let paths = ["MEMORY.md"] + projects.sorted().map { "projects/\($0).md" }
+    let paths = MemoryScopeConfiguration.paths(projectKeys: projects.sorted(), deviceKey: deviceKey)
     guard snapshot.documents.map(\.path) == paths else {
       throw DreamDecisionError.context("snapshot scope catalogue")
     }
@@ -265,9 +292,9 @@ public struct DreamDecisionContext: Sendable {
       try limits.check(bytes.count, maximum: limits.maximumDocumentBytes)
       try limits.accumulate(
         bytes.count, total: &selectedBytes, maximum: limits.maximumSnapshotBytes)
-      let scope: DreamMemoryScope =
-        document.path == "MEMORY.md"
-        ? .global : .project(String(document.path.dropFirst(9).dropLast(3)))
+      guard let scope = DreamMemoryScope(path: document.path) else {
+        throw DreamDecisionError.context("memory scope path")
+      }
       for block in MemoryDocument.nativeBlockRanges(in: bytes) {
         guard let before = String(data: bytes.subdata(in: block.range), encoding: .utf8) else {
           throw DreamDecisionError.context("native block encoding")
@@ -316,7 +343,7 @@ public struct DreamDecisionContext: Sendable {
       ])
     }
     let limitsJSON = try DecisionJSON.parse(DreamRunEncoding.encode(limits))
-    let context = DecisionJSON.object([
+    var contextFields: [String: DecisionJSON] = [
       "schemaVersion": .integer(1), "run": .string(runBytes.base64EncodedString()),
       "inputHash": .string(run.inputHash.rawValue), "base": .string(snapshot.base),
       "layoutHash": .string(snapshot.layoutHash.rawValue),
@@ -329,7 +356,14 @@ public struct DreamDecisionContext: Sendable {
       "scopes": .array(scopeJSON), "owners": .array(ownerJSON), "date": .string(addedDate),
       "limits": limitsJSON, "policyVersion": .integer(1), "policy": .string(Self.policy),
       "limitations": .array(limitations.map { .string($0) }),
-    ])
+    ]
+    if let deviceKey { contextFields["deviceKey"] = .string(deviceKey) }
+    if !projectBindings.isEmpty {
+      contextFields["projectBindings"] = .object(projectBindings.mapValues { .string($0) })
+    }
+    let context = DecisionJSON.object(contextFields)
+    self.deviceKey = deviceKey
+    self.projectBindings = projectBindings
     self.run = run
     self.snapshot = snapshot
     self.scopes = sortedScopes
@@ -546,6 +580,13 @@ private struct DecisionValidator {
         throw DreamDecisionError.schema
       }
       scope = .project(key)
+    case "device", "deviceProject":
+      let isProject = try kind.string() == "deviceProject"
+      let object = try value.object(keys: isProject ? ["kind", "deviceKey", "key"] : ["kind", "deviceKey"])
+      let device = try object["deviceKey"]!.string()
+      guard device == context.deviceKey else { throw DreamDecisionError.schema }
+      if isProject { scope = .deviceProject(device: device, project: try object["key"]!.string()) }
+      else { scope = .device(device) }
     default: throw DreamDecisionError.schema
     }
     guard context.snapshot.documents.contains(where: { $0.path == scope.path }) else {
@@ -571,7 +612,7 @@ private struct DecisionValidator {
   }
 
   func requireEligibility(_ sources: [PrimaryTextID], scope: DreamMemoryScope) throws {
-    guard sources.allSatisfy({ resolution($0).isEligible(for: scope) }) else {
+    guard sources.allSatisfy({ resolution($0).isEligible(for: scope, deviceKey: context.deviceKey) }) else {
       throw DreamDecisionError.schema
     }
   }
@@ -587,7 +628,17 @@ private struct DecisionValidator {
   }
 
   func requireReferenceScope(_ reference: DreamMemoryScope, target: DreamMemoryScope) throws {
-    guard reference == .global || reference == target else { throw DreamDecisionError.schema }
+    let isMatchingProject: Bool
+    if case .project(let key) = reference, case .deviceProject(_, let targetKey) = target {
+      isMatchingProject = key == targetKey
+    } else { isMatchingProject = false }
+    let isMatchingDevice: Bool
+    if case .device(let key) = reference, case .deviceProject(let targetKey, _) = target {
+      isMatchingDevice = key == targetKey
+    } else { isMatchingDevice = false }
+    guard reference == .global || reference == target || isMatchingProject || isMatchingDevice else {
+      throw DreamDecisionError.schema
+    }
   }
 
   mutating func memoryAnchor(_ value: DecisionJSON) throws -> DreamMemoryAnchor {
@@ -1108,7 +1159,7 @@ extension DreamDecisionContext {
     }
     let payload = DecisionJSON.object([
       "schemaVersion": .integer(1), "contextHash": .string(contextHash.rawValue),
-      "decisionSchema": Self.decisionSchema,
+      "decisionSchema": decisionSchema,
       "date": .string(addedDate), "policy": .string(Self.policy),
       "primaryEvidence": .array(primary), "agentContextNotEvidence": .array(agents),
       "questionsAndSelectedLabelsNotEvidence": .array(questions),
@@ -1140,7 +1191,7 @@ extension DreamDecisionContext {
     ]
   }
 
-  private static var decisionSchema: DecisionJSON {
+  private var decisionSchema: DecisionJSON {
     func closed(_ fields: [String: DecisionJSON]) -> DecisionJSON {
       .object([
         "type": .string("object"), "additionalProperties": .boolean(false),
@@ -1157,12 +1208,12 @@ extension DreamDecisionContext {
     let digest = DecisionJSON.object([
       "type": .string("string"), "pattern": .string("^[0-9a-f]{64}$"),
     ])
-    let scope = DecisionJSON.object([
-      "oneOf": .array([
-        closed(["kind": literal("global")]),
-        closed(["kind": literal("project"), "key": digest]),
-      ])
-    ])
+    var scopes = [closed(["kind": literal("global")]), closed(["kind": literal("project"), "key": digest])]
+    if let deviceKey {
+      scopes += [closed(["kind": literal("device"), "deviceKey": literal(deviceKey)]),
+        closed(["kind": literal("deviceProject"), "deviceKey": literal(deviceKey), "key": digest])]
+    }
+    let scope = DecisionJSON.object(["oneOf": .array(scopes)])
     let source = closed(["session": text, "entry": text, "part": integer])
     let anchor = closed([
       "scope": scope, "documentHash": digest, "start": integer, "end": integer, "before": text,
@@ -1208,6 +1259,13 @@ extension DreamDecisionContext {
       "schemaVersion": .object(["const": .integer(1)]), "contextHash": digest,
       "decisions": array(decisions),
     ])
+  }
+
+  var savedSystemPrompt: String {
+    guard let deviceKey else { return Self.systemPrompt }
+    return Self.systemPrompt + "\nDevice-local facts belong only to {kind:\"device\",deviceKey:\"" + deviceKey
+      + "\"} or {kind:\"deviceProject\",deviceKey:\"" + deviceKey
+      + "\",key:\"matching project key\"}. These scopes apply only to this device. General durable facts still use global or project scope. Never infer device specificity without primary support."
   }
 
   static let systemPrompt = """

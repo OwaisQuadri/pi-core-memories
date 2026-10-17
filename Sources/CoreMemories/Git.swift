@@ -474,19 +474,18 @@ final class ReviewCheckoutDirectory {
     let snapshot = try MemoryStore(repo: git.repo, environment: git.environment).reviewSnapshot(
       base: commit)
     for document in snapshot.documents {
-      if document.path == "MEMORY.md" {
-        guard try read(document.path, directory: repositoryDescriptor) == document.bytes else {
-          throw MemoryError("tracked checkout bytes changed")
-        }
-      } else {
-        let projects = openat(
-          repositoryDescriptor, "projects", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard projects >= 0 else { throw MemoryError("unsafe tracked project directory") }
-        defer { _ = close(projects) }
-        guard try read(String(document.path.dropFirst(9)), directory: projects) == document.bytes
-        else {
-          throw MemoryError("tracked project bytes changed")
-        }
+      let components = document.path.split(separator: "/").map(String.init)
+      var directory = repositoryDescriptor
+      var opened: [Int32] = []
+      defer { for file in opened { _ = close(file) } }
+      for component in components.dropLast() {
+        let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard next >= 0 else { throw MemoryError("unsafe tracked memory directory") }
+        opened.append(next)
+        directory = next
+      }
+      guard try read(components.last!, directory: directory) == document.bytes else {
+        throw MemoryError("tracked checkout bytes changed")
       }
     }
     guard head == Data("ref: refs/heads/main\n".utf8) || head == Data((commit + "\n").utf8) else {

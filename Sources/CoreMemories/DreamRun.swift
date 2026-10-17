@@ -210,6 +210,8 @@ public final class DreamRunStore {
   private let bindingBytes: Data
   private let bindingHash: SourceDigest
   private let limits: DreamRunLimits
+  private let deviceKey: String?
+  private let projectBindings: [String: String]
   private let operationLock = NSLock()
   var persistenceFault: ((DreamPersistenceEvent) throws -> Void)?
   var clock: () -> Date = { Date() }
@@ -249,10 +251,13 @@ public final class DreamRunStore {
 
   public init(
     stateRoot: URL, sessionsRoot: URL, memoryRepository: URL, strippingRoots: [URL],
-    globalAgents: URL? = nil,
+    globalAgents: URL? = nil, deviceKey: String? = nil, projectBindings: [String: String] = [:],
     limits: DreamRunLimits = try! DreamRunLimits(),
     isCancelled: @escaping @Sendable () -> Bool = { false }
   ) throws {
+    try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
+    self.deviceKey = deviceKey
+    self.projectBindings = projectBindings
     guard
       ([stateRoot, sessionsRoot, memoryRepository] + strippingRoots
         + (globalAgents.map { [$0] } ?? [])).allSatisfy({
@@ -580,7 +585,7 @@ public final class DreamRunStore {
       let request = DreamRunEncoding.Request(
         schemaVersion: 2, runID: runID, generation: progress.generation,
         inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
-        systemPrompt: DreamDecisionContext.systemPrompt,
+        systemPrompt: context.savedSystemPrompt,
         messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)))
       let requestBytes = try bounded(request)
       let directory = try runs.child(runID, isCreating: true)
@@ -721,7 +726,7 @@ public final class DreamRunStore {
           let source = try Self.canonicalExisting(URL(fileURLWithPath: cwd))
           _ = try PreparationDirectory(url: source)
           let git = Git(repo: source, environment: ProcessInfo.processInfo.environment)
-          if let key = try MemoryStore.projectKey(cwd: source) {
+          if let key = try MemoryStore.projectKey(cwd: source, projectBindings: projectBindings) {
             let worktree = try Self.canonicalExisting(
               URL(fileURLWithPath: git.text(["rev-parse", "--show-toplevel"])))
             resolution = .project(key: key, isGlobalEligible: true)
@@ -747,7 +752,7 @@ public final class DreamRunStore {
       }
     ).sorted()
     let snapshot = try memory.decisionSnapshot(
-      base: run.approvedBase, projectKeys: keys, limits: decisionLimits)
+      base: run.approvedBase, projectKeys: keys, limits: decisionLimits, deviceKey: deviceKey)
     var owners: [PinnedOwnerInput] = []
     var attempted: Set<Data> = []
     var totalBytes = 0
@@ -947,7 +952,7 @@ public final class DreamRunStore {
       addedDate: formatter.string(from: date), limits: decisionLimits,
       limitations: limitations.reduce(into: [String]()) { values, value in
         if !values.contains(value) { values.append(value) }
-      })
+      }, deviceKey: deviceKey, projectBindings: projectBindings)
     guard context.canonicalBytes.count <= limits.maximumFrozenBytes else {
       throw DreamRunError.limitExceeded
     }
@@ -1536,7 +1541,7 @@ final class DreamStateDirectory {
 
   deinit { _ = close(descriptor) }
 
-  static func openRoot(_ url: URL) throws -> DreamStateDirectory {
+  static func openRoot(_ url: URL, isCreating: Bool = true) throws -> DreamStateDirectory {
     var current = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     guard current >= 0 else { throw DreamRunError.unsafeState }
     var isClosed = false
@@ -1547,7 +1552,7 @@ final class DreamStateDirectory {
     for (index, component) in components.enumerated() {
       var status = stat()
       if fstatat(current, component, &status, AT_SYMLINK_NOFOLLOW) != 0 {
-        guard errno == ENOENT, mkdirat(current, component, 0o700) == 0 else {
+        guard isCreating, errno == ENOENT, mkdirat(current, component, 0o700) == 0 else {
           throw DreamRunError.unsafeState
         }
         isCreated = true

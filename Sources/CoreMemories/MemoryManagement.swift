@@ -1,8 +1,8 @@
 import Darwin
 import Foundation
 
-package struct MemoryManagementRequest: Codable {
-  package enum Operation: String, Codable { case list, get, add, update, delete }
+package struct MemoryManagementRequest: Codable, Sendable {
+  package enum Operation: String, Codable, Sendable { case list, get, add, update, delete }
   package let operation: Operation
   package var base: String?
   package var path: String?
@@ -10,6 +10,20 @@ package struct MemoryManagementRequest: Codable {
   package var expected: String?
   package var replacement: String?
   package var reason: String?
+
+  package init(
+    operation: Operation, base: String? = nil, path: String? = nil,
+    locator: MemoryDocument.EntryLocator? = nil, expected: String? = nil,
+    replacement: String? = nil, reason: String? = nil
+  ) {
+    self.operation = operation
+    self.base = base
+    self.path = path
+    self.locator = locator
+    self.expected = expected
+    self.replacement = replacement
+    self.reason = reason
+  }
 
   package static func decode(_ bytes: Data) throws -> Self {
     guard bytes.count <= 1_048_576,
@@ -38,7 +52,7 @@ package struct MemoryManagementRequest: Codable {
   }
 }
 
-package struct ManagedMemoryEntry: Codable {
+package struct ManagedMemoryEntry: Codable, Sendable {
   package let path: String
   package let locator: MemoryDocument.EntryLocator
   package let expected: String
@@ -49,7 +63,7 @@ package struct ManagedMemoryEntry: Codable {
   package let limitation: String?
 }
 
-package struct MemoryManagementResult: Codable {
+package struct MemoryManagementResult: Codable, Sendable {
   package let base: String
   package let entries: [ManagedMemoryEntry]
   package let commit: String?
@@ -69,6 +83,14 @@ private struct MemoryManagementAudit: Codable {
   let after: String
   let reason: String
   let revised: String
+}
+
+struct PreparedManagementChange {
+  let path: String
+  let range: Range<Int>
+  let insertion: Data
+  let document: Data
+  let audit: Data
 }
 
 package final class MemoryManagement {
@@ -107,6 +129,26 @@ package final class MemoryManagement {
           "Current committed approved entries. Stored sources are references, not verified evidence."
       )
     }
+    if request.operation == .get {
+      guard let expected = request.expected, let row = all.first(where: {
+        $0.path == request.path && $0.locator == request.locator
+          && Data($0.expected.utf8) == Data(expected.utf8)
+      }) else { throw MemoryError("entry locator or expected bytes changed; list entries again") }
+      return MemoryManagementResult(
+        base: base, entries: [row], commit: nil, auditRef: nil,
+        message: "Exact committed approved entry.")
+    }
+    let change = try prepare(request, snapshot: snapshot, date: date, newIdentity: UUID())
+    return try publish(
+      base: base, path: change.path, replacement: change.document, auditBytes: change.audit)
+  }
+
+  func prepare(
+    _ request: MemoryManagementRequest, snapshot: ApprovedDecisionSnapshot,
+    date: Date, newIdentity: UUID
+  ) throws -> PreparedManagementChange {
+    let base = snapshot.base
+    let rows = snapshot.reviewEntries()
     guard let path = request.path, MemoryDocument.isAllowedPath(path) else {
       throw MemoryError("invalid memory path")
     }
@@ -123,11 +165,6 @@ package final class MemoryManagement {
       else { throw MemoryError("entry locator or expected bytes changed; list entries again") }
       entry = found.entry
     }
-    if request.operation == .get {
-      return MemoryManagementResult(
-        base: base, entries: all.filter { $0.path == path && $0.locator == request.locator },
-        commit: nil, auditRef: nil, message: "Exact committed approved entry.")
-    }
     guard entry == nil || entry?.isMutable == true,
       let reason = request.reason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
       reason.utf8.count <= 16_384, !reason.contains("\0"), date.timeIntervalSince1970.isFinite
@@ -138,7 +175,7 @@ package final class MemoryManagement {
     }
     let formatter = ISO8601DateFormatter()
     let instant = try MemoryDocument.ReviewInstant(formatter.string(from: date))
-    let identity = entry?.identity ?? (request.operation == .delete ? nil : UUID())
+    let identity = entry?.identity ?? (request.operation == .delete ? nil : newIdentity)
     let after: Data
     if request.operation == .delete {
       guard request.replacement == nil else { throw MemoryError("delete cannot replace an entry") }
@@ -185,7 +222,8 @@ package final class MemoryManagement {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     let auditBytes = try encoder.encode(audit)
-    return try publish(base: base, path: path, replacement: replacement, auditBytes: auditBytes)
+    return PreparedManagementChange(
+      path: path, range: range, insertion: insertion, document: replacement, audit: auditBytes)
   }
 
   private func publish(
@@ -221,13 +259,15 @@ package final class MemoryManagement {
     }
   }
 
-  package func reviewCatalog(cwd: URL) throws -> MemoryManagementResult {
+  package func reviewCatalog(cwd: URL, deviceKey: String? = nil, projectBindings: [String: String] = [:]) throws -> MemoryManagementResult {
     let catalog = try execute(MemoryManagementRequest(operation: .list))
-    let key = try MemoryStore.projectKey(cwd: cwd)
+    try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
+    let key = try MemoryStore.projectKey(cwd: cwd, projectBindings: projectBindings)
+    let paths = MemoryScopeConfiguration.paths(projectKeys: key.map { [$0] } ?? [], deviceKey: deviceKey)
     return MemoryManagementResult(
       base: catalog.base,
       entries: catalog.entries.filter {
-        ($0.path == "MEMORY.md" || $0.path == key.map { "projects/\($0).md" })
+        paths.contains($0.path)
           && MemoryDocument.isMemoryContent(Data($0.expected.utf8))
       }, commit: nil, auditRef: nil, message: catalog.message)
   }

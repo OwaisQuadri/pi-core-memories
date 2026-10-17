@@ -112,7 +112,7 @@ private func managementTarget(
   defer { fixture.clean() }
   let identity = UUID()
   let bytes = try MemoryDocument.reviewedBytes(
-    Data(fact("Shared.").utf8), identity: identity,
+    Data(fact("Café.").utf8), identity: identity,
     instant: MemoryDocument.ReviewInstant("2026-01-01T00:00:00Z"))
   for path in ["MEMORY.md", "projects/" + String(repeating: "b", count: 64) + ".md"] {
     try fixture.write("# Memory\n\n" + String(decoding: bytes, as: UTF8.self), path: path)
@@ -129,6 +129,10 @@ private func managementTarget(
   var guessed = managementTarget(.get, catalog: catalog, row: duplicate)
   guessed.expected = fact("Shared.")
   #expect(throws: (any Error).self) { try manager.execute(guessed) }
+  var canonical = managementTarget(.get, catalog: catalog, row: duplicate)
+  canonical.expected = duplicate.expected.replacingOccurrences(of: "Café.", with: "Cafe\u{301}.")
+  #expect(canonical.expected == duplicate.expected)
+  #expect(throws: (any Error).self) { try manager.execute(canonical) }
   #expect(try fixture.humanState() == before)
 }
 

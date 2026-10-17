@@ -11,6 +11,9 @@ func execute() throws -> Int32 {
     throw UsageError(
       description: "expected init, project-key, render, check, propose, review, or dream-scan")
   }
+  if ["dream", "draft", "scope", "setup-device", "bind-project"].contains(command) {
+    return try executeClientCommand(arguments)
+  }
   if command == "dream-worker" { return executeDreamWorker(arguments: arguments) }
   if command == "memory-review-worker" { return executeMemoryReviewWorker(arguments: arguments) }
   if command == "memory-prepare-worker" {
@@ -33,7 +36,7 @@ func execute() throws -> Int32 {
     }
   }
   let permitted: [String: Set<String>] = [
-    "init": ["--repo"], "project-key": ["--cwd"], "render": ["--repo", "--cwd"],
+    "init": ["--repo"], "project-key": ["--cwd", "--config", "--bindings"], "render": ["--repo", "--cwd", "--device-key", "--bindings", "--config"],
     "check": ["--repo"], "propose": ["--repo", "--base", "--file", "--reason", "--contradictions"],
     "review": ["--repo"], "manage": ["--repo"], "review-catalog": ["--repo", "--cwd"],
     "dream-scan": ["--sessions", "--since", "--snippets", "--prompts", "--samples"],
@@ -57,17 +60,33 @@ func execute() throws -> Int32 {
     try FileHandle.standardOutput.write(contentsOf: Data(text.utf8))
   }
 
+  func scopeConfiguration() throws -> MemoryScopeConfiguration {
+    let config = try MemoryConfiguration.load(from: options["--config"].map { URL(fileURLWithPath: $0) } ?? MemoryConfiguration.defaultURL)
+    var bindings = config.projectBindings
+    if let path = options["--bindings"] {
+      let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+      defer { try? handle.close() }
+      let bytes = try handle.read(upToCount: 65_537) ?? Data()
+      guard bytes.count <= 65_536 else { throw UsageError(description: "project bindings too large") }
+      bindings = try JSONDecoder().decode([String: String].self, from: bytes)
+    }
+    let scope = MemoryScopeConfiguration(deviceKey: options["--device-key"] ?? config.deviceKey, projectBindings: bindings)
+    try MemoryScopeConfiguration.validate(deviceKey: scope.deviceKey, projectBindings: scope.projectBindings)
+    return scope
+  }
+
   switch command {
   case "init":
     try MemoryStore.initialize(repo: url("--repo"))
   case "project-key":
-    if let key = try MemoryStore.projectKey(cwd: url("--cwd")) {
+    if let key = try MemoryStore.projectKey(cwd: url("--cwd"), projectBindings: scopeConfiguration().projectBindings) {
       try output("\(key)\n")
     } else {
       throw UsageError(description: "no project key exists outside a Git repository")
     }
   case "render":
-    try output(MemoryStore(repo: url("--repo")).render(cwd: url("--cwd")))
+    let scope = try scopeConfiguration()
+    try output(MemoryStore(repo: url("--repo")).render(cwd: url("--cwd"), deviceKey: scope.deviceKey, projectBindings: scope.projectBindings))
   case "check":
     let failures = try MemoryStore(repo: url("--repo")).check()
     if !failures.isEmpty {

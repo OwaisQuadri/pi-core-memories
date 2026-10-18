@@ -9,6 +9,7 @@ package struct MemoryDraft: Codable, Sendable {
   package let baseCommit: String
   package let created: Date
   package let operations: [MemoryManagementRequest]
+  package let batch: MemoryBatchContents?
 }
 
 package struct MemoryDraftReceipt: Codable, Sendable {
@@ -78,7 +79,7 @@ package final class MemoryDraftStore {
       _ = try store.reviewSnapshot(base: acceptedBase)
       let draft = MemoryDraft(
         schemaVersion: 1, draftID: UUID(), revision: 0, repositoryBinding: binding,
-        baseCommit: acceptedBase, created: Date(), operations: operations)
+        baseCommit: acceptedBase, created: Date(), operations: operations, batch: nil)
       try persist(draft)
       return draft
     }
@@ -93,6 +94,9 @@ package final class MemoryDraftStore {
   ) throws -> MemoryDraft {
     try locked {
       let previous = try current(draftID, revision: expectedRevision)
+      guard previous.batch == nil else {
+        throw MemoryError("typed batches must be edited through the memory batch session")
+      }
       guard expectedRevision < UInt64.max, operations.count <= 256 else {
         throw DreamRunError.limitExceeded
       }
@@ -102,7 +106,7 @@ package final class MemoryDraftStore {
       let draft = MemoryDraft(
         schemaVersion: 1, draftID: draftID, revision: expectedRevision + 1,
         repositoryBinding: binding, baseCommit: previous.baseCommit,
-        created: previous.created, operations: operations)
+        created: previous.created, operations: operations, batch: nil)
       try persist(draft)
       return draft
     }
@@ -120,6 +124,9 @@ package final class MemoryDraftStore {
   {
     try locked {
       let draft = try read(draftID, revision: expectedRevision)
+      guard draft.batch == nil else {
+        throw MemoryError("typed batches require the proof-aware batch Save")
+      }
       try root.installReviewFile(
         DreamRunEncoding.encode(draft), name: "\(draftID.uuidString)-\(expectedRevision).json")
       guard !idempotencyKey.isEmpty, idempotencyKey.utf8.count <= 256,
@@ -282,6 +289,44 @@ package final class MemoryDraftStore {
       base: draft.baseCommit, commit: commit, auditRef: auditRef)
   }
 
+  package func persistBatch(_ draft: MemoryDraft, expectedRevision: UInt64) throws {
+    try locked {
+      guard Self.isValid(draft), draft.schemaVersion == 2,
+        draft.repositoryBinding == binding, draft.revision >= expectedRevision
+      else { throw DreamRunError.corruption }
+      let previous = try current(draft.draftID, revision: expectedRevision)
+      guard previous.baseCommit == draft.baseCommit, previous.created == draft.created else {
+        throw DreamRunError.corruption
+      }
+      if previous.revision == draft.revision {
+        guard try memoryBatchDigest(previous) == memoryBatchDigest(draft) else {
+          throw MemoryError("a different draft revision is already durable")
+        }
+        return
+      }
+      if previous.schemaVersion == 1 {
+        try root.installReviewFile(
+          DreamRunEncoding.encode(previous),
+          name: "\(previous.draftID.uuidString)-\(previous.revision).json")
+      }
+      try persist(draft)
+    }
+  }
+
+  private static func isValid(_ draft: MemoryDraft) -> Bool {
+    guard MemoryStore.isFullOID(draft.baseCommit), draft.created.timeIntervalSince1970.isFinite,
+      draft.operations.count <= 256
+    else { return false }
+    if draft.schemaVersion == 1 { return draft.batch == nil }
+    guard draft.schemaVersion == 2, draft.operations.isEmpty, let batch = draft.batch,
+      batch.items.count <= 256,
+      Set(batch.items.map(\.itemID)).count == batch.items.count,
+      batch.binding.allowedPaths.count <= 256,
+      batch.binding.allowedPaths.allSatisfy(MemoryDocument.isAllowedPath)
+    else { return false }
+    return true
+  }
+
   private func persist(_ draft: MemoryDraft) throws {
     try root.installReviewFile(
       DreamRunEncoding.encode(draft), name: "\(draft.draftID.uuidString)-current.json",
@@ -294,9 +339,8 @@ package final class MemoryDraftStore {
     for name in names where name.hasSuffix("-current.json") {
       let draft = try JSONDecoder().decode(
         MemoryDraft.self, from: root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
-      guard draft.schemaVersion == 1, draft.repositoryBinding == binding,
-        name == "\(draft.draftID.uuidString)-current.json",
-        MemoryStore.isFullOID(draft.baseCommit), draft.operations.count <= 256
+      guard Self.isValid(draft), draft.repositoryBinding == binding,
+        name == "\(draft.draftID.uuidString)-current.json"
       else { throw DreamRunError.corruption }
       if names.contains("\(draft.draftID.uuidString)-discarded") { continue }
       if latest[draft.draftID].map({ $0.revision < draft.revision }) ?? true {
@@ -311,7 +355,7 @@ package final class MemoryDraftStore {
     let name = try root.isPresent(archived) ? archived : "\(id.uuidString)-current.json"
     let draft = try JSONDecoder().decode(
       MemoryDraft.self, from: root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
-    guard draft.schemaVersion == 1, draft.repositoryBinding == binding,
+    guard Self.isValid(draft), draft.repositoryBinding == binding,
       draft.draftID == id, draft.revision == revision
     else { throw DreamRunError.corruption }
     return draft

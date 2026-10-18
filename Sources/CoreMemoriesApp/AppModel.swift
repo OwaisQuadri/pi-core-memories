@@ -44,9 +44,11 @@ import Foundation
   private var control: DreamControl?
   let workspace: Workspace
   let configURL: URL
+  private let autosaveDelay: Duration
 
-  init(configURL: URL) {
+  init(configURL: URL, autosaveDelay: Duration = .milliseconds(500)) {
     self.configURL = configURL
+    self.autosaveDelay = autosaveDelay
     self.workspace = Workspace(configURL: configURL)
 
   }
@@ -212,7 +214,7 @@ import Foundation
       await previous?.value
       do {
         try Task.checkCancellation()
-        try await Task.sleep(for: .milliseconds(500))
+        try await Task.sleep(for: autosaveDelay)
         try Task.checkCancellation()
         try await persistEditor()
       } catch is CancellationError {} catch { failure = String(describing: error) }

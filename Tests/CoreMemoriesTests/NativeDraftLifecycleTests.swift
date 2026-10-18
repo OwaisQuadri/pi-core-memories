@@ -14,7 +14,7 @@ import Testing
   configuration.diagnostics = fixture.root.appendingPathComponent("diagnostics").path
   let url = fixture.root.appendingPathComponent("profile/config.json")
   try configuration.save(to: url)
-  let model = AppModel(configURL: url)
+  let model = AppModel(configURL: url, autosaveDelay: .seconds(3600))
   await model.load()
   _ = try #require(model.catalog)
   model.add()

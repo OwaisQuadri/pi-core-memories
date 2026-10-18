@@ -1,13 +1,6 @@
 import CoreMemories
 import SwiftUI
 
-func memoryReviewText(_ bytes: Data) -> String {
-  let text = (try? MemoryDocument.editableEntry(bytes)) ?? String(decoding: bytes, as: UTF8.self)
-  return text.replacingOccurrences(
-    of: #"[ \t]*\[source: [^\[\];\r\n]+; added: [0-9]{4}-[0-9]{2}-[0-9]{2}\]"#,
-    with: "", options: .regularExpression)
-}
-
 struct MemoriesView: View {
   @ObservedObject var model: AppModel
   var body: some View {
@@ -40,8 +33,10 @@ struct MemoriesView: View {
                 model.edit(entry)
               } label: {
                 VStack(alignment: .leading, spacing: 5) {
-                  Text((try? MemoryDocument.editableEntry(Data(entry.expected.utf8))) ?? entry.expected)
-                    .lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
+                  Text(
+                    (try? MemoryDocument.editableEntry(Data(entry.expected.utf8))) ?? entry.expected
+                  )
+                  .lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
                   Text(
                     MemoryScopeConfiguration.label(
                       path: entry.path, deviceKey: model.configuration.deviceKey)
@@ -182,7 +177,9 @@ struct ReviewView: View {
           } else {
             if model.isReviewLoading {
               ProgressView("Loading suggestions…")
-            } else if model.actionableCandidates.isEmpty { Text(model.reviewEmptyMessage) }
+            } else if model.actionableCandidates.isEmpty {
+              Text(model.reviewEmptyMessage)
+            }
             ForEach(model.actionableCandidates, id: \.change.id) { candidate in
               candidateRow(candidate)
             }
@@ -204,10 +201,11 @@ struct ReviewView: View {
             Button("Back") { model.preview = nil }.keyboardShortcut(.cancelAction)
             Button("Save into Memory") { Task { await model.approve() } }
           }
-          Text(memoryReviewText(preview.change.after)).font(.headline)
+          Text(MemoryDocument.reviewText(preview.change.after)).font(.headline)
           PlainTextView(
-            text: "BEFORE\n" + (preview.before.isEmpty ? "New memory" : memoryReviewText(preview.before))
-              + "\n\nAFTER\n" + memoryReviewText(preview.after)
+            text: "BEFORE\n"
+              + (preview.before.isEmpty ? "New memory" : MemoryDocument.reviewText(preview.before))
+              + "\n\nAFTER\n" + MemoryDocument.reviewText(preview.after)
               + "\n\nREASON\n" + preview.change.reason)
           DisclosureGroup("Details") {
             Text("Base · \(preview.currentBase)").font(.system(.caption, design: .monospaced))
@@ -215,9 +213,11 @@ struct ReviewView: View {
             Text("Stored sources are references, not verified evidence.").font(.caption)
             PlainTextView(
               text: "STORED ENTRY\n" + String(decoding: preview.after, as: UTF8.self)
-                + "\n\nSOURCES\n" + preview.change.sources.map { $0.exactText }.joined(separator: "\n\n")
-                + "\n\nCONTRADICTIONS\n" + String(describing: preview.change.contradictions))
-              .frame(height: 180)
+                + "\n\nSOURCES\n"
+                + preview.change.sources.map { $0.exactText }.joined(separator: "\n\n")
+                + "\n\nCONTRADICTIONS\n" + String(describing: preview.change.contradictions)
+            )
+            .frame(height: 180)
           }
         } else {
           VStack(alignment: .leading, spacing: 12) {
@@ -245,7 +245,7 @@ struct ReviewView: View {
 
   private func candidateRow(_ candidate: MemoryReviewCandidate) -> some View {
     VStack(alignment: .leading, spacing: 8) {
-      Text(memoryReviewText(candidate.change.after)).lineLimit(4)
+      Text(MemoryDocument.reviewText(candidate.change.after)).lineLimit(4)
       Text(
         "\(dispositionTitle(candidate.disposition)) · \(MemoryScopeConfiguration.label(path: candidate.change.path, deviceKey: model.configuration.deviceKey))"
       )

@@ -67,17 +67,21 @@ struct DreamsView: View {
     ) {
       VStack(alignment: .leading, spacing: 16) {
         Text("Prepare Saved Suggestions").font(.title2.bold())
-        Text("No model call or charge. Nothing is saved into memory now. Each memory needs a fresh preview and separate Save into Memory approval.")
+        Text(
+          "No model call or charge. Nothing is saved into memory now. Each memory needs a fresh preview and separate Save into Memory approval."
+        )
         if let recovery = model.savedRecovery {
           Text("\(recovery.actionableCount) ready to review").font(.headline)
           ScrollView {
             VStack(alignment: .leading, spacing: 16) {
               ForEach(recovery.suggestions, id: \.change.id) { suggestion in
                 VStack(alignment: .leading, spacing: 6) {
-                  Text(memoryReviewText(suggestion.change.after))
-                  Text(MemoryScopeConfiguration.label(
-                    path: suggestion.change.path, deviceKey: model.configuration.deviceKey))
-                    .font(.caption).foregroundStyle(.secondary)
+                  Text(MemoryDocument.reviewText(suggestion.change.after))
+                  Text(
+                    MemoryScopeConfiguration.label(
+                      path: suggestion.change.path, deviceKey: model.configuration.deviceKey)
+                  )
+                  .font(.caption).foregroundStyle(.secondary)
                   if let blocker = suggestion.blocker {
                     Text(blocker).foregroundStyle(.orange)
                   }

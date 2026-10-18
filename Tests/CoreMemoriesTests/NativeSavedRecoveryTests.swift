@@ -4,6 +4,20 @@ import Testing
 @testable import CoreMemories
 @testable import CoreMemoriesApp
 
+@Test func nativeReviewPreviewPreservesLiteralSourcesAndStoredBytes() throws {
+  let text =
+    #"Keep `[source: literal; added: 2026-01-01]` and \[source: escaped; added: 2026-01-01] verbatim. [source: owner; added: 2026-01-01]"#
+  let bytes = Data(text.utf8)
+  #expect(MemoryDocument.entries(in: bytes).first?.isMutable == true)
+  #expect(
+    MemoryDocument.reviewText(bytes)
+      == #"Keep `[source: literal; added: 2026-01-01]` and \[source: escaped; added: 2026-01-01] verbatim."#
+  )
+  let fenced = Data("```text\n[source: code; added: 2026-01-01]\n```".utf8)
+  #expect(MemoryDocument.reviewText(fenced) == String(decoding: fenced, as: UTF8.self))
+  #expect(bytes == Data(text.utf8))
+}
+
 @Test @MainActor
 func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() async throws {
   let fixture = try TransactionFixture()
@@ -29,7 +43,7 @@ func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() a
   await model.prepareSavedRecovery()
   #expect(model.savedRecovery?.actionableCount == 1)
   let suggestion = try #require(model.savedRecovery?.suggestions.first)
-  #expect(!memoryReviewText(suggestion.change.after).contains("[source:"))
+  #expect(!MemoryDocument.reviewText(suggestion.change.after).contains("[source:"))
   #expect(String(decoding: suggestion.change.after, as: UTF8.self).contains("[source:"))
   #expect(model.preview == nil)
   #expect(try fixture.protectedState() == before)

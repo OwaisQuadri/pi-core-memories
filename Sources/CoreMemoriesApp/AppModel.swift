@@ -97,11 +97,14 @@ import Foundation
   func refreshSnapshot() async {
     await pauseQueue()
     savedRecovery = nil
-    presentation = nil
     apply(await workspace.refresh())
     if isWorkspaceLoaded || section == "Memories" {
       workspaceGeneration &+= 1
-      do { applyBatch(try await workspace.reprepareBatch()) } catch {
+      do {
+        let prepared = try await workspace.reprepareBatch()
+        clearEditor()
+        applyBatch(prepared)
+      } catch {
         failure = String(describing: error)
       }
     }
@@ -236,7 +239,9 @@ import Foundation
       self.checkout = nil
       if isWorkspaceLoaded {
         workspaceGeneration &+= 1
-        applyBatch(try await workspace.reprepareBatch())
+        let prepared = try await workspace.reprepareBatch()
+        clearEditor()
+        applyBatch(prepared)
       }
       presentation = nil
       message = "Checkout prepared; no memory was approved"
@@ -398,6 +403,7 @@ import Foundation
       try await workspace.configure(value)
       workspaceGeneration &+= 1
       configuration = value
+      clearEditor()
       batchProjection = nil
       retainedDraft = nil
       isWorkspaceLoaded = false

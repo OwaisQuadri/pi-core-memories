@@ -62,6 +62,18 @@ extension Workspace {
     let store = try editorStore()
     let controller = try availableReviewController()
     let restored = try currentDraft ?? store.list(review: controller).last
+    let opened = try prepareBatch(restoring: restored, catalogLimit: catalogLimit)
+    session = opened
+    currentDraft = opened.projection.draft
+    durableRevision = restored?.revision ?? 0
+    return opened.projection
+  }
+
+  private func prepareBatch(restoring: MemoryDraft?, catalogLimit: Int = 64) throws
+    -> MemoryBatchSession
+  {
+    let store = try editorStore()
+    let controller = try availableReviewController()
     let catalog = try MemoryManagement(repository: configuration.memoryURL).execute(
       .init(operation: .list))
     var paths = Set(catalog.entries.map(\.path) + ["MEMORY.md"])
@@ -73,19 +85,24 @@ extension Workspace {
         paths.insert("devices/\(device)/projects/\(key).md")
       }
     }
-    let opened = try MemoryBatchSession(
-      repository: configuration.memoryURL, drafts: store, review: controller,
-      restoring: restored, configurationURL: configURL,
-      allowedPaths: restored?.batch?.binding.allowedPaths ?? paths.sorted(),
-      catalogLimit: catalogLimit)
-    for path in paths.sorted()
-    where !opened.projection.draft.batch!.binding.allowedPaths.contains(path) {
-      try opened.preparePath(path)
+    let original = try restoring ?? store.create()
+    do {
+      let opened = try MemoryBatchSession(
+        repository: configuration.memoryURL, drafts: store, review: controller,
+        restoring: original, configurationURL: configURL,
+        allowedPaths: restoring?.batch?.binding.allowedPaths ?? paths.sorted(),
+        catalogLimit: catalogLimit)
+      for path in paths.sorted()
+      where !opened.projection.draft.batch!.binding.allowedPaths.contains(path) {
+        try opened.preparePath(path)
+      }
+      return opened
+    } catch {
+      if restoring == nil {
+        try store.discard(draftID: original.draftID, expectedRevision: original.revision)
+      }
+      throw error
     }
-    session = opened
-    currentDraft = opened.projection.draft
-    durableRevision = restored?.revision ?? 0
-    return opened.projection
   }
 
   func batch(_ command: NativeBatchCommand) throws -> NativeBatchUpdate {
@@ -224,12 +241,23 @@ extension Workspace {
   }
 
   func reprepareBatch() async throws -> MemoryBatchProjection {
+    guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
     if session != nil { _ = try await persistBatch() }
-    let previous = session
-    session = nil
-    do { return try openBatch() } catch {
-      session = previous
-      throw error
+    let previous = session?.projection.draft ?? currentDraft
+    let isEmpty = previous.map { $0.batch?.items.isEmpty ?? $0.operations.isEmpty } ?? false
+    let opened = try prepareBatch(restoring: isEmpty ? nil : previous)
+    if isEmpty, let previous {
+      do {
+        try editorStore().discard(
+          draftID: previous.draftID, expectedRevision: durableRevision ?? previous.revision)
+      } catch {
+        try editorStore().discard(draftID: opened.projection.draft.draftID, expectedRevision: 0)
+        throw error
+      }
     }
+    session = opened
+    currentDraft = opened.projection.draft
+    durableRevision = isEmpty || previous == nil ? 0 : previous?.revision
+    return opened.projection
   }
 }

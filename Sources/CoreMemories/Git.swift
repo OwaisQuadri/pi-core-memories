@@ -102,6 +102,23 @@ struct Git: Sendable {
   func directRefTransaction(_ commands: String, refs: [String], isolatedHead: String) throws
     -> CommandResult
   {
+    try directRefTransaction(commands, refs: refs, isolatedHead: isolatedHead, enrollment: nil)
+  }
+
+  func enrollSavedRecovery(
+    _ commands: String, refs: [String], isolatedHead: String,
+    installCheckpoint: () throws -> Void
+  ) throws -> CommandResult {
+    try withoutActuallyEscaping(installCheckpoint) { enrollment in
+      try directRefTransaction(
+        commands, refs: refs, isolatedHead: isolatedHead, enrollment: enrollment)
+    }
+  }
+
+  private func directRefTransaction(
+    _ commands: String, refs: [String], isolatedHead: String,
+    enrollment: (() throws -> Void)?
+  ) throws -> CommandResult {
     guard [40, 64].contains(isolatedHead.utf8.count),
       isolatedHead.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
       try text(["cat-file", "-t", isolatedHead]) == "commit",
@@ -169,6 +186,7 @@ struct Git: Sendable {
           throw MemoryError("ref must be direct: \(ref)")
         }
       }
+      try enrollment?()
       try input.fileHandleForWriting.write(contentsOf: Data("commit\n".utf8))
     }
     try input.fileHandleForWriting.close()

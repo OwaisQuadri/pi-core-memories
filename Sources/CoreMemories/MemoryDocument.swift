@@ -5,6 +5,9 @@ import Foundation
 /// - Returns: Path verdicts or annotation failures through its operations.
 /// - Throws: Nothing.
 public enum MemoryDocument {
+  private static let sourceRegex = try! NSRegularExpression(
+    pattern: #"\[source: ([^\[\];\r\n]+); added: ([0-9]{4}-[0-9]{2}-[0-9]{2})\]"#)
+
   /// Identifies paths that can contain approved memory.
   /// - Parameter path: A repository-relative file path.
   /// - Returns: Whether the path is MEMORY.md or a lowercase SHA-256 project file.
@@ -176,24 +179,20 @@ public enum MemoryDocument {
 
   static func sourceAnnotations(in bytes: Data) -> [String] {
     let text = String(decoding: bytes, as: UTF8.self)
-    let regex = try! NSRegularExpression(
-      pattern: #"\[source: ([^\[\];\r\n]+); added: ([0-9]{4}-[0-9]{2}-[0-9]{2})\]"#)
-    return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).map {
+    return sourceRegex.matches(in: text, range: NSRange(text.startIndex..., in: text)).map {
       String(text[Range($0.range, in: text)!])
     }
   }
 
-  private static func reviewMetadata(in bytes: Data) -> (
-    identity: UUID?, instant: ReviewInstant?, revision: ReviewInstant?, failure: String?,
-    range: Range<String.Index>?
-  ) {
-    let text = String(decoding: bytes, as: UTF8.self)
+  private static func metadataMatches(in text: String, regex: NSRegularExpression)
+    -> [NSTextCheckingResult]?
+  {
     let options = AttributedString.MarkdownParsingOptions(appliesSourcePositionAttributes: true)
     guard let parsed = try? AttributedString(markdown: text, options: options) else {
-      return (nil, nil, nil, "cannot parse review metadata", nil)
+      return nil
     }
     var lineStarts = [0]
-    let raw = Array(bytes)
+    let raw = Array(text.utf8)
     for index in raw.indices where raw[index] == 10 || raw[index] == 13 {
       if raw[index] == 13, index + 1 < raw.count, raw[index + 1] == 10 { continue }
       lineStarts.append(index + 1)
@@ -210,9 +209,7 @@ public enum MemoryDocument {
       let end = lineStarts[position.endLine - 1] + position.endColumn
       return start..<end
     }
-    let regex = try! NSRegularExpression(
-      pattern: #"(?i)\[\s*(memory-id|reviewed|revised)\b\s*:[^\]\r\n]*(?:\]|$)"#)
-    let matches = regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).filter {
+    return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).filter {
       guard let range = Range($0.range, in: text) else { return false }
       let start = text[..<range.lowerBound].utf8.count
       let end = start + text[range].utf8.count
@@ -224,6 +221,32 @@ public enum MemoryDocument {
       }
       return slashCount.isMultiple(of: 2)
         && allowed.contains { $0.contains(start) && end <= $0.upperBound }
+    }
+  }
+
+  package static func reviewText(_ bytes: Data) -> String {
+    var text = (try? editableEntry(bytes)) ?? String(decoding: bytes, as: UTF8.self)
+    guard let matches = metadataMatches(in: text, regex: sourceRegex) else { return text }
+    for match in matches.reversed() {
+      guard let range = Range(match.range, in: text) else { continue }
+      var start = range.lowerBound
+      while start > text.startIndex, [" ", "\t"].contains(text[text.index(before: start)]) {
+        start = text.index(before: start)
+      }
+      text.removeSubrange(start..<range.upperBound)
+    }
+    return text
+  }
+
+  private static func reviewMetadata(in bytes: Data) -> (
+    identity: UUID?, instant: ReviewInstant?, revision: ReviewInstant?, failure: String?,
+    range: Range<String.Index>?
+  ) {
+    let text = String(decoding: bytes, as: UTF8.self)
+    let regex = try! NSRegularExpression(
+      pattern: #"(?i)\[\s*(memory-id|reviewed|revised)\b\s*:[^\]\r\n]*(?:\]|$)"#)
+    guard let matches = metadataMatches(in: text, regex: regex) else {
+      return (nil, nil, nil, "cannot parse review metadata", nil)
     }
     guard matches.count <= 1 else {
       return (nil, nil, nil, "malformed or duplicate explicit review metadata", nil)
@@ -338,12 +361,10 @@ public enum MemoryDocument {
   private static func annotationFailures(lines: [String], blocks orderedBlocks: [Block]) -> [String]
   {
     var failures: [String] = []
-    let pattern = #"\[source: ([^\[\];\r\n]+); added: ([0-9]{4}-[0-9]{2}-[0-9]{2})\]"#
-    let regex = try! NSRegularExpression(pattern: pattern)
     for record in orderedBlocks {
       let firstLine = record.firstLine
       let block = lines[(record.firstLine - 1)..<record.lastLine].joined(separator: "\n")
-      let annotations = regex.matches(in: block, range: NSRange(block.startIndex..., in: block))
+      let annotations = sourceRegex.matches(in: block, range: NSRange(block.startIndex..., in: block))
       if annotations.isEmpty && record.isAnnotationRequired {
         failures.append(
           "line \(firstLine): missing or malformed [source: reference; added: YYYY-MM-DD]")

@@ -49,13 +49,19 @@ Start a new Pi session. Set `PI_CORE_MEMORIES_REPO` when your data store differs
 
 The package adds memory loading, `/dream`, `/mem-review`, `/mem-rereview`, `/mem-prepare`, and the existing memory management tools. Installing the package does not approve candidates or run a dream.
 
-## Dreams
+## Find suggestions
 
-The app shows saved runs, each saved attempt, its model selection, and reply validation failures. Expand a run to inspect its exact request, context, reply, or receipt. Inspection does not call a model or advance dream progress.
+Choose Find Suggestions to process recent conversations. The queue shows dreamt text, undreamt text, and free queue capacity. Batch sizes come from runtime measurements; unavailable measurements stay unknown.
 
-Start resumes saved work when present. Process All continues through the backlog and stops on a pending result. Retry Interrupted Call and Replace Invalid Reply require separate choices because they can make another billable call. Replacement retains the rejected reply and keeps the frozen validation rules.
+Review Suggestions shows waiting suggestions separately from reviewed history. A finished run and a manual refresh reload the suggestion list. Saving a suggestion still requires a fresh preview and Save into Memory.
 
-Cancel affects only the invocation that the app owns. Other Pi sessions remain separate.
+If approved memories changed after a reply was saved, choose Prepare Saved Suggestions. Inspect the saved suggestions and their blockers, then confirm Prepare for Review. This action makes no model call and changes no approved memories. Each compatible suggestion still needs separate review and approval. Changed or ambiguous targets stay blocked.
+
+Details contains saved runs, attempts, model selection, validation failures, and exact artifacts. Inspection does not call a model or advance dream progress.
+
+Other Actions includes processing all waiting batches. Retry Interrupted Call and Replace Invalid Reply can make another billable call. Neither repairs a saved reply whose publication stopped after approved memories changed. Replacement retains the rejected reply and keeps the frozen validation rules.
+
+Stop Finding Suggestions affects only the invocation that the app owns. Other Pi sessions remain separate.
 
 In Settings, select the Pi executable and agent directory. Empty selection fields use Pi defaults. Explicit provider, model, and thinking settings must match Pi's resolved selection before a request starts. Credentials stay in Pi's normal credential stores.
 
@@ -77,7 +83,7 @@ Memory edits persist as local drafts. Save Changes validates the whole draft and
 
 Use Prepare Checkout before the first publication from an attached initialization checkout. It preserves that checkout's files and index. It does not approve memory.
 
-Dream candidates stay separate from edit drafts. Review shows a current preview, sources, contradictions, and the proposed change. Approve This Entry applies only that preview. Restoring a draft does not restore candidate approval authority.
+Dream suggestions stay separate from edit drafts. Review Suggestion shows the proposed memory, before and after text, and the reason. Details contains the exact stored entry, sources, and contradictions. Save into Memory applies only the fresh preview. Restoring a draft does not restore candidate approval authority.
 
 Reveal Checkout in Finder opens the selected working-file location, or the repository folder when that file is not checked out. The editor reads committed approved bytes, not dirty working files. Existing Pi sessions keep their saved memory snapshot; start a new session to load changed memory.
 

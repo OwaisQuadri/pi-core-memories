@@ -447,6 +447,9 @@ package final class MemoryReviewController {
     }
     let bytes = snapshot.documents.first(where: { $0.path == change.path })?.bytes ?? Data()
     var range = change.locator.map { $0.start..<$0.end }
+    if candidates[change.id.rawValue]?.1.recoveryCheckpointHash != nil {
+      return try Self.recoveredTarget(change, frozen: frozen, snapshot: snapshot)
+    }
     let edits = try approvedEdits(from: change.base, to: base)
     for edit in edits where edit.preview.path == change.path {
       if let target = range {
@@ -579,6 +582,11 @@ package final class MemoryReviewController {
       payload.start >= 0, payload.end >= payload.start, payload.end <= bytes.count,
       Data(bytes[payload.start..<payload.end]) == payload.before
     else { throw DreamRunError.corruption }
+    if admission.recoveryCheckpointHash != nil {
+      let frozen = try loadSnapshot?(change.base) ?? store.reviewSnapshot(base: change.base)
+      let target = try Self.recoveredTarget(change, frozen: frozen, snapshot: snapshot)
+      guard target.range == payload.start..<payload.end else { throw DreamRunError.corruption }
+    }
     switch change.operation {
     case .add:
       guard payload.start == bytes.count, payload.end == bytes.count, payload.before.isEmpty else {
@@ -607,6 +615,69 @@ package final class MemoryReviewController {
       MemoryDocument.entries(in: replacement).first(where: { $0.identity == payload.identity })?
         .bytes == payload.after
     else { throw DreamRunError.corruption }
+  }
+
+  static func recoveredTarget(
+    _ change: AtomicMemoryChange, frozen: ApprovedDecisionSnapshot,
+    snapshot: ApprovedDecisionSnapshot
+  ) throws -> (
+    snapshot: ApprovedDecisionSnapshot, bytes: Data, range: Range<Int>,
+    locator: MemoryDocument.EntryLocator?
+  ) {
+    let original = frozen.documents.first(where: { $0.path == change.path })?.bytes
+    guard change.path == change.scope.path,
+      original.map(SourceDigest.init(bytes:)) == change.documentHash
+    else { throw MemoryError("frozen target document changed") }
+    let document = snapshot.documents.first(where: { $0.path == change.path })
+    if let document {
+      guard document.mode == "100644", document.diagnostics.isEmpty else {
+        throw MemoryError("current memory document cannot be changed safely")
+      }
+    }
+    let entries = snapshot.reviewEntries()
+    let frozenEntries = frozen.reviewEntries()
+    func exactEntry(path: String, original: MemoryDocument.MemoryEntry) throws
+      -> MemoryDocument.MemoryEntry
+    {
+      let matches = entries.filter {
+        $0.path == path && $0.entry.identity == original.identity && $0.entry.bytes == original.bytes
+      }
+      guard let document = snapshot.documents.first(where: { $0.path == path }),
+        document.mode == "100644", document.diagnostics.isEmpty,
+        original.isMutable, matches.count == 1, matches[0].entry.isMutable else {
+        throw MemoryError("selected memory changed or is ambiguous")
+      }
+      return matches[0].entry
+    }
+    for contradiction in change.contradictions {
+      guard case .memory(let anchor, _) = contradiction else { continue }
+      guard let document = frozen.documents.first(where: { $0.path == anchor.scope.path }),
+        document.digest == anchor.documentHash,
+        let entry = frozenEntries.first(where: {
+          $0.path == anchor.scope.path && $0.entry.locator.start == anchor.start
+            && $0.entry.locator.end == anchor.end && $0.entry.bytes == Data(anchor.before.utf8)
+        })?.entry
+      else { throw MemoryError("frozen contradiction anchor changed") }
+      _ = try exactEntry(path: anchor.scope.path, original: entry)
+    }
+    let bytes = document?.bytes ?? Data()
+    switch change.operation {
+    case .add:
+      let identity = try change.entryID ?? assignedIdentity(change.id.rawValue)
+      guard !entries.contains(where: { $0.entry.identity == identity }) else {
+        throw MemoryError("memory identity is already in use")
+      }
+      return (snapshot, bytes, bytes.count..<bytes.count, nil)
+    case .update:
+      guard let locator = change.locator, let before = change.before,
+        let entry = frozenEntries.first(where: {
+          $0.path == change.path && $0.entry.locator == locator
+            && $0.entry.bytes == before && $0.entry.identity == change.entryID
+        })?.entry
+      else { throw MemoryError("frozen target entry changed") }
+      let current = try exactEntry(path: change.path, original: entry)
+      return (snapshot, bytes, current.locator.start..<current.locator.end, current.locator)
+    }
   }
 
   private func approvedEdits(from base: String, to current: String) throws -> [ReviewAttempt] {

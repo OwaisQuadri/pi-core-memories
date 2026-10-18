@@ -76,11 +76,21 @@ struct WorkspaceView: View {
     "moon.stars", "checkmark.seal", "text.book.closed", "square.and.pencil", "gearshape",
   ]
 
+  private func sectionTitle(_ section: String) -> String {
+    switch section {
+    case "Dreams": "Find Suggestions"
+    case "Review": "Review Suggestions"
+    case "Memories": "Saved Memories"
+    case "Changes": "Your Changes"
+    default: section
+    }
+  }
+
   var body: some View {
     NavigationSplitView {
       List(selection: $model.section) {
         ForEach(Array(sections.enumerated()), id: \.element) { index, section in
-          Label(section, systemImage: icons[index]).tag(section)
+          Label(sectionTitle(section), systemImage: icons[index]).tag(section)
         }
       }.navigationTitle("Core Memories").navigationSplitViewColumnWidth(min: 170, ideal: 190)
     } detail: {
@@ -104,7 +114,7 @@ struct WorkspaceView: View {
               .font(.caption)
           }
         }.padding(.horizontal, 16).padding(.vertical, 9)
-      }.navigationTitle(model.section)
+      }.navigationTitle(sectionTitle(model.section))
         .toolbar {
           Button {
             Task { await model.refresh() }

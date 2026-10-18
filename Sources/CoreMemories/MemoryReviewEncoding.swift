@@ -39,9 +39,11 @@ struct ReviewAdmission: Codable, Equatable {
   let completionHash: String
   let decisionsHash: String
   let receipts: [[String]]
+  let recoveryCheckpointHash: String?
 
   init(change: AtomicMemoryChange, bundle: VerifiedDreamReviewCandidates) {
-    schemaVersion = 1
+    schemaVersion = bundle.recoveryCheckpointHash == nil ? 1 : 2
+    recoveryCheckpointHash = bundle.recoveryCheckpointHash?.rawValue
     candidateID = change.id.rawValue
     runID = bundle.runID
     generation = bundle.generation

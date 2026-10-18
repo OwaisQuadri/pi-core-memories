@@ -65,6 +65,7 @@ extension Workspace {
     let catalog = try MemoryManagement(repository: configuration.memoryURL).execute(
       .init(operation: .list))
     var paths = Set(catalog.entries.map(\.path) + ["MEMORY.md"])
+    for candidate in try controller?.list() ?? [] { paths.insert(candidate.change.path) }
     for key in configuration.projectBindings.values { paths.insert("projects/\(key).md") }
     if let device = configuration.deviceKey {
       paths.insert("devices/\(device)/MEMORY.md")
@@ -74,8 +75,13 @@ extension Workspace {
     }
     let opened = try MemoryBatchSession(
       repository: configuration.memoryURL, drafts: store, review: controller,
-      restoring: restored, configurationURL: configURL, allowedPaths: paths.sorted(),
+      restoring: restored, configurationURL: configURL,
+      allowedPaths: restored?.batch?.binding.allowedPaths ?? paths.sorted(),
       catalogLimit: catalogLimit)
+    for path in paths.sorted()
+    where !opened.projection.draft.batch!.binding.allowedPaths.contains(path) {
+      try opened.preparePath(path)
+    }
     session = opened
     currentDraft = opened.projection.draft
     durableRevision = restored?.revision ?? 0

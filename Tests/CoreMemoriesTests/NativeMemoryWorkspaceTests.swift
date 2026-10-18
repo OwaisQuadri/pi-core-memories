@@ -68,6 +68,105 @@ extension Workspace {
   return model
 }
 
+@Test(arguments: ["project", "deviceProject"])
+@MainActor func nativeAbsentUnboundSuggestionTargetsRemainDiscoverable(scope: String) async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let project = fixture.root.appendingPathComponent("project")
+  try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
+  _ = try Git(repo: project, environment: [:]).data(["init", "--template="])
+  let key = try #require(try MemoryStore.projectKey(cwd: project))
+  let device = String(repeating: "a", count: 64)
+  try fixture.populate(cwd: project.path)
+  let sources = try DreamRunStore(
+    stateRoot: fixture.state, sessionsRoot: fixture.sessions, memoryRepository: fixture.memory,
+    strippingRoots: [fixture.snippets], deviceKey: device)
+  _ = try transactionCompleted(
+    sources.run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { request in
+        let context = try transactionObject(request)
+        let evidence = try #require((context["primaryEvidence"] as? [[String: Any]])?.first)
+        var target = ["kind": scope, "key": key]
+        if scope == "deviceProject" { target["deviceKey"] = device }
+        return try transactionResponse(
+          request,
+          decisions: [
+            [
+              "kind": "add", "scope": target, "text": "Retain this project preference.",
+              "sources": [evidence["source"]!], "contradictions": [], "reason": "Explicit scope",
+            ]
+          ])
+      }))
+  var configuration = queueConfiguration(fixture)
+  configuration.deviceKey = device
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  let base = try fixture.main()
+  let model = AppModel(configURL: url)
+  model.section = "Memories"
+  await model.load()
+  await model.pauseQueue()
+  try #require(model.failure == nil)
+  #expect(model.configuration.projectBindings.isEmpty)
+  let expectedPath =
+    scope == "project" ? "projects/\(key).md" : "devices/\(device)/projects/\(key).md"
+  #expect(model.batchProjection?.candidateCount == 1)
+  let candidate = try #require(model.actionableCandidates.first)
+  #expect(candidate.change.path == expectedPath)
+  #expect(
+    !FileManager.default.fileExists(
+      atPath: fixture.memory.appendingPathComponent(expectedPath).path))
+  await model.selectMemory(.candidate(candidate.change.id.rawValue))
+  await model.stageShown()
+  #expect(model.stagedItems.count == 1)
+  #expect(try fixture.main() == base)
+  try await model.shutdown()
+}
+
+@Test @MainActor func nativeNewSuggestionPathsPreserveRestoredStagedIntent() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let project = fixture.root.appendingPathComponent("project")
+  try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
+  _ = try Git(repo: project, environment: [:]).data(["init", "--template="])
+  try fixture.populate(texts: ["Initial preference."], cwd: project.path)
+  let sources = try fixture.store()
+  _ = try transactionCompleted(
+    sources.run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { try transactionAdd($0) }))
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try queueConfiguration(fixture).save(to: url)
+  let model = AppModel(configURL: url)
+  model.section = "Memories"
+  await model.load()
+  let candidate = try #require(model.actionableCandidates.first)
+  await model.selectMemory(.candidate(candidate.change.id.rawValue))
+  await model.stageShown()
+  try await model.flushInputAndPersistence()
+  let staged = try #require(model.stagedItems.first)
+  try await model.shutdown()
+  try fixture.populate(
+    texts: ["Initial preference.", "New project preference."], cwd: project.path)
+  _ = try transactionCompleted(
+    sources.run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { try transactionAdd($0, isProject: true) }))
+  let reopened = AppModel(configURL: url)
+  reopened.section = "Memories"
+  await reopened.load()
+  #expect(reopened.failure == nil)
+  #expect(reopened.stagedItems.map(\.itemID) == [staged.itemID])
+  #expect(reopened.batchProjection?.needsReview == [staged.itemID])
+  #expect(reopened.actionableCandidates.contains { $0.change.path.hasPrefix("projects/") })
+  await reopened.refresh()
+  #expect(reopened.failure == nil)
+  #expect(reopened.stagedItems.map(\.itemID) == [staged.itemID])
+  #expect(reopened.actionableCandidates.contains { $0.change.path.hasPrefix("projects/") })
+  try await reopened.shutdown()
+}
+
 @Test @MainActor func nativeMixedChoicesPublishOnlyThroughOneFinalSave() async throws {
   let fixture = try ReviewFlowFixture()
   defer { fixture.transaction.clean() }

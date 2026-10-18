@@ -72,7 +72,11 @@ package struct MemoryBatchPresentation: Sendable {
 package struct MemoryBatchProjection: Sendable {
   package let draft: MemoryDraft
   package let entries: [ManagedMemoryEntry]
+  package let candidates: [MemoryReviewCandidate]
   package let selectedItemID: UUID?
+  package let catalogOffset: Int
+  package let entryCount: Int
+  package let candidateCount: Int
   package let needsReview: Set<UUID>
 }
 

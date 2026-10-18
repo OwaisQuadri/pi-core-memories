@@ -418,15 +418,22 @@ public final class DreamRunStore {
   }
 
   package func verifiedCompletedReviewCandidates() throws -> [VerifiedDreamReviewCandidates] {
+    try withVerifiedReviewCandidates { $0 }
+  }
+
+  func withVerifiedReviewCandidates<T>(
+    _ operation: ([VerifiedDreamReviewCandidates]) throws -> T
+  ) throws -> T {
     guard operationLock.try() else { throw DreamRunError.busy }
     defer { operationLock.unlock() }
+    let lock = try root.openReadLock()
+    defer {
+      _ = flock(lock, LOCK_UN)
+      _ = close(lock)
+    }
+    guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
+    var bundles: [VerifiedDreamReviewCandidates] = []
     do {
-      let lock = try root.openReadLock()
-      defer {
-        _ = flock(lock, LOCK_UN)
-        _ = close(lock)
-      }
-      guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
       try root.verifyLock(lock)
       _ = try root.retainedBytes(maximum: limits.maximumStateBytes)
       guard
@@ -434,12 +441,11 @@ public final class DreamRunStore {
       else {
         throw DreamRunError.unsafeState
       }
-      var bundles: [VerifiedDreamReviewCandidates] = []
       _ = try loadChain { bundles.append($0) }
-      return bundles
     } catch DreamRunError.busy { throw DreamRunError.busy } catch {
       throw DreamRunError.nativeReviewLimitation("saved completion verification failed: \(error)")
     }
+    return try operation(bundles)
   }
 
   package func previewSavedRecovery(runID: String) throws -> SavedDreamRecoveryPreview {

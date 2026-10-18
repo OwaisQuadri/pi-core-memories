@@ -21,7 +21,7 @@ package struct MemoryReviewPreview: Sendable {
   package let after: Data
   package let replacement: Data
   package let digest: SourceDigest
-  fileprivate let payload: ReviewPreviewPayload
+  let payload: ReviewPreviewPayload
 }
 
 package struct MemoryReviewCheckoutPreview: Sendable {
@@ -52,24 +52,28 @@ package struct MemoryReviewMutationFailure: Error, CustomStringConvertible {
 }
 
 package final class MemoryReviewController {
-  private let root: DreamStateDirectory
+  let root: DreamStateDirectory
   private let stateURL: URL
-  private let repository: URL
+  let repository: URL
   private let sources: DreamRunStore
-  private let store: MemoryStore
-  private let binding: ReviewRootBinding
+  let store: MemoryStore
+  let binding: ReviewRootBinding
   private let repositoryDevice: dev_t
   private let stateDevice: dev_t
   private let writer: Int32
   private let operationLock = NSLock()
-  private var candidates: [String: (AtomicMemoryChange, ReviewAdmission, [String])] = [:]
-  private var previews: [String: ReviewPreviewPayload] = [:]
+  var candidates: [String: (AtomicMemoryChange, ReviewAdmission, [String])] = [:]
+  var batchPublications: [String: VerifiedMemoryPublication] = [:]
+  var legacyPublications: [String: VerifiedMemoryPublication] = [:]
+  var batchSelections: [String: MemoryReviewDisposition] = [:]
+  var previews: [String: ReviewPreviewPayload] = [:]
   private var checkoutPreviews: [String: ReviewCheckoutWitness] = [:]
-  private var approvals: [String: ReviewAttempt] = [:]
-  private var checkoutState: DreamStateDirectory?
+  var approvals: [String: ReviewAttempt] = [:]
+  var checkoutState: DreamStateDirectory?
   var fileIO = MemoryReviewFileIO()
   package var isCancelled: () -> Bool = { false }
   var persistenceFault: ((MemoryReviewPersistenceEvent) throws -> Void)?
+  var batchHistoryObserver: (() -> Void)?
 
   package init(
     repository: URL, stateRoot: URL, sources: DreamRunStore,
@@ -297,53 +301,18 @@ package final class MemoryReviewController {
 
   package func apply(_ preview: MemoryReviewPreview) throws -> MemoryReviewApproval {
     try locked {
-      try refresh()
-      let payload = preview.payload
-      guard previews.removeValue(forKey: payload.candidateID) == payload,
-        try selection(payload.candidateID) == .pending
-          || selection(payload.candidateID) == .deferred,
-        preview.digest.rawValue
-          == SourceDigest(bytes: try MemoryReviewEncoding.encode(payload)).rawValue,
-        try store.approvedCommit() == payload.currentBase
-      else { throw MemoryError("entry preview changed; review it again") }
-      guard !isCancelled() else { throw MemoryError("review cancelled before publication") }
-      let checkout = try store.reviewGit.reviewCheckout()
-      try checkout.lock(
-        state: checkoutState!, detachedHead: Data((payload.checkout.commit + "\n").utf8))
-      try persistenceFault?(.afterCheckoutLocks)
-      guard payload.checkout.head == Data((payload.checkout.commit + "\n").utf8),
-        try checkout.witness(isLocked: true) == payload.checkout
-      else { throw MemoryError("explicit checkout detach or a fresh entry preview is required") }
-      try validatePayload(payload)
-      let message = try Self.approvalMessage(payload)
-      let commit = try store.reviewCommit(
-        base: payload.currentBase, path: payload.path, replacement: payload.replacement,
-        message: message)
-      let git = store.reviewGit
-      let attempt = ReviewAttempt(
-        schemaVersion: 1, preview: payload, previewHash: preview.digest.rawValue,
-        resultCommit: commit, resultTree: try git.text(["rev-parse", "\(commit)^{tree}"]),
-        auditRef: "refs/memory-review/approvals/\(preview.digest.rawValue)")
-      try root.installReviewFile(
-        MemoryReviewEncoding.encode(attempt), name: "attempt-\(attempt.previewHash).json",
-        fault: persistenceFault, io: fileIO)
-      try persistenceFault?(.beforePublication)
-      guard !isCancelled() else { throw MemoryError("review cancelled before publication") }
-      try store.publishCheckedMemoryCommit(
-        commit: commit, base: payload.currentBase, auditRef: attempt.auditRef,
-        checkout: payload.checkout)
-      previews.removeAll()
-      do {
-        try persistenceFault?(.afterPublication)
-        try recoverApprovals()
-      } catch {
-        throw MemoryReviewMutationFailure(
-          mutation: .approved, commit: commit, auditRef: attempt.auditRef,
-          followUpFailure: "\(error)")
+      try withBatchSources(state: checkoutState!) {
+        let payload = preview.payload
+        guard previews.removeValue(forKey: payload.candidateID) == payload,
+          try selection(payload.candidateID) == .pending
+            || selection(payload.candidateID) == .deferred,
+          preview.digest.rawValue
+            == SourceDigest(bytes: try MemoryReviewEncoding.encode(payload)).rawValue,
+          try store.approvedCommit() == payload.currentBase
+        else { throw MemoryError("entry preview changed; review it again") }
+        guard !isCancelled() else { throw MemoryError("review cancelled before publication") }
+        return try MemoryBatchPublisher.applyLegacy(preview, review: self)
       }
-      return MemoryReviewApproval(
-        candidateID: preview.change.id, previewHash: preview.digest, commit: commit,
-        auditRef: attempt.auditRef)
     }
   }
 
@@ -370,7 +339,8 @@ package final class MemoryReviewController {
     }
   }
 
-  private func selection(_ id: String) throws -> MemoryReviewDisposition {
+  func selection(_ id: String) throws -> MemoryReviewDisposition {
+    if let disposition = batchSelections[id] { return disposition }
     if approvals[id] != nil { return .approved }
     for disposition in [MemoryReviewDisposition.rejected, .deferred] {
       let name = "\(disposition.rawValue)-\(id).json"
@@ -387,10 +357,11 @@ package final class MemoryReviewController {
     return .pending
   }
 
-  private func refresh() throws {
+  func refresh(bundles supplied: [VerifiedDreamReviewCandidates]? = nil) throws {
+    batchHistoryObserver?()
     try verifyBinding()
     try store.reviewGit.reviewCheckout().recoverLease(state: root)
-    let bundles = try sources.verifiedCompletedReviewCandidates()
+    let bundles = try supplied ?? sources.verifiedCompletedReviewCandidates()
     var loaded: [String: (AtomicMemoryChange, ReviewAdmission, [String])] = [:]
     for bundle in bundles {
       for change in bundle.changes {
@@ -403,6 +374,12 @@ package final class MemoryReviewController {
     guard loaded.count <= 10_000 else { throw DreamRunError.limitExceeded }
     for name in try root.names() where !name.hasPrefix(".pending-") {
       if name == "root.json" || name == "writer.lock" { continue }
+      if name == "batch-format.json" || name.hasPrefix("batch-decisions-")
+        || name.hasPrefix("batch-attempt-") || name.hasPrefix("batch-draft-")
+        || name.hasPrefix("batch-receipt-")
+      {
+        continue
+      }
       if name.hasPrefix("attempt-") || name.hasPrefix("detach-") { continue }
       let prefixes = ["candidate-", "rejected-", "deferred-", "outcome-"]
       guard let prefix = prefixes.first(where: name.hasPrefix), name.hasSuffix(".json") else {
@@ -421,6 +398,7 @@ package final class MemoryReviewController {
     }
     candidates = loaded
     try recoverApprovals()
+    try recoverBatches()
   }
 
   private func currentTarget(
@@ -450,19 +428,12 @@ package final class MemoryReviewController {
     if candidates[change.id.rawValue]?.1.recoveryCheckpointHash != nil {
       return try Self.recoveredTarget(change, frozen: frozen, snapshot: snapshot)
     }
-    let edits = try approvedEdits(from: change.base, to: base)
-    for edit in edits where edit.preview.path == change.path {
-      if let target = range {
-        let span = edit.preview.start..<edit.preview.end
-        if span.upperBound <= target.lowerBound {
-          let delta = edit.preview.replacement.count - edit.preview.originalDocument.count
-          range = (target.lowerBound + delta)..<(target.upperBound + delta)
-        } else if span.lowerBound < target.upperBound {
-          throw MemoryError("approved sibling overlaps the selected entry")
-        }
-      }
+    let publications = try verifiedPublications(from: change.base, to: base)
+    if let target = range {
+      range = try MemoryBatchComposition.transformed(
+        target, path: change.path, publications: publications)
     }
-    try verifyConflictAnchors(change, snapshot: snapshot, edits: edits)
+    _ = try batchAnchors(change, snapshot: snapshot, publications: publications)
     switch change.operation {
     case .add:
       return (snapshot, bytes, bytes.count..<bytes.count, nil)
@@ -479,7 +450,7 @@ package final class MemoryReviewController {
     }
   }
 
-  private func recoverApprovals() throws {
+  func recoverApprovals() throws {
     let git = store.reviewGit
     let limits = try DreamDecisionLimits()
     let attempts = try root.names().filter { $0.hasPrefix("attempt-") }
@@ -557,10 +528,11 @@ package final class MemoryReviewController {
         io: fileIO)
     }
     approvals = recovered
+    try indexLegacyPublications()
     try recoverDetach()
   }
 
-  private func validatePayload(
+  func validatePayload(
     _ payload: ReviewPreviewPayload,
     loadSnapshot: ((String) throws -> ApprovedDecisionSnapshot)? = nil
   ) throws {
@@ -680,49 +652,6 @@ package final class MemoryReviewController {
     }
   }
 
-  private func approvedEdits(from base: String, to current: String) throws -> [ReviewAttempt] {
-    var cursor = current
-    var reverse: [ReviewAttempt] = []
-    var visited: Set<String> = []
-    while cursor != base {
-      guard visited.insert(cursor).inserted,
-        let edit = approvals.values.first(where: { $0.resultCommit == cursor }),
-        approvals.values.filter({ $0.resultCommit == cursor }).count == 1
-      else { throw MemoryError("main contains changes outside verified entry approvals") }
-      reverse.append(edit)
-      cursor = edit.preview.currentBase
-      guard reverse.count <= 10_000 else { throw DreamRunError.limitExceeded }
-    }
-    return reverse.reversed()
-  }
-
-  private func verifyConflictAnchors(
-    _ change: AtomicMemoryChange, snapshot: ApprovedDecisionSnapshot, edits: [ReviewAttempt]
-  ) throws {
-    for contradiction in change.contradictions {
-      guard case .memory(let anchor, _) = contradiction else { continue }
-      var range = anchor.start..<anchor.end
-      for edit in edits where edit.preview.path == anchor.scope.path {
-        let span = edit.preview.start..<edit.preview.end
-        if span.upperBound <= range.lowerBound {
-          let delta = edit.preview.replacement.count - edit.preview.originalDocument.count
-          range = (range.lowerBound + delta)..<(range.upperBound + delta)
-        } else if span.lowerBound < range.upperBound {
-          throw MemoryError("a supplied memory contradiction changed")
-        }
-      }
-      guard let bytes = snapshot.documents.first(where: { $0.path == anchor.scope.path })?.bytes,
-        range.lowerBound >= 0, range.upperBound <= bytes.count,
-        Data(bytes[range]) == Data(anchor.before.utf8),
-        snapshot.reviewEntries().contains(where: {
-          $0.path == anchor.scope.path && $0.entry.isMutable
-            && $0.entry.locator.start == range.lowerBound
-            && $0.entry.locator.end == range.upperBound
-        })
-      else { throw MemoryError("a supplied memory contradiction changed or is ambiguous") }
-    }
-  }
-
   private func directAudit(_ ref: String, objects: ReviewGitObjects? = nil) throws -> String? {
     let git = store.reviewGit
     guard try git.run(["symbolic-ref", "--quiet", ref]).status == 1 else {
@@ -798,7 +727,7 @@ package final class MemoryReviewController {
     }
   }
 
-  private static func approvalMessage(_ payload: ReviewPreviewPayload) throws -> Data {
+  static func approvalMessage(_ payload: ReviewPreviewPayload) throws -> Data {
     Data("Core memory native review\n\n".utf8) + (try MemoryReviewEncoding.encode(payload))
       + Data("\n".utf8)
   }
@@ -829,7 +758,22 @@ package final class MemoryReviewController {
     _ = try root.retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
   }
 
-  private func locked<T>(_ operation: () throws -> T) throws -> T {
+  func withBatchOwnership<T>(_ operation: () throws -> T) throws -> T {
+    guard operationLock.try() else { throw DreamRunError.busy }
+    defer { operationLock.unlock() }
+    return try operation()
+  }
+
+  func withBatchSources<T>(state: DreamStateDirectory, _ operation: () throws -> T) throws -> T {
+    try sources.withVerifiedReviewCandidates { bundles in
+      checkoutState = state
+      defer { checkoutState = nil }
+      try refresh(bundles: bundles)
+      return try operation()
+    }
+  }
+
+  func locked<T>(_ operation: () throws -> T) throws -> T {
     guard operationLock.try() else { throw DreamRunError.busy }
     defer { operationLock.unlock() }
     return try store.reviewGit.reviewCheckout().withLeaseState { state in
@@ -839,7 +783,7 @@ package final class MemoryReviewController {
     }
   }
 
-  private static func assignedIdentity(_ id: String) throws -> UUID {
+  static func assignedIdentity(_ id: String) throws -> UUID {
     let hex = String(
       SourceDigest(bytes: Data(("memory-review-entry:" + id).utf8)).rawValue.prefix(32))
     let parts = [

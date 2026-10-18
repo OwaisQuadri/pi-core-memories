@@ -72,6 +72,7 @@ func runCommand(
 }
 
 struct Git: Sendable {
+  @TaskLocal static var memoryBatchCommandObserver: (@Sendable () -> Void)?
   let repo: URL
   let environment: [String: String]
 
@@ -90,7 +91,8 @@ struct Git: Sendable {
   func run(_ arguments: [String], input: Data = Data(), additions: [String: String] = [:]) throws
     -> CommandResult
   {
-    try runCommand(
+    Self.memoryBatchCommandObserver?()
+    return try runCommand(
       executable: URL(fileURLWithPath: "/usr/bin/git"),
       arguments: [
         "-C", repo.path, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
@@ -165,6 +167,7 @@ struct Git: Sendable {
     process.standardInput = input
     process.standardOutput = output
     process.standardError = stderr
+    Self.memoryBatchCommandObserver?()
     let exit = try launch(process)
     defer {
       try? input.fileHandleForWriting.close()

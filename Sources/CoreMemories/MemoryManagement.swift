@@ -292,30 +292,41 @@ package final class MemoryManagement {
     guard try store.approvedCommit() == base, date.timeIntervalSince1970.isFinite else {
       throw MemoryError("approved base changed; open native review again")
     }
-    let snapshot = try store.reviewSnapshot(base: base)
-    let rows = snapshot.reviewEntries()
-    let identities = rows.compactMap { $0.entry.identity }
-    guard Set(identities).count == identities.count,
-      let target = rows.first(where: { $0.path == entry.path && $0.entry.locator == entry.locator }
-      ),
-      target.entry.isMutable, target.entry.bytes == Data(entry.expected.utf8)
-    else { throw MemoryError("entry changed or is not mutable; open native review again") }
     let instant = try MemoryDocument.ReviewInstant(ISO8601DateFormatter().string(from: date))
-    let after = try MemoryDocument.reviewedBytes(
-      target.entry.bytes, identity: target.entry.identity ?? UUID(), instant: instant)
-    guard var replacement = snapshot.documents.first(where: { $0.path == entry.path })?.bytes else {
-      throw MemoryError("approved document is missing")
+    let intent = MemoryBatchReviewIntent(
+      entry: entry,
+      identity: entry.identity
+        ?? memoryBatchIdentity("review-entry:\(base):\(entry.path):\(entry.locator.start)"),
+      instant: instant)
+    let id = memoryBatchIdentity("confirm-reviewed:\(base):\(try memoryBatchDigest(intent))")
+    let item = MemoryBatchItem(itemID: id, generation: 0, intent: .confirmReviewed(intent))
+    let batch = MemoryBatchContents(
+      binding: MemoryBatchBinding(
+        configurationPath: nil, configurationDigest: nil, allowedPaths: [entry.path],
+        reviewBinding: nil), items: [item])
+    let draft = MemoryDraft(
+      schemaVersion: 2, draftID: id, revision: 0,
+      repositoryBinding: SourceDigest(bytes: Data(git.repo.path.utf8)).rawValue,
+      baseCommit: base, created: date, operations: [], batch: batch)
+    let checkout = try git.reviewCheckout()
+    return try checkout.withLeaseState { state in
+      let publisher = MemoryBatchPublisher(root: state, store: store, review: nil)
+      let result = try publisher.save(
+        draft, checkout: checkout.witness(), authorized: [id], leaseState: state)
+      switch result {
+      case .saved(let receipt):
+        return MemoryManagementResult(
+          base: base, entries: [], commit: receipt.commit, auditRef: receipt.auditRef,
+          message: "Reviewed entry committed.")
+      case .savedNeedsRecovery(let receipt, let details):
+        throw MemoryReviewMutationFailure(
+          mutation: .approved, commit: receipt.commit!, auditRef: receipt.auditRef,
+          followUpFailure: details)
+      case .outcomeUnknown(let saveID, let details):
+        throw MemoryBatchRecoveryRequired(saveID: saveID, details: details)
+      case .decisionsSaved: throw DreamRunError.corruption
+      }
     }
-    replacement.replaceSubrange(entry.locator.start..<entry.locator.end, with: after)
-    let auditBytes = try JSONSerialization.data(
-      withJSONObject: [
-        "origin": "native-approved-entry-review", "base": base, "path": entry.path,
-        "before": entry.expected, "after": String(decoding: after, as: UTF8.self),
-        "reviewed": instant.rawValue,
-      ], options: [.sortedKeys, .withoutEscapingSlashes])
-    return try publish(
-      base: base, path: entry.path, replacement: replacement, auditBytes: auditBytes,
-      title: "Core memory approved entry review")
   }
 
   package func checkoutPreview() throws -> MemoryReviewCheckoutPreview {

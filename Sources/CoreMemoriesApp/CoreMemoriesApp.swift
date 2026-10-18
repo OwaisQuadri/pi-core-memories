@@ -99,7 +99,10 @@ struct WorkspaceView: View {
           if model.isBusy { ProgressView().controlSize(.small) }
           Text(model.message).font(.caption).lineLimit(2).textSelection(.enabled)
           Spacer()
-          if !model.operations.isEmpty { Text("\(model.operations.count) changes").font(.caption) }
+          if !model.operations.isEmpty {
+            Text(model.operations.count == 1 ? "1 change" : "\(model.operations.count) changes")
+              .font(.caption)
+          }
         }.padding(.horizontal, 16).padding(.vertical, 9)
       }.navigationTitle(model.section)
         .toolbar {

@@ -107,7 +107,7 @@ struct ChangesView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
       HStack {
-        Text("\(model.operations.count) Draft Changes").font(.title2.bold())
+        Text("Draft Changes").font(.title2.bold())
         Spacer()
         Button("Discard Draft…", role: .destructive) { model.isConfirmingDiscard = true }.disabled(
           model.draft == nil)

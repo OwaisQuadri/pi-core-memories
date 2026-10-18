@@ -126,8 +126,10 @@ import Foundation
     preview = nil
     await pauseQueue()
     do {
-      savedRecovery = try await workspace.prepareSavedRecovery(
+      let prepared = try await workspace.prepareSavedRecovery(
         runID: runID, profile: configuration, base: base)
+      isBusy = false
+      savedRecovery = prepared
     } catch { failure = String(describing: error) }
   }
 

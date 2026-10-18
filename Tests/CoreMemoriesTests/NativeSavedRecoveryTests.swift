@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 
@@ -40,7 +41,13 @@ func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() a
   encoder.outputFormatting = [.sortedKeys]
   let operations = try encoder.encode(model.operations)
   let before = try fixture.protectedState()
+  var isPresentationBusy = false
+  let observation = model.$savedRecovery.sink { presentation in
+    if presentation != nil { isPresentationBusy = model.isBusy }
+  }
+  defer { observation.cancel() }
   await model.prepareSavedRecovery()
+  #expect(!isPresentationBusy)
   #expect(model.savedRecovery?.actionableCount == 1)
   let suggestion = try #require(model.savedRecovery?.suggestions.first)
   #expect(!MemoryDocument.reviewText(suggestion.change.after).contains("[source:"))

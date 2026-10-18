@@ -101,6 +101,7 @@ struct DreamsView: View {
           }
         }
       }.padding(24).frame(width: 640, height: 520)
+        .environment(\.isEnabled, true)
     }
     .alert("Retry Interrupted Call?", isPresented: $model.isConfirmingRetry) {
       Button("Cancel", role: .cancel) {}

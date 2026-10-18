@@ -147,6 +147,9 @@ struct DreamsView: View {
       {
         Text(model.dreamDetail).textSelection(.enabled)
       }
+      if let unavailable = model.queueSnapshot?.unavailableReason {
+        Text(unavailable).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+      }
       LabeledContent(
         "Requested model",
         value: [

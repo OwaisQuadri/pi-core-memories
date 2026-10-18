@@ -58,9 +58,6 @@ struct DreamQueueView: View {
             .secondary)
         }
       }.font(.caption).monospacedDigit()
-      if let unavailable = model.queueSnapshot?.unavailableReason {
-        Text(unavailable).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-      }
     }.padding(12).background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
   }
 

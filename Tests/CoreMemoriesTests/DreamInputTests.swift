@@ -411,6 +411,20 @@ private struct DreamInputFixture {
       fixture.header() + "\n"
       + dreamUser("u", nil, dreamOld, "Accepted human text.") + "\n"
     try fixture.write(body, to: file)
+    let second = fixture.file("two.jsonl")
+    let later = fixture.file(folder: "--later--")
+    let secondBody =
+      fixture.header("two") + "\n"
+      + dreamUser("u", nil, dreamOld, "Second accepted text.") + "\n"
+    let laterBody =
+      fixture.header("later") + "\n"
+      + dreamUser("u", nil, dreamOld, "Later accepted text.") + "\n"
+    try fixture.write(secondBody, to: second)
+    try fixture.write(laterBody, to: later)
+    for accepted in [file, second, later] {
+      try FileManager.default.setAttributes(
+        [.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: accepted.path)
+    }
     let foreignRoot = fixture.root.appendingPathComponent("foreign")
     let foreignFolder = foreignRoot.appendingPathComponent("--fixture--")
     let foreign = foreignFolder.appendingPathComponent("one.jsonl")
@@ -431,11 +445,54 @@ private struct DreamInputFixture {
     }
     #expect(stateAfterSubstitution != nil)
     #expect(try fixture.snapshot() == stateAfterSubstitution)
-    #expect(batch.evidence.map(\.exactText) == ["Accepted human text."])
-    #expect(batch.positionsAfter.first?.sessionID.rawValue == "one")
-    #expect(batch.evidence.first?.witness.relativePath.rawValue == "--fixture--/one.jsonl")
-    #expect(batch.exactSourceRecords.compactMap(\.bytes).reduce(Data(), +) == Data(body.utf8))
+    #expect(
+      batch.evidence.map(\.exactText)
+        == ["Accepted human text.", "Second accepted text.", "Later accepted text."])
+    #expect(batch.positionsAfter.map { $0.sessionID.rawValue } == ["one", "two", "later"])
+    for (path, expected) in [
+      "--fixture--/one.jsonl": body, "--fixture--/two.jsonl": secondBody,
+      "--later--/one.jsonl": laterBody,
+    ] {
+      let bytes = batch.exactSourceRecords.filter { $0.witness.relativePath.rawValue == path }
+        .compactMap(\.bytes).reduce(Data(), +)
+      #expect(bytes == Data(expected.utf8))
+    }
   }
+}
+
+@Test(arguments: ["symlink", "directory"])
+func dreamInputUnvisitedFolderReplacementCannotRedirectCapture(_ replacement: String) throws {
+  let fixture = try DreamInputFixture()
+  defer { fixture.clean() }
+  let first = fixture.file(folder: "--a--")
+  let later = fixture.file(folder: "--b--")
+  try fixture.write(fixture.header("first") + "\n", to: first)
+  try fixture.write(fixture.header("later") + "\n", to: later)
+  let foreign = fixture.root.appendingPathComponent("foreign")
+  try fixture.write(
+    fixture.header("foreign") + "\n"
+      + dreamUser("u", nil, dreamOld, "Must not be captured.") + "\n",
+    to: foreign.appendingPathComponent("one.jsonl"))
+  var reads: [URL] = []
+  var stateAfterSubstitution: [String: DreamInputFileState]?
+  #expect(throws: (any Error).self) {
+    try fixture.reader().prepare(progress: DreamProgress(), limits: DreamInputLimits()) { candidate in
+      reads.append(candidate)
+      guard candidate == first else { return }
+      let folder = later.deletingLastPathComponent()
+      try FileManager.default.moveItem(
+        at: folder, to: fixture.root.appendingPathComponent("accepted"))
+      if replacement == "symlink" {
+        try FileManager.default.createSymbolicLink(at: folder, withDestinationURL: foreign)
+      } else {
+        try FileManager.default.moveItem(at: foreign, to: folder)
+      }
+      stateAfterSubstitution = try fixture.snapshot()
+    }
+  }
+  #expect(reads == [first])
+  #expect(stateAfterSubstitution != nil)
+  #expect(try fixture.snapshot() == stateAfterSubstitution)
 }
 
 @Test func dreamInputStrippingDirectorySubstitutionKeepsAcceptedInputs() throws {

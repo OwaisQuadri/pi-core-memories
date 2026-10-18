@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import Testing
+import XCTest
 
 @testable import CoreMemories
 
@@ -13,6 +14,71 @@ func queueConfiguration(_ fixture: TransactionFixture) -> MemoryConfiguration {
   configuration.reviewState = fixture.root.appendingPathComponent("review").path
   configuration.diagnostics = fixture.root.appendingPathComponent("diagnostics").path
   return configuration
+}
+
+final class DreamQueueDescriptorProcessHelper: XCTestCase {
+  func testQueueScanUnderDescriptorPressure() throws {
+    guard let root = ProcessInfo.processInfo.environment["DREAM_QUEUE_DESCRIPTOR_FIXTURE"] else {
+      return
+    }
+    var limit = rlimit()
+    XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &limit), 0)
+    limit.rlim_cur = 256
+    XCTAssertEqual(setrlimit(RLIMIT_NOFILE, &limit), 0)
+    let fixture = try TransactionFixture(root: URL(fileURLWithPath: root), isCreating: false)
+    func descriptorCount() -> Int {
+      (0..<256).filter { fcntl(Int32($0), F_GETFD) >= 0 }.count
+    }
+    let baseline = descriptorCount()
+    for _ in 0..<3 {
+      let snapshot = DreamQueueSnapshot.read(configuration: queueConfiguration(fixture))
+      XCTAssertNil(snapshot.unavailableReason)
+      XCTAssertEqual(snapshot.coverage?.backlogBytes, 320 * 20)
+      XCTAssertEqual(snapshot.coverage?.undreamtBytes, 320 * 20)
+      XCTAssertEqual(snapshot.coverage?.plannedBytes, 320 * 20)
+      XCTAssertEqual(snapshot.coverage?.nextBytes, 0)
+      XCTAssertEqual(descriptorCount(), baseline)
+    }
+    var peak = baseline
+    let batch = try SessionReader(
+      sessions: fixture.sessions, snippets: fixture.snippets, environment: [:]
+    ).prepare(progress: DreamProgress(), limits: DreamInputLimits()) { _ in
+      peak = max(peak, descriptorCount())
+    }
+    XCTAssertLessThanOrEqual(peak, baseline + 2)
+    XCTAssertEqual(descriptorCount(), baseline)
+    XCTAssertEqual(batch.positionsAfter.count, 320)
+    XCTAssertEqual(batch.evidence.count, 320)
+    XCTAssertEqual(batch.exactSourceRecords.count, 640)
+    try SessionReader.verifyPreparation(batch)
+  }
+}
+
+@Test func dreamQueueScanDoesNotExhaustDescriptorsAcrossSessionFolders() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  _ = try fixture.store().run(
+    selection: fixture.selection, prepare: { try fixture.prepare($0) }, call: transactionUncalled)
+  for index in 0..<320 {
+    let id = "session-\(index)"
+    try fixture.write(
+      dreamHeader(id, cwd: fixture.root.path, name: nil) + "\n"
+        + dreamUser("u", nil, dreamOld, "Accepted human text.") + "\n",
+      file: fixture.sessions.appendingPathComponent("folder-\(index)/one.jsonl"))
+  }
+  let before = try fixture.snapshot(fixture.root)
+  let result = try runCommand(
+    executable: URL(fileURLWithPath: "/usr/bin/xcrun"),
+    arguments: [
+      "xctest", "-XCTest",
+      "CoreMemoriesTests.DreamQueueDescriptorProcessHelper/testQueueScanUnderDescriptorPressure",
+      Bundle(for: DreamQueueDescriptorProcessHelper.self).bundleURL.path,
+    ],
+    environment: [
+      "PATH": "/usr/bin:/bin", "DREAM_QUEUE_DESCRIPTOR_FIXTURE": fixture.root.path,
+    ])
+  #expect(result.status == 0, "\(result.text)\n\(result.errorText)")
+  #expect(try fixture.snapshot(fixture.root) == before)
 }
 
 private func queueJSON() -> [String: Any] {

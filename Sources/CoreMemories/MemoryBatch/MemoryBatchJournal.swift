@@ -115,6 +115,7 @@ extension MemoryDraftStore {
   func withBatchJournal<T>(
     _ review: MemoryReviewController?, operation: (DreamStateDirectory) throws -> T
   ) throws -> T {
+    try verifyMemoryBatchRepository(store, review: review)
     func acquireJournal() throws -> T {
       try locked {
         try store.reviewGit.reviewCheckout().withLeaseState { state in

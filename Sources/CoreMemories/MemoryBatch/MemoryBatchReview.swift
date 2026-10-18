@@ -1,5 +1,11 @@
 import Foundation
 
+func verifyMemoryBatchRepository(_ store: MemoryStore, review: MemoryReviewController?) throws {
+  guard review == nil || review?.store.reviewGit.repo.path == store.reviewGit.repo.path else {
+    throw MemoryError("review controller belongs to another memory repository")
+  }
+}
+
 struct PreparedMemoryBatchCandidate {
   let candidate: MemoryReviewCandidate
   let intent: MemoryBatchCandidateIntent

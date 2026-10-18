@@ -17,6 +17,7 @@ final class MemoryBatchPublisher {
   }
 
   func composition(_ draft: MemoryDraft) throws -> MemoryBatchComposition {
+    try verifyMemoryBatchRepository(store, review: review)
     let snapshot = try store.reviewSnapshot(base: draft.baseCommit)
     let manager = try MemoryManagement(repository: store.reviewGit.repo)
     return try MemoryBatchComposition.prepare(draft, snapshot: snapshot, manager: manager) {
@@ -31,6 +32,7 @@ final class MemoryBatchPublisher {
   }
 
   func recover(_ draft: MemoryDraft) throws -> MemoryBatchSaveResult? {
+    try verifyMemoryBatchRepository(store, review: review)
     let saveID = try memoryBatchDigest(draft)
     let git = store.reviewGit
     let auditRef = "refs/memory-batches/\(saveID)"
@@ -94,6 +96,7 @@ final class MemoryBatchPublisher {
     _ draft: MemoryDraft, checkout expected: ReviewCheckoutWitness,
     authorized: Set<UUID>, leaseState: DreamStateDirectory? = nil
   ) throws -> MemoryBatchSaveResult {
+    try verifyMemoryBatchRepository(store, review: review)
     let saveID = try memoryBatchDigest(draft)
     do {
       if let result = try recover(draft) { return result }
@@ -180,6 +183,7 @@ final class MemoryBatchPublisher {
     _ draft: MemoryDraft, composed: MemoryBatchComposition, expected: ReviewCheckoutWitness,
     leaseState: DreamStateDirectory?, legacy: ReviewPreviewPayload? = nil
   ) throws -> String {
+    try verifyMemoryBatchRepository(store, review: review)
     let manifest = try MemoryBatchReplay.manifest(draft, composition: composed)
     let checkout = try store.reviewGit.reviewCheckout()
     func publish(_ state: DreamStateDirectory) throws -> String {

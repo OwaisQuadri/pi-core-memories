@@ -35,6 +35,10 @@ package final class MemoryBatchSession {
       throw DreamRunError.limitExceeded
     }
     let store = try MemoryStore(repo: repository, environment: ProcessInfo.processInfo.environment)
+    guard store.reviewGit.repo.path == drafts.store.reviewGit.repo.path else {
+      throw MemoryError("draft store belongs to another memory repository")
+    }
+    try verifyMemoryBatchRepository(store, review: review)
     let original = try restoring ?? drafts.create()
     let snapshot = try store.reviewSnapshot(base: original.baseCommit)
     guard snapshot.documents.reduce(0, { $0 + ($1.bytes?.count ?? 0) }) <= 16 * 1024 * 1024 else {
@@ -210,6 +214,10 @@ package final class MemoryBatchSession {
   }
 
   private func verifyCatalogContext(_ store: MemoryStore) throws {
+    try verifyMemoryBatchRepository(store, review: review)
+    guard store.reviewGit.repo.path == drafts.store.reviewGit.repo.path else {
+      throw MemoryError("draft store belongs to another memory repository")
+    }
     let binding = draft.batch!.binding
     if let path = binding.configurationPath {
       let configuration = try MemoryConfiguration.load(from: URL(fileURLWithPath: path))

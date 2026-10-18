@@ -53,7 +53,7 @@ package struct DreamInvocationStatus: Sendable {
       meaning =
         status == "pending" ? "Saved work is pending; no terminal reason is established." : ""
     }
-    return [meaning, detail].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
+    return meaning
   }
 
   package static func read(

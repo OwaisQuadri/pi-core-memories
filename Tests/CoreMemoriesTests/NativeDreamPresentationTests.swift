@@ -9,6 +9,20 @@ private func nativeReportEvent(_ report: [String: Any]) throws -> Data {
   try JSONSerialization.data(withJSONObject: ["event": "report", "report": report])
 }
 
+@Test(arguments: ["callbackFailure", "workerFailure", "protocolFailure", "invalidDecision"])
+@MainActor
+func nativeStatusKeepsTechnicalDetailsOutOfThePrimaryExplanation(_ reason: String) throws {
+  let model = AppModel(configURL: URL(fileURLWithPath: "/unused-synthetic-profile"))
+  let detail = "Synthetic provider error: quota exceeded"
+  try model.receive(
+    nativeReportEvent([
+      "status": "pending", "reason": reason, "detail": detail,
+    ]))
+  #expect(!model.dreamDetail.isEmpty)
+  #expect(!model.dreamDetail.contains(detail))
+  #expect(model.invocationStatus?.detail == detail)
+}
+
 private func savedNativeReport(
   configuration: MemoryConfiguration, runID: String
 ) throws -> URL {
@@ -107,7 +121,9 @@ private func savedNativeReport(
 }
 
 @Test @MainActor
-func nativeLatestStatusSurvivesMoreThan256RetainedInvocationsWithoutReadingObsoletePayloads() async throws {
+func nativeLatestStatusSurvivesMoreThan256RetainedInvocationsWithoutReadingObsoletePayloads()
+  async throws
+{
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   let (_, pending) = try savedRecoveryPendingAddition(fixture)

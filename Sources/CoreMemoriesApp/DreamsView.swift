@@ -147,6 +147,9 @@ struct DreamsView: View {
       {
         Text(model.dreamDetail).textSelection(.enabled)
       }
+      if let detail = model.invocationStatus?.detail, !detail.isEmpty {
+        Text(detail).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+      }
       if let unavailable = model.queueSnapshot?.unavailableReason {
         Text(unavailable).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
       }

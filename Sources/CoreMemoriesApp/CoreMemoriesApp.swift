@@ -115,7 +115,7 @@ struct WorkspaceView: View {
             Task { await model.prepareCheckout() }
           } label: {
             Label("Prepare Checkout", systemImage: "lock.open")
-          }
+          }.disabled(model.isBusy)
           Button {
             Task { await model.save() }
           } label: {

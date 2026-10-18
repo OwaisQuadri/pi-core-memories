@@ -30,9 +30,18 @@ import Testing
 {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
-  let url = fixture.root.appendingPathComponent("selected.json")
-  if variant == "corrupt" { try fixture.write("{", file: url) }
+  let url = fixture.root.appendingPathComponent("profile/selected.json")
   let model = AppModel(configURL: url)
+  var fallback = MemoryConfiguration.defaults
+  fallback.roots = DreamControlRoots(
+    state: fixture.state.path, sessions: fixture.sessions.path, memory: fixture.memory.path,
+    snippets: fixture.snippets.path, prompts: nil, globalAgents: nil)
+  fallback.journal = fixture.root.appendingPathComponent("journal").path
+  fallback.reviewState = fixture.root.appendingPathComponent("review").path
+  fallback.diagnostics = fixture.root.appendingPathComponent("diagnostics").path
+  try await model.workspace.configure(fallback)
+  try FileManager.default.removeItem(at: url)
+  if variant == "corrupt" { try fixture.write("{", file: url) }
   #expect(model.isBusy)
   model.add()
   #expect(!model.isEditing)
@@ -42,6 +51,15 @@ import Testing
   model.add()
   #expect(!model.isEditing)
   #expect(model.catalog == nil)
+  let beforePreparation = try fixture.snapshot(fixture.memory)
+  await model.prepareCheckout()
+  #expect(model.checkout == nil)
+  #expect(try fixture.snapshot(fixture.memory) == beforePreparation)
+  model.checkout = try MemoryManagement(repository: fixture.memory).checkoutPreview()
+  let beforeDetachment = try fixture.snapshot(fixture.memory)
+  await model.detach()
+  #expect(model.checkout != nil)
+  #expect(try fixture.snapshot(fixture.memory) == beforeDetachment)
   let delegate = ApplicationDelegate()
   delegate.model = model
   #expect(await delegate.isTerminationReady())

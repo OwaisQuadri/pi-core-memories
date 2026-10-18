@@ -294,13 +294,18 @@ import Foundation
   }
 
   func prepareCheckout() async {
+    guard isLoaded, !isBusy else { return }
+    isBusy = true
+    defer { isBusy = false }
     do { checkout = try await workspace.checkoutPreview() } catch {
       failure = String(describing: error)
     }
   }
 
   func detach() async {
-    guard let checkout else { return }
+    guard isLoaded, !isBusy, let checkout else { return }
+    isBusy = true
+    defer { isBusy = false }
     do {
       try await workspace.detach(checkout)
       self.checkout = nil

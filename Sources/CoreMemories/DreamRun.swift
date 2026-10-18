@@ -210,6 +210,8 @@ public final class DreamRunStore {
   private let bindingBytes: Data
   private let bindingHash: SourceDigest
   private let limits: DreamRunLimits
+  private let deviceKey: String?
+  private let projectBindings: [String: String]
   private let operationLock = NSLock()
   var persistenceFault: ((DreamPersistenceEvent) throws -> Void)?
   var clock: () -> Date = { Date() }
@@ -249,10 +251,13 @@ public final class DreamRunStore {
 
   public init(
     stateRoot: URL, sessionsRoot: URL, memoryRepository: URL, strippingRoots: [URL],
-    globalAgents: URL? = nil,
+    globalAgents: URL? = nil, deviceKey: String? = nil, projectBindings: [String: String] = [:],
     limits: DreamRunLimits = try! DreamRunLimits(),
     isCancelled: @escaping @Sendable () -> Bool = { false }
   ) throws {
+    try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
+    self.deviceKey = deviceKey
+    self.projectBindings = projectBindings
     guard
       ([stateRoot, sessionsRoot, memoryRepository] + strippingRoots
         + (globalAgents.map { [$0] } ?? [])).allSatisfy({
@@ -435,23 +440,28 @@ public final class DreamRunStore {
     var observedInputBytes = 0
     let result = try runLocked(
       selection: selection, resume: resume, isLockCreated: ownership.isCreated,
-      prepare: prepare, call: { request in
+      prepare: prepare,
+      call: { request in
         let started = ContinuousClock.now
         let response = try call(request)
         let elapsed = started.duration(to: .now).components
         measuredSeconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
         return response
-      }, observe: { progress, batch, isRepeated in
+      },
+      observe: { progress, batch, isRepeated in
         observedRecordCount = batch.exactSourceRecords.count
         observedInputBytes = batch.keptBytes
         var estimate: Double?
         if (try? self.root.isPresent("timing.json")) == true,
-          let timingBytes = try? self.root.read("timing.json", maximum: DreamRunEncoding.maximumMetadataBytes),
-          let timing = try? DreamRunEncoding.decode(DreamTiming.self, bytes: timingBytes) {
+          let timingBytes = try? self.root.read(
+            "timing.json", maximum: DreamRunEncoding.maximumMetadataBytes),
+          let timing = try? DreamRunEncoding.decode(DreamTiming.self, bytes: timingBytes)
+        {
           if timing.provider == selection.provider, timing.modelID == selection.modelID,
             timing.thinkingLevel == selection.thinkingLevel,
             timing.records == observedRecordCount, timing.inputBytes == observedInputBytes,
-            timing.seconds.isFinite, timing.seconds > 0 {
+            timing.seconds.isFinite, timing.seconds > 0
+          {
             estimate = timing.seconds
           }
         }
@@ -459,9 +469,11 @@ public final class DreamRunStore {
       })
     if case .completed = result, let measuredSeconds, measuredSeconds > 0 {
       try? persist(
-        bounded(DreamTiming(provider: selection.provider, modelID: selection.modelID,
-          thinkingLevel: selection.thinkingLevel, records: observedRecordCount,
-          inputBytes: observedInputBytes, seconds: measuredSeconds)),
+        bounded(
+          DreamTiming(
+            provider: selection.provider, modelID: selection.modelID,
+            thinkingLevel: selection.thinkingLevel, records: observedRecordCount,
+            inputBytes: observedInputBytes, seconds: measuredSeconds)),
         name: "timing.json", directory: root, isReplacing: true)
     }
     guard flock(lock, LOCK_UN) == 0 else { throw DreamRunError.persistenceFailure }
@@ -580,7 +592,7 @@ public final class DreamRunStore {
       let request = DreamRunEncoding.Request(
         schemaVersion: 2, runID: runID, generation: progress.generation,
         inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
-        systemPrompt: DreamDecisionContext.systemPrompt,
+        systemPrompt: context.savedSystemPrompt,
         messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)))
       let requestBytes = try bounded(request)
       let directory = try runs.child(runID, isCreating: true)
@@ -721,7 +733,7 @@ public final class DreamRunStore {
           let source = try Self.canonicalExisting(URL(fileURLWithPath: cwd))
           _ = try PreparationDirectory(url: source)
           let git = Git(repo: source, environment: ProcessInfo.processInfo.environment)
-          if let key = try MemoryStore.projectKey(cwd: source) {
+          if let key = try MemoryStore.projectKey(cwd: source, projectBindings: projectBindings) {
             let worktree = try Self.canonicalExisting(
               URL(fileURLWithPath: git.text(["rev-parse", "--show-toplevel"])))
             resolution = .project(key: key, isGlobalEligible: true)
@@ -747,7 +759,7 @@ public final class DreamRunStore {
       }
     ).sorted()
     let snapshot = try memory.decisionSnapshot(
-      base: run.approvedBase, projectKeys: keys, limits: decisionLimits)
+      base: run.approvedBase, projectKeys: keys, limits: decisionLimits, deviceKey: deviceKey)
     var owners: [PinnedOwnerInput] = []
     var attempted: Set<Data> = []
     var totalBytes = 0
@@ -947,7 +959,7 @@ public final class DreamRunStore {
       addedDate: formatter.string(from: date), limits: decisionLimits,
       limitations: limitations.reduce(into: [String]()) { values, value in
         if !values.contains(value) { values.append(value) }
-      })
+      }, deviceKey: deviceKey, projectBindings: projectBindings)
     guard context.canonicalBytes.count <= limits.maximumFrozenBytes else {
       throw DreamRunError.limitExceeded
     }
@@ -1227,20 +1239,12 @@ public final class DreamRunStore {
       let bytes = try sealed.directory.read(
         attempt.responseName, maximum: maximumResponseEnvelopeBytes)
       let response = try DreamRunEncoding.decode(DreamRunEncoding.BoundResponse.self, bytes: bytes)
-      guard response.admissionHash == sealed.admissionHash.rawValue,
-        response.runID == run.runID, response.generation == run.progress.generation,
-        response.inputHash == run.inputHash.rawValue,
-        response.contextHash == sealed.context.contextHash.rawValue,
-        response.requestHash == sealed.request.requestHash.rawValue,
-        try response.selection.domain() == callSelection,
-        response.text.utf8.count <= limits.maximumResponseBytes
-      else { throw DreamRunError.corruption }
-      responseHash = SourceDigest(bytes: bytes)
-      validated = try DreamDecision.validate(
-        response: DurableDreamResponse(
-          run: run, response: DreamCompletedResponse(text: response.text),
-          responseHash: responseHash!, isReplay: true, isBaseCurrent: false),
-        context: sealed.context)
+      let durable = try response.domain(
+        run: run, context: sealed.context, request: sealed.request,
+        admissionHash: sealed.admissionHash, selection: callSelection, bytes: bytes,
+        maximumResponseBytes: limits.maximumResponseBytes)
+      responseHash = durable.responseHash
+      validated = try DreamDecision.validate(response: durable, context: sealed.context)
     }
     let plans = validated?.plans ?? []
     let notes = validated?.notes ?? []
@@ -1536,7 +1540,7 @@ final class DreamStateDirectory {
 
   deinit { _ = close(descriptor) }
 
-  static func openRoot(_ url: URL) throws -> DreamStateDirectory {
+  static func openRoot(_ url: URL, isCreating: Bool = true) throws -> DreamStateDirectory {
     var current = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     guard current >= 0 else { throw DreamRunError.unsafeState }
     var isClosed = false
@@ -1547,7 +1551,7 @@ final class DreamStateDirectory {
     for (index, component) in components.enumerated() {
       var status = stat()
       if fstatat(current, component, &status, AT_SYMLINK_NOFOLLOW) != 0 {
-        guard errno == ENOENT, mkdirat(current, component, 0o700) == 0 else {
+        guard isCreating, errno == ENOENT, mkdirat(current, component, 0o700) == 0 else {
           throw DreamRunError.unsafeState
         }
         isCreated = true

@@ -139,7 +139,7 @@ struct MemoryReviewFileIO {
 
 extension DreamStateDirectory {
   func installReviewFile(
-    _ bytes: Data, name: String,
+    _ bytes: Data, name: String, isReplacing: Bool = false,
     fault: ((MemoryReviewPersistenceEvent) throws -> Void)? = nil,
     io: MemoryReviewFileIO = MemoryReviewFileIO()
   ) throws {
@@ -147,10 +147,11 @@ extension DreamStateDirectory {
       bytes.count <= MemoryReviewEncoding.maximumFileBytes
     else { throw DreamRunError.unsafeState }
     if try isPresent(name) {
-      guard try read(name, maximum: MemoryReviewEncoding.maximumFileBytes) == bytes else {
-        throw DreamRunError.corruption
+      let existing = try read(name, maximum: MemoryReviewEncoding.maximumFileBytes)
+      if !isReplacing {
+        guard existing == bytes else { throw DreamRunError.corruption }
+        return
       }
-      return
     }
     let retained = try retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
     guard bytes.count <= MemoryReviewEncoding.maximumStateBytes - retained else {
@@ -182,7 +183,10 @@ extension DreamStateDirectory {
     guard io.sync(file) == 0, close(file) == 0 else { throw DreamRunError.persistenceFailure }
     isClosed = true
     try fault?(.beforeInstall(name))
-    guard io.install(descriptor, temporary, name) == 0 else {
+    let installed = isReplacing
+      ? Darwin.renameat(descriptor, temporary, descriptor, name)
+      : io.install(descriptor, temporary, name)
+    guard installed == 0 else {
       throw DreamRunError.persistenceFailure
     }
     try fault?(.afterInstall(name))

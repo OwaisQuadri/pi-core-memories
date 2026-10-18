@@ -1,16 +1,22 @@
 # pi-core-memories
 
-A Swift store for approved Markdown memory in a separate private Git repository.
-The store commands and Pi session loader are separate parts of issue #706.
-It uses Foundation, CryptoKit, and system Git, with no package dependencies.
+A native Mac app and Swift store for approved Markdown memory in a separate private Git repository.
+The Pi integration loads approved memory and runs inspectable dreams.
+The Swift core uses Foundation, CryptoKit, and system Git without external Swift dependencies.
+
+See [build and setup](docs/native-app.md) for the app, command runtime, and Pi package.
 
 ## Store and documents
 
 `MEMORY.md` holds global memory. `projects/<key>.md` holds one project's memory.
-The key is the full lowercase SHA-256 of Git's canonical common-directory path.
+`devices/<device-key>/MEMORY.md` holds device-wide memory.
+`devices/<device-key>/projects/<key>.md` holds project memory for that device.
+
+The default project key is the full lowercase SHA-256(Secure Hash Algorithm, 256-bit) of Git's canonical common-directory path.
 Linked worktrees and path aliases of the same repository share a key.
-Moving that repository to a different canonical path changes its key.
-Outside Git, rendering includes only global memory.
+An explicit local project binding can reuse a shared key across devices or moves.
+Without a binding, a new canonical path changes the key.
+Outside Git, rendering includes global memory and the configured device-wide layer.
 
 Use ordinary Markdown headings, paragraphs, lists, and references:
 
@@ -59,8 +65,8 @@ creates `MEMORY.md` with `0600` before writing memory. It creates main and an
 empty `MEMORY.md` commit.
 `project-key` prints a key, or reports no key with a nonzero exit outside Git.
 
-`render` resolves `refs/heads/main` once, then reads only the global and matching
-project documents from that commit. Dirty files and proposal checkouts cannot
+`render` resolves `refs/heads/main` once, then appends global, matching project,
+current-device, and matching device-project documents from that commit. Dirty files and proposal checkouts cannot
 supply memory. A missing repository, main, or global document is an error.
 
 `check` validates all committed approved files, not the working tree. Success is
@@ -70,8 +76,8 @@ Check diagnostics and command errors escape terminal controls with the same
 No read command initializes a store.
 
 `propose` accepts exact replacement Markdown on standard input. Its base must be
-the full current main commit identifier. Its only targets are `MEMORY.md` and
-`projects/<64-lowercase-hex-key>.md`. It refuses invalid paths, bytes, metadata,
+the full current main commit identifier. It accepts only the memory paths listed above,
+with full lowercase hexadecimal keys. It refuses invalid paths, bytes, metadata,
 stale bases, and replacements with no change.
 
 The approved base must contain a regular `MEMORY.md` and only allowed regular memory files. An ordinary code
@@ -421,10 +427,10 @@ or provider requests.
 `MemoryStore.decisionSnapshot(base:projectKeys:limits:)` reads the exact saved
 commit, not current main. Supply a full lowercase 40- or 64-digit commit object
 identifier. The whole tree must have the dedicated memory layout: regular
-`MEMORY.md` and only allowed regular project files.
+`MEMORY.md` and only allowed regular memory files.
 
 The snapshot binds every path, mode, and blob identity in a sorted layout hash.
-It loads only global and explicitly requested project bytes.
+It loads global, explicitly requested projects, and the selected device's matching layers.
 A requested missing project has explicit absence; global cannot be absent.
 Invalid Unicode Transformation Format 8-bit (UTF-8) and null (NUL) bytes fail.
 Annotation failures remain diagnostics so an exact update can repair an existing
@@ -468,6 +474,9 @@ exactly these fields:
 | `ownerNote` | sources, owner, contradictions, explanation |
 
 Scope is `{"kind":"global"}` or `{"kind":"project","key":"<64 lowercase hex>"}`.
+A device-enabled context also permits `{"kind":"device","deviceKey":"<pinned device key>"}`
+and `{"kind":"deviceProject","deviceKey":"<pinned device key>","key":"<pinned project key>"}`.
+A saved context without device configuration keeps its original schema and prompt.
 A source has exactly session, entry, and integral part fields. Only frozen typed
 text, typed skill arguments, and typed answers can supply primary support.
 Picked labels, agent context, generated memory, child records, and owner bytes
@@ -593,8 +602,8 @@ before the first model request of each session. It uses
 resolved from the session's project directory. The loader never initializes data.
 Use the store-only `init`, `propose`, and `review` commands explicitly.
 
-A successful render supplies approved global memory and only the matching project's
-memory. Linked worktrees share the project's Git common-directory identity.
+A successful render supplies the approved memory layers for the current project and device.
+Other devices' text does not enter that snapshot. Linked worktrees share the project's Git common-directory identity.
 Dirty files and pending proposals do not load. Missing commands, missing stores,
 invalid approved documents, invalid UTF-8 output, and renders that a signal stops
 leave no snapshot. The loader tries again on the next prompt. A terminal session
@@ -862,3 +871,7 @@ There is no automatic legacy import. `dream-scan` remains a read-only census.
 Observational memory remains the owner for within-session context. This store has
 no vectors, Jev, daemon, scheduler, confidence scores, durability scores, or semantic
 evidence gates.
+
+## License
+
+[MIT License](LICENSE). A backlink is welcome but not required.

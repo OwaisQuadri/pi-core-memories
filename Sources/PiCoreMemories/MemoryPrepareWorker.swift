@@ -34,7 +34,10 @@ func executeMemoryPrepareWorker(arguments: [String]) throws -> Int32 {
     guard let cwd = start["cwd"] as? String, cwd.hasPrefix("/"),
       let base = start["base"] as? String, let index = start["entry"] as? Int
     else { throw UsageError(description: "invalid native entry selection") }
-    let catalog = try manager.reviewCatalog(cwd: URL(fileURLWithPath: cwd))
+    let scope = try MemoryConfiguration.load()
+    let catalog = try manager.reviewCatalog(
+      cwd: URL(fileURLWithPath: cwd),
+      deviceKey: scope.deviceKey, projectBindings: scope.projectBindings)
     guard catalog.base == base, catalog.entries.indices.contains(index) else {
       throw UsageError(description: "catalog changed; open native review again")
     }

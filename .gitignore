@@ -2,3 +2,4 @@
 target/
 .swiftpm/
 .DS_Store
+node_modules/

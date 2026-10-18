@@ -45,7 +45,18 @@ public struct ApprovedDecisionSnapshot: Sendable {
       Set(documents.map(\.path)).count == documents.count
     else { throw DreamDecisionError.context("snapshot identity or ordering") }
     try limits.check(layoutEntries.count, maximum: limits.maximumLayoutEntries)
-    try limits.check(documents.count - 1, maximum: limits.maximumProjectKeys)
+    let projectKeys = Set(documents.compactMap { document -> String? in
+      switch DreamMemoryScope(path: document.path) {
+      case .project(let key), .deviceProject(_, let key): return key
+      default: return nil
+      }
+    })
+    try limits.check(projectKeys.count, maximum: limits.maximumProjectKeys)
+    let (scopeLimit, isScopeOverflow) = limits.maximumProjectKeys.multipliedReportingOverflow(by: 2)
+    let (documentLimit, isDocumentOverflow) = scopeLimit.addingReportingOverflow(2)
+    if !isScopeOverflow && !isDocumentOverflow {
+      try limits.check(documents.count, maximum: max(limits.maximumLayoutEntries, documentLimit))
+    }
     var layout = Data()
     for entry in layoutEntries {
       guard MemoryDocument.isAllowedPath(entry.path),
@@ -191,17 +202,23 @@ public struct MemoryStore: Sendable {
   /// - Returns: A full lowercase SHA-256 key, or nil outside a repository.
   /// - Throws: If directory access or Git discovery fails for another reason.
   public static func projectKey(
+    cwd: URL, environment: [String: String] = ProcessInfo.processInfo.environment,
+    projectBindings: [String: String] = [:]
+  ) throws -> String? {
+    try MemoryScopeConfiguration.validate(deviceKey: nil, projectBindings: projectBindings)
+    guard let canonical = try projectBindingDirectory(cwd: cwd, environment: environment) else { return nil }
+    if let bound = projectBindings[canonical] { return bound }
+    return SHA256.hash(data: Data(canonical.utf8))
+      .map { String(format: "%02x", $0) }.joined()
+  }
+
+  public static func projectBindingDirectory(
     cwd: URL, environment: [String: String] = ProcessInfo.processInfo.environment
   ) throws -> String? {
-    guard let common = try Git(repo: cwd, environment: environment).commonDirectory() else {
-      return nil
-    }
-    guard let path = realpath(common.path, nil) else {
-      throw MemoryError("cannot resolve Git common directory")
-    }
+    guard let common = try Git(repo: cwd, environment: environment).commonDirectory() else { return nil }
+    guard let path = realpath(common.path, nil) else { throw MemoryError("cannot resolve Git common directory") }
     defer { free(path) }
-    return SHA256.hash(data: Data(String(cString: path).utf8))
-      .map { String(format: "%02x", $0) }.joined()
+    return String(cString: path)
   }
 
   /// Resolves the approved main commit.
@@ -215,10 +232,15 @@ public struct MemoryStore: Sendable {
   /// - Parameter cwd: The directory used to select a project; outside Git selects only global memory.
   /// - Returns: Committed Markdown, excluding dirty files and all other projects.
   /// - Throws: On a missing store/main/global file, invalid selected memory, or Git failure.
-  public func render(cwd: URL) throws -> String {
+  public func render(cwd: URL, deviceKey: String? = nil, projectBindings: [String: String] = [:]) throws -> String {
+    try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     let commit = try approvedCommit()
-    let key = try Self.projectKey(cwd: cwd, environment: git.environment)
-    let paths = ["MEMORY.md"] + (key.map { ["projects/\($0).md"] } ?? [])
+    let key = try Self.projectKey(cwd: cwd, environment: git.environment, projectBindings: projectBindings)
+    var paths = ["MEMORY.md"] + (key.map { ["projects/\($0).md"] } ?? [])
+    if let deviceKey {
+      paths.append("devices/\(deviceKey)/MEMORY.md")
+      if let key { paths.append("devices/\(deviceKey)/projects/\(key).md") }
+    }
     let entries = try treeEntries(commit, paths: paths)
     guard entries.contains(where: { $0.path == "MEMORY.md" }) else {
       throw MemoryError("missing committed MEMORY.md")
@@ -234,15 +256,17 @@ public struct MemoryStore: Sendable {
   }
 
   public func decisionSnapshot(
-    base: String, projectKeys: [String], limits: DreamDecisionLimits = try! DreamDecisionLimits()
+    base: String, projectKeys: [String], limits: DreamDecisionLimits = try! DreamDecisionLimits(),
+    deviceKey: String? = nil
   ) throws -> ApprovedDecisionSnapshot {
     try decisionSnapshot(
-      base: base, projectKeys: projectKeys, limits: limits, entries: nil, objects: nil)
+      base: base, projectKeys: projectKeys, limits: limits, entries: nil, objects: nil,
+      selectedPaths: MemoryScopeConfiguration.paths(projectKeys: projectKeys, deviceKey: deviceKey))
   }
 
   private func decisionSnapshot(
     base: String, projectKeys: [String], limits: DreamDecisionLimits,
-    entries suppliedEntries: [TreeEntry]?, objects: ReviewGitObjects?
+    entries suppliedEntries: [TreeEntry]?, objects: ReviewGitObjects?, selectedPaths: [String]? = nil
   ) throws -> ApprovedDecisionSnapshot {
     guard Self.isFullOID(base),
       try objects.map({ try $0.info(base).type == "commit" })
@@ -269,7 +293,9 @@ public struct MemoryStore: Sendable {
         throw DreamDecisionError.context("snapshot object")
       }
     }
-    let paths = ["MEMORY.md"] + projectKeys.sorted().map { "projects/\($0).md" }
+    let paths = selectedPaths ?? (["MEMORY.md"] + projectKeys.sorted().map { "projects/\($0).md" })
+    guard paths.allSatisfy(MemoryDocument.isAllowedPath), paths == paths.sorted(),
+      Set(paths).count == paths.count else { throw DreamDecisionError.context("selected memory paths") }
     var total = 0
     let documents = try paths.map { path in
       guard let entry = entries.first(where: { $0.path == path }) else {
@@ -319,9 +345,7 @@ public struct MemoryStore: Sendable {
     }
     return try decisionSnapshot(
       base: base,
-      projectKeys: paths.filter { $0 != "MEMORY.md" }.map {
-        String($0.dropFirst(9).dropLast(3))
-      }, limits: limits, entries: entries, objects: objects)
+      projectKeys: [], limits: limits, entries: entries, objects: objects, selectedPaths: paths.sorted())
   }
 
   package func verifySavedProposal(
@@ -494,9 +518,15 @@ public struct MemoryStore: Sendable {
   }
 
   func reviewCommit(base: String, path: String, replacement: Data, message: Data) throws -> String {
-    guard Self.isFullOID(base), MemoryDocument.isAllowedPath(path),
-      MemoryDocument.failures(in: replacement).isEmpty
-    else { throw MemoryError("invalid single-file review commit") }
+    try reviewCommit(base: base, replacements: [path: replacement], message: message)
+  }
+
+  func reviewCommit(base: String, replacements: [String: Data], message: Data) throws -> String {
+    guard Self.isFullOID(base), !replacements.isEmpty,
+      replacements.allSatisfy({
+        MemoryDocument.isAllowedPath($0.key) && MemoryDocument.failures(in: $0.value).isEmpty
+      })
+    else { throw MemoryError("invalid memory review commit") }
     let entries = try treeEntries(base)
     guard entries.contains(where: { $0.path == "MEMORY.md" }),
       entries.allSatisfy({
@@ -505,27 +535,32 @@ public struct MemoryStore: Sendable {
     else {
       throw MemoryError("base is not a dedicated memory store: invalid memory file layout")
     }
-    let blob = try git.text(["hash-object", "-w", "--stdin", "--no-filters"], input: replacement)
-    let updatedEntries =
-      entries.filter { $0.path != path }
-      + [TreeEntry(mode: "100644", oid: blob, path: path)]
-    var rootEntries = ""
-    var projectEntries = ""
-    for entry in updatedEntries {
-      if entry.path == "MEMORY.md" {
-        rootEntries += "\(entry.mode) blob \(entry.oid)\t\(entry.path)\0"
-      } else {
-        let name = entry.path.dropFirst("projects/".count)
-        projectEntries += "\(entry.mode) blob \(entry.oid)\t\(name)\0"
+    var updatedEntries = entries.filter { replacements[$0.path] == nil }
+    for path in replacements.keys.sorted() {
+      let blob = try git.text(
+        ["hash-object", "-w", "--stdin", "--no-filters"], input: replacements[path]!)
+      updatedEntries.append(TreeEntry(mode: "100644", oid: blob, path: path))
+    }
+    func makeTree(_ entries: [TreeEntry], prefix: String) throws -> String {
+      var records = ""
+      var children: [String: [TreeEntry]] = [:]
+      for entry in entries {
+        let relative = String(entry.path.dropFirst(prefix.count))
+        if let slash = relative.firstIndex(of: "/") {
+          children[String(relative[..<slash]), default: []].append(entry)
+        } else {
+          records += "\(entry.mode) blob \(entry.oid)\t\(relative)\0"
+        }
       }
+      for name in children.keys.sorted() {
+        let tree = try makeTree(children[name]!, prefix: prefix + name + "/")
+        records += "040000 tree \(tree)\t\(name)\0"
+      }
+      return try git.text(["mktree", "-z"], input: Data(records.utf8))
     }
-    if !projectEntries.isEmpty {
-      let projectsTree = try git.text(["mktree", "-z"], input: Data(projectEntries.utf8))
-      rootEntries += "040000 tree \(projectsTree)\tprojects\0"
-    }
-    let tree = try git.text(["mktree", "-z"], input: Data(rootEntries.utf8))
-    guard try changedPaths(from: base, to: tree) == [path] else {
-      throw MemoryError("proposal must change exactly its target file")
+    let tree = try makeTree(updatedEntries, prefix: "")
+    guard try changedPaths(from: base, to: tree) == replacements.keys.sorted() else {
+      throw MemoryError("publication must change exactly its target files")
     }
     return try git.text(
       ["commit-tree", tree, "-p", base], input: message, additions: Git.proposalIdentity)
@@ -602,7 +637,7 @@ public struct MemoryStore: Sendable {
     return display
   }
 
-  private static func isFullOID(_ text: String) -> Bool {
+  static func isFullOID(_ text: String) -> Bool {
     MemoryDocument.isMatch(#"\A([0-9a-f]{40}|[0-9a-f]{64})\z"#, text)
   }
 

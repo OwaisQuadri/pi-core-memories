@@ -137,6 +137,8 @@ private func decisionScope(_ scope: DreamMemoryScope) -> [String: Any] {
   switch scope {
   case .global: ["kind": "global"]
   case .project(let key): ["kind": "project", "key": key]
+  case .device(let key): ["kind": "device", "deviceKey": key]
+  case .deviceProject(let device, let project): ["kind": "deviceProject", "deviceKey": device, "key": project]
   }
 }
 

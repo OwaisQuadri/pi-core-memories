@@ -595,24 +595,28 @@ public struct SessionReader: Sendable {
     }
   }
 
-  func preparationFiles() throws -> [PreparationSessionFile] {
+  func forEachPreparationFolder(_ read: ([PreparationSessionFile]) throws -> Void) throws {
     let root = try PreparationDirectory(url: sessions)
-    var files: [PreparationSessionFile] = []
-    for folderName in try root.names() {
-      let folderKind = try root.kind(folderName)
-      guard folderKind != S_IFLNK else {
-        throw MemoryError("unsafe session folder: \(folderName)")
+    let folders = try root.names().compactMap {
+      name -> (name: String, identity: PreparationDirectoryIdentity)? in
+      let entry = try root.entry(name)
+      guard entry.kind != S_IFLNK else {
+        throw MemoryError("unsafe session folder: \(name)")
       }
-      guard folderKind == S_IFDIR else { continue }
+      return entry.kind == S_IFDIR ? (name, entry.identity) : nil
+    }
+    for (folderName, identity) in folders {
       let folder = try PreparationDirectory(
         url: sessions.appendingPathComponent(folderName), parent: root)
-      for name in try folder.names() where name.hasSuffix(".jsonl") {
-        files.append(
-          PreparationSessionFile(
-            path: try SourceRelativePath(folderName + "/" + name), directory: folder, name: name))
+      guard folder.identity == identity else {
+        throw MemoryError("session folder changed: \(folderName)")
       }
+      let files = try folder.names().filter { $0.hasSuffix(".jsonl") }.map { name in
+        PreparationSessionFile(
+          path: try SourceRelativePath(folderName + "/" + name), directory: folder, name: name)
+      }
+      try read(files)
     }
-    return files
   }
 
   static func link(_ digests: inout [SessionDigest]) {

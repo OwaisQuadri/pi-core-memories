@@ -202,8 +202,9 @@ Kept text is the primary text, its attached agent context, and selection text.
 Bytes before a saved position are already dreamt and do not count toward the cap. A skipped file keeps its saved position,
 and its remaining bytes are not dreamt while it stays outside these limits. Preparation holds accepted
 directory descriptors and opens child directories and files relative to them, without
-following symbolic links. A directory replacement cannot redirect capture to a different
-directory. It captures each file's byte ceiling and admits only records that end with a newline. Preparation reports
+following symbolic links. Only the root and current session folder stay open during capture.
+An unvisited folder replacement fails closed instead of redirecting capture.
+It captures each file's byte ceiling and admits only records that end with a newline. Preparation reports
 an unfinished tail by path and byte range but does not consume it. Record timestamps
 do not decide which records are new.
 

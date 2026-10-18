@@ -249,52 +249,58 @@ extension SessionReader {
       try beforeRead(url)
     }
     let stripping = try preparationStrippingInputs(beforeRead: checkedRead)
-    let files = try preparationFiles()
     var modified: [SourceRelativePath: Date] = [:]
-    for file in files {
-      let date = try file.directory.status(file.name).modified
-      if date > modifiedAfter { modified[file.path] = date }
-    }
     let tracked = Dictionary(uniqueKeysWithValues: progress.positions.map { ($0.relativePath, $0) })
     var captured: [CapturedSession] = []
-    var identities = Set(
-      progress.positions.filter { modified[$0.relativePath] == nil }.map(\.sessionID))
+    var identities: Set<SessionIdentifier> = []
     var discovered: Set<SourceRelativePath> = []
     var tails: [UnfinishedSessionTail] = []
-    for file in files {
-      let path = file.path
-      discovered.insert(path)
-      guard modified[path] != nil else { continue }
-      try checkedRead(file.directory.url.appendingPathComponent(file.name))
-      let data = try file.directory.capture(file.name)
-      let complete = data.lastIndex(of: 0x0A).map { $0 + 1 } ?? 0
-      if complete < data.count {
-        tails.append(
-          UnfinishedSessionTail(
-            relativePath: path, byteRange: UInt64(complete)..<UInt64(data.count)))
+    try forEachPreparationFolder { files in
+      if isCancelled() { throw CancellationError() }
+      for file in files {
+        let date = try file.directory.status(file.name).modified
+        if date > modifiedAfter { modified[file.path] = date }
       }
-      if let saved = tracked[path] {
-        guard saved.completeBytes <= UInt64(complete)
-        else { throw MemoryError("session shrank: \(path.rawValue)") }
-        let offset = Int(saved.completeBytes)
-        guard offset > 0, data[offset - 1] == 0x0A,
-          SourceDigest(bytes: Data(data[..<offset])) == saved.prefixHash
-        else { throw MemoryError("session prefix changed: \(path.rawValue)") }
-      }
-      guard complete > 0 else { continue }
-      let session = try CapturedSession(path: path, bytes: data, completeBytes: complete)
-      guard identities.insert(session.id).inserted else {
-        throw MemoryError("duplicate session identity: \(session.id.rawValue)")
-      }
-      if let saved = tracked[path] {
-        guard saved.sessionID == session.id else {
-          throw MemoryError("session identity changed: \(path.rawValue)")
+      for file in files {
+        let path = file.path
+        discovered.insert(path)
+        guard modified[path] != nil else { continue }
+        try checkedRead(file.directory.url.appendingPathComponent(file.name))
+        let data = try file.directory.capture(file.name)
+        let complete = data.lastIndex(of: 0x0A).map { $0 + 1 } ?? 0
+        if complete < data.count {
+          tails.append(
+            UnfinishedSessionTail(
+              relativePath: path, byteRange: UInt64(complete)..<UInt64(data.count)))
         }
-        guard saved.classificationHash == session.classificationHash else {
-          throw MemoryError("session classification changed: \(path.rawValue)")
+        if let saved = tracked[path] {
+          guard saved.completeBytes <= UInt64(complete)
+          else { throw MemoryError("session shrank: \(path.rawValue)") }
+          let offset = Int(saved.completeBytes)
+          guard offset > 0, data[offset - 1] == 0x0A,
+            SourceDigest(bytes: Data(data[..<offset])) == saved.prefixHash
+          else { throw MemoryError("session prefix changed: \(path.rawValue)") }
         }
+        guard complete > 0 else { continue }
+        let session = try CapturedSession(path: path, bytes: data, completeBytes: complete)
+        guard identities.insert(session.id).inserted else {
+          throw MemoryError("duplicate session identity: \(session.id.rawValue)")
+        }
+        if let saved = tracked[path] {
+          guard saved.sessionID == session.id else {
+            throw MemoryError("session identity changed: \(path.rawValue)")
+          }
+          guard saved.classificationHash == session.classificationHash else {
+            throw MemoryError("session classification changed: \(path.rawValue)")
+          }
+        }
+        captured.append(session)
       }
-      captured.append(session)
+    }
+    for saved in progress.positions where modified[saved.relativePath] == nil {
+      guard identities.insert(saved.sessionID).inserted else {
+        throw MemoryError("duplicate session identity: \(saved.sessionID.rawValue)")
+      }
     }
     guard Set(tracked.keys).isSubset(of: discovered) else {
       throw MemoryError("missing tracked session file")
@@ -466,8 +472,19 @@ struct PreparationSessionFile {
   let name: String
 }
 
+struct PreparationDirectoryIdentity: Equatable {
+  let device: dev_t
+  let inode: ino_t
+
+  init(_ status: stat) {
+    device = status.st_dev
+    inode = status.st_ino
+  }
+}
+
 final class PreparationDirectory {
   let url: URL
+  let identity: PreparationDirectoryIdentity
   private let descriptor: Int32
   private let parent: PreparationDirectory?
 
@@ -483,6 +500,7 @@ final class PreparationDirectory {
       throw MemoryError("unsafe preparation directory")
     }
     self.url = url
+    identity = PreparationDirectoryIdentity(status)
     self.descriptor = descriptor
     self.parent = parent
   }
@@ -512,12 +530,12 @@ final class PreparationDirectory {
     return names.sorted()
   }
 
-  func kind(_ name: String) throws -> mode_t {
+  func entry(_ name: String) throws -> (kind: mode_t, identity: PreparationDirectoryIdentity) {
     var status = stat()
     guard fstatat(descriptor, name, &status, AT_SYMLINK_NOFOLLOW) == 0 else {
       throw MemoryError("cannot inspect preparation directory entry")
     }
-    return status.st_mode & S_IFMT
+    return (status.st_mode & S_IFMT, PreparationDirectoryIdentity(status))
   }
 
   func status(_ name: String) throws -> (modified: Date, size: UInt64) {

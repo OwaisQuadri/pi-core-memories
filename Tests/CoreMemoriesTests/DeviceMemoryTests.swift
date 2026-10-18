@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -121,4 +122,41 @@ func deviceSnapshotCountsProjectKeysInsteadOfScopeDocuments(projectCount: Int) t
       projectKeys: keys + [String(format: "%064x", projectCount)], limits: limits,
       deviceKey: String(repeating: "d", count: 64))
   }
+}
+
+@Test func deviceReviewCatalogCommandUsesCurrentDeviceAndBoundProject() throws {
+  let fixture = try Fixture()
+  defer { fixture.clean() }
+  let project = try fixture.project("project")
+  let common = try #require(try MemoryStore.projectBindingDirectory(cwd: project))
+  let original = try #require(try MemoryStore.projectKey(cwd: project))
+  let shared = String(repeating: "c", count: 64)
+  let device = String(repeating: "d", count: 64)
+  let selected = [
+    "MEMORY.md", "projects/\(shared).md", "devices/\(device)/MEMORY.md",
+    "devices/\(device)/projects/\(shared).md",
+  ]
+  for path in selected + [
+    "projects/\(original).md", "devices/\(String(repeating: "e", count: 64))/MEMORY.md",
+  ] {
+    try fixture.write("# Memory\n\n" + fact("Scope \(path)."), path: path)
+  }
+  try fixture.commit()
+  let resolved = try #require(realpath(fixture.root.path, nil))
+  defer { free(resolved) }
+  let configURL = URL(fileURLWithPath: String(cString: resolved)).appendingPathComponent(
+    "profile/config.json")
+  var config = MemoryConfiguration.defaults
+  config.settings.piExecutable = "/usr/bin/false"
+  config.deviceKey = device
+  config.projectBindings = [common: shared]
+  try config.save(to: configURL)
+  let result = try fixture.cli([
+    "review-catalog", "--repo", fixture.repo.path,
+    "--cwd", project.path, "--config", configURL.path,
+  ])
+  #expect(result.status == 0)
+  struct Envelope: Decodable { let catalog: MemoryManagementResult }
+  let catalog = try JSONDecoder().decode(Envelope.self, from: result.output).catalog
+  #expect(Set(catalog.entries.map(\.path)) == Set(selected))
 }

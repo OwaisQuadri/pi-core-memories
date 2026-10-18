@@ -13,6 +13,8 @@ let package = Package(
     .target(name: "CoreMemories"),
     .executableTarget(name: "PiCoreMemories", dependencies: ["CoreMemories"]),
     .executableTarget(name: "CoreMemoriesApp", dependencies: ["CoreMemories"]),
-    .testTarget(name: "CoreMemoriesTests", dependencies: ["CoreMemories", "PiCoreMemories"]),
+    .testTarget(
+      name: "CoreMemoriesTests",
+      dependencies: ["CoreMemories", "PiCoreMemories", "CoreMemoriesApp"]),
   ]
 )

@@ -37,6 +37,9 @@ import Foundation
   private var editorIndex: Int?
   private var isLoadingEditor = false
   private var autosaveTask: Task<Void, Never>?
+  private var shutdownTask: Task<Void, Error>?
+  private var editRevision: UInt64 = 0
+  private var persistedEditRevision: UInt64 = 0
   private var dreamTask: Task<Void, Never>?
   private var control: DreamControl?
   let workspace: Workspace
@@ -49,6 +52,7 @@ import Foundation
   }
 
   var isExistingEntry: Bool { editorTarget != nil }
+  var isDraftDirty: Bool { editRevision != persistedEditRevision }
 
   var visibleEntries: [ManagedMemoryEntry] {
     (catalog?.entries ?? []).filter { row in
@@ -69,7 +73,7 @@ import Foundation
     catalog = snapshot.catalog
     inspection = snapshot.inspection
     drafts = snapshot.drafts
-    if draft == nil, let recovered = drafts.last {
+    if draft == nil, !isDraftDirty, operations.isEmpty, let recovered = drafts.last {
       draft = recovered
       operations = recovered.operations
       message = "Recovered draft · revision \(recovered.revision)"
@@ -155,7 +159,9 @@ import Foundation
   }
 
   func editorChanged() {
-    guard isEditing, !isBusy, !isLoadingEditor, let base = draft?.baseCommit ?? catalog?.base else {
+    guard isEditing, !isBusy, !isLoadingEditor,
+      let base = draft?.baseCommit ?? operations.first?.base ?? catalog?.base
+    else {
       return
     }
     let request = MemoryManagementRequest(
@@ -173,7 +179,9 @@ import Foundation
   }
 
   func deleteEntry() {
-    guard let target = editorTarget, let base = draft?.baseCommit ?? catalog?.base else { return }
+    guard !isBusy, let target = editorTarget,
+      let base = draft?.baseCommit ?? operations.first?.base ?? catalog?.base
+    else { return }
     let operation = MemoryManagementRequest(
       operation: .delete, base: base, path: target.path,
       locator: target.locator, expected: target.expected, reason: editorReason)
@@ -188,6 +196,7 @@ import Foundation
   }
 
   func removeOperation(_ index: Int) {
+    guard !isBusy, operations.indices.contains(index) else { return }
     operations.remove(at: index)
     isEditing = false
     editorIndex = nil
@@ -195,10 +204,14 @@ import Foundation
   }
 
   private func queueAutosave() {
-    autosaveTask?.cancel()
+    editRevision &+= 1
+    let previous = autosaveTask
+    previous?.cancel()
     message = "Draft not yet persisted"
     autosaveTask = Task {
+      await previous?.value
       do {
+        try Task.checkCancellation()
         try await Task.sleep(for: .milliseconds(500))
         try Task.checkCancellation()
         try await persistEditor()
@@ -207,10 +220,12 @@ import Foundation
   }
 
   private func persistEditor() async throws {
-    guard let base = draft?.baseCommit ?? catalog?.base else {
+    guard let base = draft?.baseCommit ?? operations.first?.base ?? catalog?.base else {
       throw WorkspaceError("approved catalog is unavailable")
     }
+    let revision = editRevision
     draft = try await workspace.autosave(operations, base: base)
+    persistedEditRevision = revision
     message = "Draft saved locally · revision \(draft?.revision ?? 0)"
   }
 
@@ -224,6 +239,7 @@ import Foundation
       try await persistEditor()
       let receipt = try await workspace.save()
       operations = []
+      persistedEditRevision = editRevision
       draft = nil
       isEditing = false
       message = "Saved one commit · \(receipt.commit)"
@@ -232,11 +248,15 @@ import Foundation
   }
 
   func discard() async {
+    guard !isBusy else { return }
+    isBusy = true
+    defer { isBusy = false }
     autosaveTask?.cancel()
     await autosaveTask?.value
     do {
       try await workspace.discard()
       operations = []
+      persistedEditRevision = editRevision
       draft = nil
       isEditing = false
       message = "Draft discarded"
@@ -245,12 +265,17 @@ import Foundation
   }
 
   func restore(_ value: MemoryDraft) async {
+    guard !isBusy else { return }
+    isBusy = true
+    defer { isBusy = false }
     autosaveTask?.cancel()
     await autosaveTask?.value
     do {
+      if isDraftDirty { try await persistEditor() }
       try await workspace.restore(value)
       draft = value
       operations = value.operations
+      persistedEditRevision = editRevision
       isEditing = false
       message = "Recovered draft · revision \(value.revision)"
     } catch { failure = String(describing: error) }
@@ -335,7 +360,7 @@ import Foundation
   }
 
   func run(_ operation: DreamControlOperation) {
-    guard !isDreamRunning else { return }
+    guard !isBusy, !isDreamRunning else { return }
     isDreamRunning = true
     dreamPhase = "Starting"
     dreamDetail = ""
@@ -405,6 +430,9 @@ import Foundation
 
   func saveSettings(isSettingUpDevice: Bool = false) async {
     do {
+      guard !isBusy, !isDraftDirty, operations.isEmpty else {
+        throw WorkspaceError("Save or discard local edits before changing configuration")
+      }
       var value = configuration
       if isSettingUpDevice { value.setupDevice() }
       try await workspace.configure(value)
@@ -414,13 +442,25 @@ import Foundation
     } catch { failure = String(describing: error) }
   }
 
-  func shutdown() async {
-    autosaveTask?.cancel()
-    await autosaveTask?.value
-    if !operations.isEmpty {
-      do { try await persistEditor() } catch { failure = String(describing: error) }
+  func shutdown() async throws {
+    if let shutdownTask {
+      try await shutdownTask.value
+      return
     }
-    control?.cancel()
-    await dreamTask?.value
+    guard !isBusy else { throw WorkspaceError("Wait for the current operation before quitting") }
+    isBusy = true
+    let task = Task<Void, Error> {
+      autosaveTask?.cancel()
+      await autosaveTask?.value
+      if isDraftDirty { try await persistEditor() }
+      control?.cancel()
+      await dreamTask?.value
+    }
+    shutdownTask = task
+    defer {
+      shutdownTask = nil
+      isBusy = false
+    }
+    try await task.value
   }
 }

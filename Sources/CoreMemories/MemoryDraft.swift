@@ -67,11 +67,18 @@ package final class MemoryDraftStore {
     }
   }
 
-  package func create() throws -> MemoryDraft {
+  package func create(base: String? = nil, operations: [MemoryManagementRequest] = []) throws
+    -> MemoryDraft
+  {
     try locked {
+      let acceptedBase = try base ?? store.approvedCommit()
+      guard operations.count <= 256, operations.allSatisfy({ $0.base == acceptedBase }) else {
+        throw MemoryError("draft operations must use the selected base")
+      }
+      _ = try store.reviewSnapshot(base: acceptedBase)
       let draft = MemoryDraft(
         schemaVersion: 1, draftID: UUID(), revision: 0, repositoryBinding: binding,
-        baseCommit: try store.approvedCommit(), created: Date(), operations: [])
+        baseCommit: acceptedBase, created: Date(), operations: operations)
       try persist(draft)
       return draft
     }

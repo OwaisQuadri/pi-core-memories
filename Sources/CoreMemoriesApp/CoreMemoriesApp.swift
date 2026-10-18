@@ -5,12 +5,20 @@ import SwiftUI
 @MainActor final class ApplicationDelegate: NSObject, NSApplicationDelegate {
   var model: AppModel?
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-    guard let model else { return .terminateNow }
-    Task {
-      await model.shutdown()
-      sender.reply(toApplicationShouldTerminate: true)
-    }
+    guard model != nil else { return .terminateNow }
+    Task { sender.reply(toApplicationShouldTerminate: await isTerminationReady()) }
     return .terminateLater
+  }
+
+  func isTerminationReady() async -> Bool {
+    guard let model else { return true }
+    do {
+      try await model.shutdown()
+      return true
+    } catch {
+      model.failure = String(describing: error)
+      return false
+    }
   }
 }
 
@@ -38,7 +46,9 @@ import SwiftUI
         }
         .onDisappear {
           model.cancelDream()
-          Task { await model.shutdown() }
+          Task {
+            do { try await model.shutdown() } catch { model.failure = String(describing: error) }
+          }
         }
     }
     .commands {

@@ -59,7 +59,11 @@ actor Workspace {
 
   func autosave(_ operations: [MemoryManagementRequest], base: String) throws -> MemoryDraft {
     let store = try editorStore()
-    let draft = try currentDraft ?? store.create()
+    guard let draft = currentDraft else {
+      let created = try store.create(base: base, operations: operations)
+      currentDraft = created
+      return created
+    }
     guard draft.baseCommit == base else {
       throw WorkspaceError("active draft has a different base; reconcile or discard it first")
     }

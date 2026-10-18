@@ -29,7 +29,16 @@ private func reviewFlowOutput(_ text: String) throws {
 
 @Test(.enabled(if: ProcessInfo.processInfo.environment["CORE_MEMORY_REVIEW_BASELINE"] == "1"))
 func reviewFlowBaselinePreservesApprovedSiblingsSourcesAndCheckout() throws {
-  for repetition in 0...5 {
+  let repetitions: [Int]
+  if let raw = ProcessInfo.processInfo.environment["CORE_MEMORY_REVIEW_REPETITION"] {
+    guard let repetition = Int(raw), (0...5).contains(repetition) else {
+      throw MemoryError("expected a review-flow repetition from zero through five")
+    }
+    repetitions = [repetition]
+  } else {
+    repetitions = Array(0...5)
+  }
+  for repetition in repetitions {
     let fixture = try ReviewFlowFixture()
     defer { fixture.transaction.clean() }
     let preserved = try fixture.preservedFiles()

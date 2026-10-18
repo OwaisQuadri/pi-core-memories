@@ -53,7 +53,7 @@ The package adds memory loading, `/dream`, `/mem-review`, `/mem-rereview`, `/mem
 
 Choose Find Suggestions to process recent conversations. The queue shows dreamt text, undreamt text, and free queue capacity. Batch sizes come from runtime measurements; unavailable measurements stay unknown.
 
-Review Suggestions shows waiting suggestions separately from reviewed history. A finished run and a manual refresh reload the suggestion list. Saving a suggestion still requires a fresh preview and Save into Memory.
+Review Suggestions opens the Memories workspace. To Review, Changes, Blocked, and Saved History remain separate groups beside the editor and final Save Changes control. A finished run and a manual refresh reload the suggestions. Review each proposed result before choosing Stage Acceptance.
 
 If approved memories changed after a reply was saved, choose Prepare Saved Suggestions. Inspect the saved suggestions and their blockers, then confirm Prepare for Review. This action makes no model call and changes no approved memories. Each compatible suggestion still needs separate review and approval. Changed or ambiguous targets stay blocked.
 
@@ -79,11 +79,17 @@ Use `--config <file>` for a separate app or command profile. Keep that file in a
 
 ## Edit and review
 
-Memory edits persist as local drafts. Save Changes validates the whole draft and publishes one commit. An invalid annotation, stale base, changed target, or checkout conflict leaves approved memory unchanged. Unchanged retries retain the Save receipt's identity.
+Review choices and memory edits stage in one local draft. Save Changes validates every staged item and publishes one approved-memory commit. A draft containing only Decide Later and Dismiss choices saves decisions without creating a commit. An invalid annotation, stale base, changed target, or checkout conflict prevents publication. Remove and staged Undo change the next Save's contents. They do not reverse a completed Save.
 
 Use Prepare Checkout before the first publication from an attached initialization checkout. It preserves that checkout's files and index. It does not approve memory.
 
-Dream suggestions stay separate from edit drafts. Review Suggestion shows the proposed memory, before and after text, and the reason. Details contains the exact stored entry, sources, and contradictions. Save into Memory applies only the fresh preview. Restoring a draft does not restore candidate approval authority.
+Select a suggestion to inspect its original proposal, approved-before text, and final result. Choose Stage Acceptance, Decide Later, or Dismiss to stage its disposition. To correct a suggestion, choose Edit Suggestion, retain its sources, enter a reason, and choose Preview Amendment. Inspect the amended result before choosing Stage Acceptance. The original proposal and provenance remain intact.
+
+Supported additions, updates, deletions, and Confirm Reviewed also stage in this workspace. Confirm Reviewed requires inspection of its exact result before Stage Confirm Reviewed. Save Changes, the toolbar, and Command-S use the same final Save action. Command-Z uses text undo in an active editor and staged undo elsewhere.
+
+Draft persistence runs separately from prepared interaction. A crash can lose input that has not received a persistence acknowledgment. Restoring a draft restores intent, not approval authority. Each restored publishing suggestion and Confirm Reviewed row requires fresh inspection and staging. Details contains exact sources, diagnostics, paths, and receipts. Recovery-required or unknown Save outcomes block another publication until exact recovery resolves them.
+
+Terminal review remains explicitly confirmed one item at a time. It uses the shared transaction owner, not the native batch's Save action. Memory management commands remain create, read, update, and delete operations. They cannot approve suggestions or save a review-bearing batch.
 
 Reveal Checkout in Finder opens the selected working-file location, or the repository folder when that file is not checked out. The editor reads committed approved bytes, not dirty working files. Existing Pi sessions keep their saved memory snapshot; start a new session to load changed memory.
 
@@ -114,10 +120,14 @@ Keep dream inputs, rejected replies, draft journals, and invocation diagnostics 
 
 ```zsh
 swift build -Xswiftc -warnings-as-errors
-PI_CORE_MEMORIES_BIN="$PWD/.build/debug/pi-core-memories" swift test -Xswiftc -warnings-as-errors
+PI_CORE_MEMORIES_BIN="$(swift build --show-bin-path)/pi-core-memories" swift test -Xswiftc -warnings-as-errors
 npm ci --ignore-scripts
 node node_modules/typescript/bin/tsc --project tsconfig.json
-PI_CORE_MEMORIES_BIN="$PWD/.build/debug/pi-core-memories" node --throw-deprecation --test Integration/Pi/*.test.ts
+PI_CORE_MEMORIES_BIN="$(swift build --show-bin-path)/pi-core-memories" node --throw-deprecation --test Integration/Pi/*.test.ts
 ```
 
 The tests use temporary stores and offline providers. They do not require a live model. Native screen checks must also use a separate fixture configuration, not a personal memory store.
+
+The opt-in review drivers use the same twelve-suggestion fixture with four retained approvals and eight timed approvals. Build release tests with warnings treated as errors. Set CORE_MEMORY_REVIEW_BASELINE=1 or CORE_MEMORY_REVIEW_BATCH=1 and filter the corresponding ReviewFlow test. CORE_MEMORY_REVIEW_REPETITION selects one repetition from zero through five. Zero is the warmup. Without that variable, each driver runs the warmup and five measured repetitions. For a before-and-after comparison, run the baseline against frozen pre-change production sources and alternate equivalent repetitions.
+
+PI_NATIVE_PREPARED_TARGET=1 enables nativeThirtySuggestionPreparedActionTarget. It reports prepared model-command timings separately from preparation, durability, and final Save with reconciliation. These checks do not measure rendered-interface latency.

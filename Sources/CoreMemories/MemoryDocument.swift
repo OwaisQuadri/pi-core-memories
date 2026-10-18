@@ -113,7 +113,7 @@ public enum MemoryDocument {
     }
   }
 
-  static func isMemoryContent(_ bytes: Data) -> Bool {
+  package static func isMemoryContent(_ bytes: Data) -> Bool {
     guard let text = String(data: bytes, encoding: .utf8), let analysis = analyze(text) else {
       return false
     }

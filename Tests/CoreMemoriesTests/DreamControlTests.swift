@@ -163,3 +163,66 @@ private final class ControlEvents: @unchecked Sendable {
   #expect(input.hasPrefix(fixture.root.path + "\n"))
   #expect(!input.contains("prompt"))
 }
+
+@Test func dreamControlResourceAliasDoesNotWeakenSavedArtifactPathChecks() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let runtime = fixture.root.appendingPathComponent("runtime")
+  let control = runtime.appendingPathComponent("control.ts")
+  try fixture.write("export {}", file: control)
+  let alias = fixture.root.appendingPathComponent("alias")
+  try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: runtime)
+  let aliasFile = alias.appendingPathComponent("control.ts")
+  let settings = MemoryAppSettings(
+    piExecutable: "/usr/bin/false",
+    agentDirectory: fixture.root.path, controlExtension: aliasFile.path)
+  #expect(try settings.controlURL().path == control.path)
+  #expect(throws: (any Error).self) { try canonicalExistingFile(aliasFile) }
+}
+
+@Test func dreamControlFindsAdjacentNodeWithDesktopPath() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let control = fixture.root.appendingPathComponent("control.ts")
+  try fixture.write("export {}", file: control)
+  let pi = fixture.root.appendingPathComponent("bin/pi")
+  let node = fixture.root.appendingPathComponent("bin/node")
+  let marker = fixture.root.appendingPathComponent("node-started")
+  try fixture.write(
+    "#!/bin/zsh\nprintf used > '\(marker.path)'\nexec /bin/zsh \"$@\"\n", file: node)
+  try fixture.write(
+    """
+    #!/usr/bin/env node
+    IFS= read -r line
+    printf '%s\\n' '{"type":"response","id":"commands","success":true,"data":{"commands":[{"name":"memory-dream-control"},{"name":"memory-dream-cancel"}]}}'
+    IFS= read -r line
+    printf '%s\\n' '{"type":"response","id":"state","success":true,"data":{"model":{"provider":"fixture","id":"selected"},"thinkingLevel":"off"}}'
+    IFS= read -r line
+    printf '%s\\n' '{"type":"extension_ui_request","method":"notify","message":"{\\"version\\":1,\\"type\\":\\"core-memory-control\\",\\"event\\":\\"report\\",\\"report\\":{}}"}'
+    printf '%s\\n' '{"type":"response","id":"dream","success":true}'
+    while IFS= read -r line; do :; done
+    """, file: pi)
+  #expect(chmod(pi.path, 0o700) == 0)
+  #expect(chmod(node.path, 0o700) == 0)
+  var config = MemoryConfiguration.defaults
+  config.settings = MemoryAppSettings(
+    piExecutable: pi.path, agentDirectory: fixture.root.path, controlExtension: control.path)
+  config.roots = DreamControlRoots(
+    state: fixture.state.path, sessions: fixture.sessions.path, memory: fixture.memory.path,
+    snippets: fixture.snippets.path, prompts: nil, globalAgents: nil)
+  config.diagnostics = fixture.root.appendingPathComponent("diagnostics").path
+  config.journal = fixture.root.appendingPathComponent("drafts").path
+  config.reviewState = fixture.root.appendingPathComponent("review").path
+  let configURL = fixture.root.appendingPathComponent("profile/config.json")
+  try config.save(to: configURL)
+  let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+  let result = try runCommand(
+    executable: URL(fileURLWithPath: binary),
+    arguments: ["dream", "start", "--config", configURL.path],
+    environment: ProcessInfo.processInfo.environment.merging(["PATH": "/usr/bin:/bin"]) {
+      _, value in value
+    },
+    input: Data())
+  #expect(result.status == 0)
+  #expect(FileManager.default.fileExists(atPath: marker.path))
+}

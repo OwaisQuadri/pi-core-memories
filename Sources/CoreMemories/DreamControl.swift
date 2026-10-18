@@ -1,6 +1,14 @@
 import Darwin
 import Foundation
 
+private func resolvedControlFile(_ url: URL) throws -> URL {
+  guard let resolved = realpath(url.path, nil) else {
+    throw MemoryError("Pi control extension file is missing")
+  }
+  defer { free(resolved) }
+  return try canonicalExistingFile(URL(fileURLWithPath: String(cString: resolved)))
+}
+
 package struct MemoryAppSettings: Codable, Sendable {
   package var schemaVersion = 1
   package var piExecutable: String
@@ -26,7 +34,7 @@ package struct MemoryAppSettings: Codable, Sendable {
 
   package func controlURL() throws -> URL {
     if let controlExtension {
-      return try canonicalExistingFile(URL(fileURLWithPath: controlExtension))
+      return try resolvedControlFile(URL(fileURLWithPath: controlExtension))
     }
     var candidates: [URL] = []
     if let resources = Bundle.main.resourceURL {
@@ -34,11 +42,11 @@ package struct MemoryAppSettings: Codable, Sendable {
     }
     if let executable = Bundle.main.executableURL {
       candidates.append(
-        executable.resolvingSymlinksInPath().deletingLastPathComponent()
-          .deletingLastPathComponent().appendingPathComponent("lib/pi-core-memories/pi/control.ts"))
+        executable.deletingLastPathComponent().deletingLastPathComponent()
+          .appendingPathComponent("lib/pi-core-memories/pi/control.ts"))
     }
     for candidate in candidates {
-      if let url = try? canonicalExistingFile(candidate) { return url }
+      if let url = try? resolvedControlFile(candidate) { return url }
     }
     throw MemoryError(
       "Pi control resources are missing; install the CLI runtime or configure controlExtension")
@@ -180,13 +188,15 @@ package final class DreamControl: @unchecked Sendable {
     process.standardError = stderr
     process.environment = ProcessInfo.processInfo.environment
     process.environment?["PI_CODING_AGENT_DIR"] = settings.agentDirectory
-    if process.environment?["PI_CORE_MEMORIES_BIN"] == nil,
-      let executable = Bundle.main.executableURL
-    {
-      let helper = executable.resolvingSymlinksInPath().deletingLastPathComponent()
-        .appendingPathComponent("pi-core-memories")
+    let piDirectory = URL(fileURLWithPath: settings.piExecutable).deletingLastPathComponent()
+    process.environment?["PATH"] =
+      (process.environment?["PATH"] ?? "/usr/bin:/bin") + ":" + piDirectory.path
+    if let executable = Bundle.main.executableURL {
+      let directory = executable.deletingLastPathComponent()
+      let helper = directory.appendingPathComponent("pi-core-memories")
       if FileManager.default.isExecutableFile(atPath: helper.path) {
-        process.environment?["PI_CORE_MEMORIES_BIN"] = helper.path
+        process.environment?["PATH"] = directory.path + ":" + (process.environment?["PATH"] ?? "")
+        process.environment?["PI_CORE_MEMORIES_DREAM_EXECUTABLE"] = helper.path
       }
     }
     lock.lock()

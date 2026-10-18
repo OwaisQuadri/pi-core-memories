@@ -78,7 +78,12 @@ package struct MemoryConfiguration: Codable, Sendable {
   }
 
   package static func load(from url: URL = defaultURL) throws -> Self {
-    guard FileManager.default.fileExists(atPath: url.path) else { return defaults }
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      guard url.path == defaultURL.path else {
+        throw MemoryError("Selected configuration file does not exist")
+      }
+      return defaults
+    }
     let root = try DreamStateDirectory.openRoot(url.deletingLastPathComponent(), isCreating: false)
     let value = try JSONDecoder().decode(
       Self.self, from: root.read(url.lastPathComponent, maximum: 262_144))

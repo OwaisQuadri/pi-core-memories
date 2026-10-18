@@ -25,6 +25,28 @@ import Testing
   return model
 }
 
+@Test(arguments: ["missing", "corrupt"])
+@MainActor func nativeActionsStayBlockedUntilTheSelectedProfileLoads(_ variant: String) async throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let url = fixture.root.appendingPathComponent("selected.json")
+  if variant == "corrupt" { try fixture.write("{", file: url) }
+  let model = AppModel(configURL: url)
+  #expect(model.isBusy)
+  model.add()
+  #expect(!model.isEditing)
+  await model.load()
+  #expect(model.failure != nil)
+  #expect(model.isBusy)
+  model.add()
+  #expect(!model.isEditing)
+  #expect(model.catalog == nil)
+  let delegate = ApplicationDelegate()
+  delegate.model = model
+  #expect(await delegate.isTerminationReady())
+}
+
 @Test @MainActor func nativeDraftFinalRemovalIsFlushedBeforeQuitAndDoesNotReturn() async throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

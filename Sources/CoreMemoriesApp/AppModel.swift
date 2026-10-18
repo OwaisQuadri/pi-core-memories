@@ -14,7 +14,7 @@ import Foundation
   @Published var operations: [MemoryManagementRequest] = []
   @Published var message = ""
   @Published var failure: String?
-  @Published var isBusy = false
+  @Published var isBusy = true
   @Published var isDreamRunning = false
   @Published var dreamPhase = "Idle"
   @Published var dreamDetail = ""
@@ -36,6 +36,7 @@ import Foundation
   private var editorTarget: ManagedMemoryEntry?
   private var editorIndex: Int?
   private var isLoadingEditor = false
+  private var isLoaded = false
   private var autosaveTask: Task<Void, Never>?
   private var shutdownTask: Task<Void, Error>?
   private var editRevision: UInt64 = 0
@@ -65,10 +66,19 @@ import Foundation
   }
 
   func load() async {
-    do { apply(try await workspace.load()) } catch { failure = String(describing: error) }
+    guard !isLoaded else { return }
+    do {
+      apply(try await workspace.load())
+      isLoaded = true
+      isBusy = false
+      if section == "Review" { await loadCandidates() }
+    } catch { failure = String(describing: error) }
   }
 
-  func refresh() async { apply(await workspace.refresh()) }
+  func refresh() async {
+    guard isLoaded else { return }
+    apply(await workspace.refresh())
+  }
 
   private func apply(_ snapshot: WorkspaceSnapshot) {
     configuration = snapshot.configuration
@@ -299,6 +309,7 @@ import Foundation
   }
 
   func loadCandidates() async {
+    guard isLoaded else { return }
     do { candidates = try await workspace.candidates() } catch {
       failure = String(describing: error)
     }
@@ -445,6 +456,7 @@ import Foundation
   }
 
   func shutdown() async throws {
+    guard isLoaded else { return }
     if let shutdownTask {
       try await shutdownTask.value
       return

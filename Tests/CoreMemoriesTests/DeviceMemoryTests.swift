@@ -124,6 +124,22 @@ func deviceSnapshotCountsProjectKeysInsteadOfScopeDocuments(projectCount: Int) t
   }
 }
 
+@Test func selectedMissingProfileIsReadOnlyUntilExplicitDeviceSetupCreatesIt() throws {
+  let fixture = try Fixture()
+  defer { fixture.clean() }
+  let resolved = try #require(realpath(fixture.root.path, nil))
+  defer { free(resolved) }
+  let url = URL(fileURLWithPath: String(cString: resolved)).appendingPathComponent(
+    "profile/config.json")
+  #expect(try fixture.cli(["scope", "--config", url.path]).status != 0)
+  #expect(!FileManager.default.fileExists(atPath: url.path))
+  #expect(try fixture.cli(["setup-device", "--config", url.path]).status == 0)
+  let device = try #require(try MemoryConfiguration.load(from: url).deviceKey)
+  #expect(device.count == 64)
+  #expect(try fixture.cli(["setup-device", "--config", url.path]).status == 0)
+  #expect(try MemoryConfiguration.load(from: url).deviceKey == device)
+}
+
 @Test func deviceReviewCatalogCommandUsesCurrentDeviceAndBoundProject() throws {
   let fixture = try Fixture()
   defer { fixture.clean() }

@@ -474,6 +474,30 @@ public struct MemoryStore: Sendable {
     return (ref, commit, base)
   }
 
+  func publishSavedProposals(
+    _ plans: [SingleFileProposalPlan], observedMain: String,
+    installCheckpoint: () throws -> Void
+  ) throws {
+    var commands = "verify refs/heads/main \(observedMain)\n"
+    var refs = ["refs/heads/main"]
+    for plan in plans {
+      try validateProposal(
+        base: plan.base, path: plan.path, replacement: plan.replacement, reason: plan.reason)
+      let commit = try proposalCommit(
+        base: plan.base, path: plan.path, replacement: plan.replacement,
+        reason: plan.reason, contradictions: plan.contradictions)
+      let ref = "refs/heads/proposals/\(commit)"
+      let existing = try recoverProposal(
+        base: plan.base, path: plan.path, replacement: plan.replacement,
+        reason: plan.reason, contradictions: plan.contradictions)
+      commands += existing == nil ? "create \(ref) \(commit)\n" : "verify \(ref) \(commit)\n"
+      refs.append(ref)
+    }
+    let result = try git.enrollSavedRecovery(
+      commands, refs: refs, isolatedHead: observedMain, installCheckpoint: installCheckpoint)
+    guard result.status == 0 else { throw MemoryError("saved suggestion publication changed; prepare again") }
+  }
+
   private func validateProposal(base: String, path: String, replacement: Data, reason: String)
     throws
   {

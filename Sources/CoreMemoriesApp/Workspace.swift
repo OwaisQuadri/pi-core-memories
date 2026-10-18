@@ -10,12 +10,25 @@ struct WorkspaceSnapshot: Sendable {
   let failures: [String]
 }
 
+struct SavedRecoveryPresentation: Sendable {
+  let runID: String
+  let suggestions: [SavedSuggestionSummary]
+  var actionableCount: Int { suggestions.filter { $0.blocker == nil }.count }
+}
+
+func configurationIdentity(_ configuration: MemoryConfiguration) throws -> Data {
+  let encoder = JSONEncoder()
+  encoder.outputFormatting = [.sortedKeys]
+  return try encoder.encode(configuration)
+}
+
 actor Workspace {
   let configURL: URL
   private var configuration: MemoryConfiguration = .defaults
   private var draftStore: MemoryDraftStore?
   private var currentDraft: MemoryDraft?
   private var review: MemoryReviewController?
+  private var recovery: (DreamRunStore, SavedDreamRecoveryPreview, Data, String)?
 
   init(configURL: URL) { self.configURL = configURL }
 
@@ -25,6 +38,7 @@ actor Workspace {
   }
 
   func refresh() -> WorkspaceSnapshot {
+    recovery = nil
     var failures: [String] = []
     var catalog: MemoryManagementResult?
     var inspection: DreamInspection?
@@ -59,6 +73,7 @@ actor Workspace {
     configuration = value
     draftStore = nil
     review = nil
+    recovery = nil
   }
 
   func autosave(_ operations: [MemoryManagementRequest], base: String) throws -> MemoryDraft {
@@ -110,6 +125,42 @@ actor Workspace {
 
   func detach(_ preview: MemoryReviewCheckoutPreview) throws {
     try MemoryManagement(repository: configuration.memoryURL).confirmDetach(preview)
+  }
+
+  func prepareSavedRecovery(
+    runID: String, profile: MemoryConfiguration, base: String
+  ) throws -> SavedRecoveryPresentation {
+    recovery = nil
+    let identity = try verifyRecoveryProfile(profile, base: base)
+    let sources = try configuration.reviewSources()
+    let preview = try sources.previewSavedRecovery(runID: runID)
+    recovery = (sources, preview, identity, base)
+    return SavedRecoveryPresentation(runID: runID, suggestions: preview.suggestions)
+  }
+
+  func confirmSavedRecovery(profile: MemoryConfiguration, base: String) throws {
+    guard let (sources, preview, identity, retainedBase) = recovery else {
+      throw WorkspaceError("Prepare saved suggestions again")
+    }
+    recovery = nil
+    guard try verifyRecoveryProfile(profile, base: base) == identity, retainedBase == base else {
+      throw WorkspaceError("Profile or saved memories changed; prepare again")
+    }
+    guard case .completed = try sources.confirmSavedRecovery(preview) else {
+      throw WorkspaceError("Saved suggestions are still waiting; prepare again")
+    }
+  }
+
+  func cancelSavedRecovery() { recovery = nil }
+
+  private func verifyRecoveryProfile(_ profile: MemoryConfiguration, base: String) throws -> Data {
+    let identity = try configurationIdentity(configuration)
+    guard try configurationIdentity(profile) == identity,
+      try configurationIdentity(MemoryConfiguration.load(from: configURL)) == identity,
+      try MemoryStore(repo: configuration.memoryURL).approvedCommit() == base else {
+      throw WorkspaceError("Load the matching profile and refresh saved memories first")
+    }
+    return identity
   }
 
   func candidates() throws -> [MemoryReviewCandidate] { try reviewController().list() }

@@ -17,12 +17,16 @@ struct DreamsView: View {
           }
         }
         Text(statusTitle).font(.headline)
-        if !model.dreamDetail.isEmpty { Text(model.dreamDetail).textSelection(.enabled) }
+        if !model.dreamDetail.isEmpty, model.invocationStatus?.isPublicationBlocked != true {
+          Text(model.dreamDetail).textSelection(.enabled)
+        }
         DreamQueueView(model: model)
         if !model.isDreamRunning {
           HStack {
-            if model.invocationStatus?.isPublicationBlocked == true {
-              Button("View Saved Inference") { isShowingDetails = true }.fixedSize()
+            if model.savedRecoveryRunID != nil {
+              Button("Prepare Saved Suggestions…") {
+                Task { await model.prepareSavedRecovery() }
+              }.fixedSize()
             } else if model.invocationStatus?.reason == "invalidDecision" {
               Button("Replace Invalid Reply…") { model.isConfirmingReplacement = true }.fixedSize()
             } else if ["interruptedCall", "callInterrupted", "callbackFailure"].contains(
@@ -56,6 +60,40 @@ struct DreamsView: View {
         }
       }.padding(20)
     }
+    .sheet(
+      isPresented: Binding(
+        get: { model.savedRecovery != nil },
+        set: { if !$0 { Task { await model.cancelSavedRecovery() } } })
+    ) {
+      VStack(alignment: .leading, spacing: 16) {
+        Text("Prepare Saved Suggestions").font(.title2.bold())
+        Text("No model call or charge. Nothing is saved into memory now. Each memory needs a fresh preview and separate Save into Memory approval.")
+        if let recovery = model.savedRecovery {
+          Text("\(recovery.actionableCount) ready to review").font(.headline)
+          ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+              ForEach(recovery.suggestions, id: \.change.id) { suggestion in
+                VStack(alignment: .leading, spacing: 6) {
+                  Text(memoryReviewText(suggestion.change.after))
+                  Text(MemoryScopeConfiguration.label(
+                    path: suggestion.change.path, deviceKey: model.configuration.deviceKey))
+                    .font(.caption).foregroundStyle(.secondary)
+                  if let blocker = suggestion.blocker {
+                    Text(blocker).foregroundStyle(.orange)
+                  }
+                }
+              }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+          }
+          HStack {
+            Spacer()
+            Button("Cancel", role: .cancel) { Task { await model.cancelSavedRecovery() } }
+            Button("Prepare for Review") { Task { await model.confirmSavedRecovery() } }
+              .disabled(model.isBusy)
+          }
+        }
+      }.padding(24).frame(width: 640, height: 520)
+    }
     .alert("Retry Interrupted Call?", isPresented: $model.isConfirmingRetry) {
       Button("Cancel", role: .cancel) {}
       Button("Retry") { model.run(.retry) }
@@ -82,7 +120,7 @@ struct DreamsView: View {
       case "noNewRecords": return "No new conversations to process"
       case "pending":
         return status.isPublicationBlocked
-          ? "Saved inference is blocked from review" : "Saved work needs attention"
+          ? "Saved suggestions are waiting" : "Saved work needs attention"
       default: return status.title
       }
     }
@@ -95,6 +133,9 @@ struct DreamsView: View {
 
   private var details: some View {
     VStack(alignment: .leading, spacing: 12) {
+      if model.invocationStatus?.isPublicationBlocked == true {
+        Text(model.dreamDetail).textSelection(.enabled)
+      }
       LabeledContent(
         "Requested model",
         value: [
@@ -170,12 +211,12 @@ struct DreamsView: View {
   private func runTitle(_ run: SavedDreamRun) -> String {
     if model.invocationStatus?.runID == run.id {
       return model.invocationStatus?.isPublicationBlocked == true
-        ? "Saved inference blocked from review"
+        ? "Saved suggestions are waiting"
         : model.invocationStatus?.title ?? "Saved work needs attention"
     }
     if run.isCompleted { return "Processing completed" }
     switch run.attempts.last?.status {
-    case "Reply valid": return "Inference saved; publication not completed"
+    case "Reply valid": return "Saved suggestions are waiting"
     case "Rejected reply": return "Saved reply needs replacement"
     default: return "Saved work; completion not established"
     }

@@ -1,0 +1,90 @@
+import Foundation
+import Testing
+
+@testable import CoreMemories
+@testable import CoreMemoriesApp
+
+@Test @MainActor
+func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let (_, pending) = try savedRecoveryPendingAddition(fixture)
+  let configuration = queueConfiguration(fixture)
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  let model = AppModel(configURL: url, autosaveDelay: .seconds(3600))
+  await model.prepareSavedRecovery()
+  #expect(model.savedRecovery == nil)
+  await model.load()
+  #expect(model.savedRecoveryRunID == pending.runID)
+  await model.loadCandidates()
+  model.add()
+  model.editorText = "Keep this unsaved draft. [source: fixture; added: 2026-10-17]"
+  model.editorReason = "Retain local edit"
+  model.editorChanged()
+  let encoder = JSONEncoder()
+  encoder.outputFormatting = [.sortedKeys]
+  let operations = try encoder.encode(model.operations)
+  let before = try fixture.protectedState()
+  await model.prepareSavedRecovery()
+  #expect(model.savedRecovery?.actionableCount == 1)
+  let suggestion = try #require(model.savedRecovery?.suggestions.first)
+  #expect(!memoryReviewText(suggestion.change.after).contains("[source:"))
+  #expect(String(decoding: suggestion.change.after, as: UTF8.self).contains("[source:"))
+  #expect(model.preview == nil)
+  #expect(try fixture.protectedState() == before)
+  await model.refresh()
+  #expect(model.savedRecovery == nil)
+  await model.confirmSavedRecovery()
+  #expect(model.candidates.isEmpty)
+  await model.prepareSavedRecovery()
+  model.configuration.settings.modelID = "changed selection"
+  #expect(model.savedRecovery == nil)
+  await model.confirmSavedRecovery()
+  #expect(model.candidates.isEmpty)
+  await model.refresh()
+  await model.prepareSavedRecovery()
+  #expect(model.savedRecovery != nil)
+  model.isBusy = true
+  await model.confirmSavedRecovery()
+  #expect(model.savedRecovery != nil)
+  model.isBusy = false
+  await model.confirmSavedRecovery()
+  #expect(model.failure == nil)
+  #expect(model.savedRecovery == nil)
+  #expect(model.section == "Review")
+  #expect(model.actionableCandidates.count == 1)
+  #expect(model.preview == nil)
+  #expect(try encoder.encode(model.operations) == operations)
+  let after = try fixture.protectedState()
+  let changedPaths = after.filter { before[$0.key] != $0.value }.keys.sorted()
+  #expect(changedPaths == [])
+  await model.showPreview(try #require(model.actionableCandidates.first))
+  #expect(model.preview != nil)
+  #expect(try fixture.protectedState() == after)
+  try await model.shutdown()
+}
+
+@Test @MainActor
+func nativeSavedRecoveryRejectsAnUnloadedOrReplacedProfileWithoutPublishing() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  _ = try savedRecoveryPendingAddition(fixture)
+  var configuration = queueConfiguration(fixture)
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  let model = AppModel(configURL: url)
+  await model.prepareSavedRecovery()
+  #expect(model.savedRecovery == nil)
+  await model.load()
+  await model.prepareSavedRecovery()
+  #expect(model.savedRecovery != nil)
+  configuration.settings.modelID = "replacement profile"
+  try configuration.save(to: url)
+  let before = try fixture.protectedState()
+  await model.confirmSavedRecovery()
+  #expect(model.failure != nil)
+  #expect(model.candidates.isEmpty)
+  #expect(try fixture.protectedState() == before)
+  try await model.shutdown()
+}

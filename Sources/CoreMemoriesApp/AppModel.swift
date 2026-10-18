@@ -4,12 +4,15 @@ import Foundation
 
 @MainActor final class AppModel: ObservableObject {
   @Published var section = "Dreams"
-  @Published var configuration = MemoryConfiguration.defaults
+  @Published var configuration = MemoryConfiguration.defaults {
+    didSet { savedRecovery = nil }
+  }
   @Published var catalog: MemoryManagementResult?
   @Published var drafts: [MemoryDraft] = []
   @Published var inspection: DreamInspection?
   @Published var candidates: [MemoryReviewCandidate] = []
   @Published var preview: MemoryReviewPreview?
+  @Published var savedRecovery: SavedRecoveryPresentation?
   @Published var draft: MemoryDraft?
   @Published var operations: [MemoryManagementRequest] = []
   @Published var message = ""
@@ -89,10 +92,61 @@ import Foundation
   }
 
   func refresh() async {
-    guard isLoaded else { return }
+    guard isLoaded, !isBusy, !isDreamRunning else { return }
+    await refreshSnapshot()
+  }
+
+  private func refreshSnapshot() async {
+    savedRecovery = nil
+    preview = nil
     apply(await workspace.refresh())
-    if isReviewLoaded || section == "Review" { await loadCandidates() }
+    if isReviewLoaded || section == "Review" { await reloadCandidates() }
     reloadQueue()
+  }
+
+  var savedRecoveryRunID: String? {
+    inspection?.runs.first(where: {
+      !$0.isCompleted && $0.attempts.last?.status == "Reply valid"
+    })?.id
+  }
+
+  func prepareSavedRecovery() async {
+    guard isLoaded, !isBusy, !isDreamRunning, let runID = savedRecoveryRunID,
+      let base = catalog?.base else { return }
+    isBusy = true
+    defer { isBusy = false }
+    savedRecovery = nil
+    preview = nil
+    await pauseQueue()
+    do {
+      savedRecovery = try await workspace.prepareSavedRecovery(
+        runID: runID, profile: configuration, base: base)
+    } catch { failure = String(describing: error) }
+  }
+
+  func cancelSavedRecovery() async {
+    guard !isBusy else { return }
+    savedRecovery = nil
+    await workspace.cancelSavedRecovery()
+  }
+
+  func confirmSavedRecovery() async {
+    guard isLoaded, !isBusy, !isDreamRunning, savedRecovery != nil,
+      let base = catalog?.base else { return }
+    isBusy = true
+    defer { isBusy = false }
+    savedRecovery = nil
+    preview = nil
+    do {
+      try await workspace.confirmSavedRecovery(profile: configuration, base: base)
+      section = "Review"
+      isShowingReviewedCandidates = false
+      invocationStatus = nil
+      dreamPhase = "Ready to review"
+      dreamDetail = ""
+      message = "Saved suggestions prepared. No model call or memory approval."
+      await refreshSnapshot()
+    } catch { failure = String(describing: error) }
   }
 
   private func pauseQueue() async {
@@ -297,7 +351,7 @@ import Foundation
       draft = nil
       isEditing = false
       message = "Saved one commit · \(receipt.commit)"
-      await refresh()
+      await refreshSnapshot()
     } catch { failure = String(describing: error) }
   }
 
@@ -314,7 +368,7 @@ import Foundation
       draft = nil
       isEditing = false
       message = "Draft discarded"
-      await refresh()
+      await refreshSnapshot()
     } catch { failure = String(describing: error) }
   }
 
@@ -336,7 +390,7 @@ import Foundation
   }
 
   func prepareCheckout() async {
-    guard isLoaded, !isBusy else { return }
+    guard isLoaded, !isBusy, !isDreamRunning else { return }
     isBusy = true
     defer { isBusy = false }
     do { checkout = try await workspace.checkoutPreview() } catch {
@@ -345,7 +399,7 @@ import Foundation
   }
 
   func detach() async {
-    guard isLoaded, !isBusy, let checkout else { return }
+    guard isLoaded, !isBusy, !isDreamRunning, let checkout else { return }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -356,7 +410,11 @@ import Foundation
   }
 
   func loadCandidates() async {
-    guard isLoaded else { return }
+    guard isLoaded, !isBusy, !isDreamRunning else { return }
+    await reloadCandidates()
+  }
+
+  private func reloadCandidates() async {
     isReviewLoaded = true
     isReviewLoading = true
     reviewFailure = nil
@@ -411,6 +469,9 @@ import Foundation
   }
 
   func showPreview(_ candidate: MemoryReviewCandidate) async {
+    guard isLoaded, !isBusy, !isDreamRunning else { return }
+    isBusy = true
+    defer { isBusy = false }
     preview = nil
     await pauseQueue()
     let revision = reviewRevision
@@ -423,31 +484,38 @@ import Foundation
   }
 
   func approve() async {
-    guard let shown = preview else { return }
+    guard isLoaded, !isBusy, !isDreamRunning, let shown = preview else { return }
+    isBusy = true
+    defer { isBusy = false }
     preview = nil
     await pauseQueue()
     do {
       let receipt = try await workspace.approve(shown)
       message = "Approved entry · \(receipt.commit)"
-      await loadCandidates()
-      await refresh()
+      await reloadCandidates()
+      await refreshSnapshot()
     } catch { failure = String(describing: error) }
   }
 
   func disposition(_ candidate: MemoryReviewCandidate, isRejected: Bool) async {
+    guard isLoaded, !isBusy, !isDreamRunning else { return }
+    isBusy = true
+    defer { isBusy = false }
     preview = nil
     await pauseQueue()
     do {
       try await workspace.disposition(candidate.change.id, isRejected: isRejected)
-      await loadCandidates()
+      await reloadCandidates()
     } catch { failure = String(describing: error) }
   }
 
   func confirmReviewed(_ entry: ManagedMemoryEntry) async {
-    guard let base = catalog?.base else { return }
+    guard isLoaded, !isBusy, !isDreamRunning, let base = catalog?.base else { return }
+    isBusy = true
+    defer { isBusy = false }
     do {
       try await workspace.confirmReviewed(entry, base: base)
-      await refresh()
+      await refreshSnapshot()
     } catch { failure = String(describing: error) }
   }
 
@@ -475,7 +543,9 @@ import Foundation
   }
 
   func run(_ operation: DreamControlOperation) {
-    guard !isBusy, !isDreamRunning else { return }
+    guard isLoaded, !isBusy, !isDreamRunning else { return }
+    savedRecovery = nil
+    Task { await workspace.cancelSavedRecovery() }
     isDreamRunning = true
     dreamPhase = "Starting"
     dreamDetail = ""
@@ -573,9 +643,12 @@ import Foundation
 
   func saveSettings(isSettingUpDevice: Bool = false) async {
     do {
-      guard !isBusy, !isDraftDirty, operations.isEmpty else {
+      guard isLoaded, !isBusy, !isDreamRunning, !isDraftDirty, operations.isEmpty else {
         throw WorkspaceError("Save or discard local edits before changing configuration")
       }
+      isBusy = true
+      defer { isBusy = false }
+      savedRecovery = nil
       var value = configuration
       if isSettingUpDevice { value.setupDevice() }
       await pauseQueue()
@@ -590,7 +663,7 @@ import Foundation
       dreamPhase = "Idle"
       dreamDetail = ""
       message = "Settings saved"
-      await refresh()
+      await refreshSnapshot()
     } catch { failure = String(describing: error) }
   }
 
@@ -602,7 +675,9 @@ import Foundation
     }
     guard !isBusy else { throw WorkspaceError("Wait for the current operation before quitting") }
     isBusy = true
+    savedRecovery = nil
     let task = Task<Void, Error> {
+      await workspace.cancelSavedRecovery()
       autosaveTask?.cancel()
       await autosaveTask?.value
       if isDraftDirty { try await persistEditor() }

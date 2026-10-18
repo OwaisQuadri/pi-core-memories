@@ -1,6 +1,13 @@
 import CoreMemories
 import SwiftUI
 
+func memoryReviewText(_ bytes: Data) -> String {
+  let text = (try? MemoryDocument.editableEntry(bytes)) ?? String(decoding: bytes, as: UTF8.self)
+  return text.replacingOccurrences(
+    of: #"[ \t]*\[source: [^\[\];\r\n]+; added: [0-9]{4}-[0-9]{2}-[0-9]{2}\]"#,
+    with: "", options: .regularExpression)
+}
+
 struct MemoriesView: View {
   @ObservedObject var model: AppModel
   var body: some View {
@@ -197,24 +204,27 @@ struct ReviewView: View {
             Button("Back") { model.preview = nil }.keyboardShortcut(.cancelAction)
             Button("Save into Memory") { Task { await model.approve() } }
           }
-          Text("Base · \(preview.currentBase)").font(.system(.caption, design: .monospaced))
-            .textSelection(.enabled)
-          Text("Stored sources are references, not verified evidence.").font(.caption)
-            .foregroundStyle(.secondary)
+          Text(memoryReviewText(preview.change.after)).font(.headline)
           PlainTextView(
-            text: "BEFORE\n" + String(decoding: preview.before, as: UTF8.self)
-              + "\n\nAFTER\n" + String(decoding: preview.after, as: UTF8.self)
-              + "\n\nREASON\n" + preview.change.reason
-              + "\n\nSOURCES\n"
-              + preview.change.sources.map { $0.exactText }.joined(separator: "\n\n")
-              + "\n\nCONTRADICTIONS\n" + String(describing: preview.change.contradictions))
+            text: "BEFORE\n" + (preview.before.isEmpty ? "New memory" : memoryReviewText(preview.before))
+              + "\n\nAFTER\n" + memoryReviewText(preview.after)
+              + "\n\nREASON\n" + preview.change.reason)
+          DisclosureGroup("Details") {
+            Text("Base · \(preview.currentBase)").font(.system(.caption, design: .monospaced))
+              .textSelection(.enabled)
+            Text("Stored sources are references, not verified evidence.").font(.caption)
+            PlainTextView(
+              text: "STORED ENTRY\n" + String(decoding: preview.after, as: UTF8.self)
+                + "\n\nSOURCES\n" + preview.change.sources.map { $0.exactText }.joined(separator: "\n\n")
+                + "\n\nCONTRADICTIONS\n" + String(describing: preview.change.contradictions))
+              .frame(height: 180)
+          }
         } else {
           VStack(alignment: .leading, spacing: 12) {
             Text(model.reviewEmptyMessage)
               .foregroundStyle(.secondary)
             if model.invocationStatus?.isPublicationBlocked == true {
-              Text(model.invocationStatus?.explanation ?? "")
-              Button("Show Blocked Dream") { model.section = "Dreams" }
+              Button("Prepare Saved Suggestions…") { model.section = "Dreams" }
             }
           }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -235,8 +245,7 @@ struct ReviewView: View {
 
   private func candidateRow(_ candidate: MemoryReviewCandidate) -> some View {
     VStack(alignment: .leading, spacing: 8) {
-      Text((try? MemoryDocument.editableEntry(candidate.change.after))
-        ?? String(decoding: candidate.change.after, as: UTF8.self)).lineLimit(4)
+      Text(memoryReviewText(candidate.change.after)).lineLimit(4)
       Text(
         "\(dispositionTitle(candidate.disposition)) · \(MemoryScopeConfiguration.label(path: candidate.change.path, deviceKey: model.configuration.deviceKey))"
       )

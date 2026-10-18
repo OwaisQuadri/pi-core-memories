@@ -134,6 +134,20 @@ package struct VerifiedDreamReviewCandidates: Sendable {
   package let changes: [AtomicMemoryChange]
   package let receipts: [DreamProposalReceipt]
   package let limitations: [String]
+  let recoveryCheckpointHash: SourceDigest?
+  let recoveryCheckpoint: DreamRunEncoding.RecoveryCheckpoint?
+}
+
+package struct SavedSuggestionSummary: Sendable {
+  package let change: AtomicMemoryChange
+  package let blocker: String?
+}
+
+package struct SavedDreamRecoveryPreview: Sendable {
+  package let runID: String
+  package let suggestions: [SavedSuggestionSummary]
+  fileprivate let witness: UUID
+  fileprivate let fingerprint: SourceDigest
 }
 
 public struct DreamPendingReport: Sendable {
@@ -213,6 +227,7 @@ public final class DreamRunStore {
   private let deviceKey: String?
   private let projectBindings: [String: String]
   private let operationLock = NSLock()
+  private var recoveryWitnesses: [UUID: SourceDigest] = [:]
   var persistenceFault: ((DreamPersistenceEvent) throws -> Void)?
   var clock: () -> Date = { Date() }
   var isCancelled: () -> Bool = { false }
@@ -425,6 +440,167 @@ public final class DreamRunStore {
     } catch DreamRunError.busy { throw DreamRunError.busy } catch {
       throw DreamRunError.nativeReviewLimitation("saved completion verification failed: \(error)")
     }
+  }
+
+  package func previewSavedRecovery(runID: String) throws -> SavedDreamRecoveryPreview {
+    try withRecoveryLock {
+      recoveryWitnesses.removeAll()
+      let proof = try savedRecoveryProof(runID: runID)
+      let witness = UUID()
+      recoveryWitnesses[witness] = proof.fingerprint
+      return SavedDreamRecoveryPreview(
+        runID: runID, suggestions: proof.suggestions, witness: witness,
+        fingerprint: proof.fingerprint)
+    }
+  }
+
+  package func confirmSavedRecovery(_ preview: SavedDreamRecoveryPreview) throws
+    -> DreamTransactionResult
+  {
+    try withRecoveryLock {
+      guard recoveryWitnesses.removeValue(forKey: preview.witness) == preview.fingerprint else {
+        throw MemoryError("saved suggestions confirmation is stale")
+      }
+      let proof = try savedRecoveryProof(runID: preview.runID)
+      guard proof.fingerprint == preview.fingerprint, !isCancelled() else {
+        throw MemoryError("saved suggestions changed; prepare again")
+      }
+      let memory = try MemoryStore(repo: memoryRepository)
+      try memory.publishSavedProposals(proof.outcome.plans, observedMain: proof.main) {
+        try self.install(
+          proof.checkpoint, name: "recovery.json", directory: proof.sealed.directory)
+      }
+      return try finish(proof.sealed, chain: proof.chain, isRecovered: true, isCommitted: false)
+    }
+  }
+
+  private func withRecoveryLock<T>(_ body: () throws -> T) throws -> T {
+    guard operationLock.try() else { throw DreamRunError.busy }
+    defer { operationLock.unlock() }
+    let lock = try root.openReadLock()
+    defer {
+      _ = flock(lock, LOCK_UN)
+      _ = close(lock)
+    }
+    guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
+    try root.verifyLock(lock)
+    _ = try root.retainedBytes(maximum: limits.maximumStateBytes)
+    _ = try reviewSourceBinding()
+    return try body()
+  }
+
+  private struct SavedRecoveryProof {
+    let sealed: SealedRun
+    let chain: SuccessfulChain
+    let outcome: Outcome
+    let main: String
+    let checkpoint: DreamRunEncoding.RecoveryCheckpoint
+    let fingerprint: SourceDigest
+    let suggestions: [SavedSuggestionSummary]
+  }
+
+  private func snapshotHash(_ snapshot: ApprovedDecisionSnapshot) -> String {
+    var bytes = Data((snapshot.base + "\0" + snapshot.layoutHash.rawValue).utf8)
+    for document in snapshot.documents {
+      bytes.append(Data(("\0" + document.path + "\0" + (document.digest?.rawValue ?? "absent")).utf8))
+    }
+    return SourceDigest(bytes: bytes).rawValue
+  }
+
+  private func recoveryCheckpoint(
+    _ sealed: SealedRun, outcome: Outcome, main: String
+  ) throws -> DreamRunEncoding.RecoveryCheckpoint {
+    var status = stat()
+    guard lstat(memoryRepository.path, &status) == 0, status.st_mode & S_IFMT == S_IFDIR else {
+      throw DreamRunError.unsafeState
+    }
+    var artifacts: [[String]] = []
+    for name in try sealed.directory.names().sorted()
+    where name == "input.json" || name == "context.json" || name == "request.json"
+      || name == "response.json" || name == "call-started.json"
+      || name.hasPrefix("replacement-") || name.hasPrefix("rejected-")
+    {
+      let bytes = try sealed.directory.read(
+        name, maximum: max(maximumResponseEnvelopeBytes, limits.maximumFrozenBytes))
+      artifacts.append([name, SourceDigest(bytes: bytes).rawValue])
+    }
+    let memory = try MemoryStore(repo: memoryRepository)
+    return try DreamRunEncoding.RecoveryCheckpoint(
+      schemaVersion: 1, policyVersion: 1,
+      sourceBinding: reviewSourceBinding().rawValue,
+      repositoryVolume: MemoryReviewEncoding.volumeUUID(at: memoryRepository),
+      repositoryInode: UInt64(status.st_ino), runID: sealed.run.runID,
+      admissionHash: sealed.admissionHash.rawValue,
+      predecessorHash: sealed.admission.predecessorHash,
+      frozenProofHash: SourceDigest(bytes: bounded(artifacts)).rawValue,
+      decisionsHash: SourceDigest(bytes: bounded(outcome.record)).rawValue,
+      candidateIDs: outcome.atomicChanges.map { $0.id.rawValue },
+      planHashes: outcome.plans.map { SourceDigest(bytes: try bounded(DreamRunEncoding.Plan($0))).rawValue },
+      confirmedMain: main, snapshotHash: snapshotHash(memory.reviewSnapshot(base: main)))
+  }
+
+  private func enrolledRecovery(_ sealed: SealedRun, outcome: Outcome) throws
+    -> DreamRunEncoding.RecoveryCheckpoint?
+  {
+    guard try sealed.directory.isPresent("recovery.json") else { return nil }
+    let bytes = try sealed.directory.read("recovery.json", maximum: limits.maximumFrozenBytes)
+    let checkpoint = try DreamRunEncoding.decode(DreamRunEncoding.RecoveryCheckpoint.self, bytes: bytes)
+    guard checkpoint == (try recoveryCheckpoint(sealed, outcome: outcome, main: checkpoint.confirmedMain)),
+      bytes == (try bounded(checkpoint)) else { throw DreamRunError.corruption }
+    return checkpoint
+  }
+
+  private func savedRecoveryProof(runID: String) throws -> SavedRecoveryProof {
+    guard DreamRunEncoding.isRunID(runID) else { throw DreamRunError.corruption }
+    let chain = try loadChain()
+    let sealed = try loadAdmission(generation: chain.record.progress.generation, chain: chain)
+    guard sealed.run.runID == runID, !(try sealed.directory.isPresent("completion.json")) else {
+      throw MemoryError("saved run is not eligible for recovery")
+    }
+    let outcome = try validatedOutcome(sealed)
+    guard !outcome.plans.isEmpty else { throw MemoryError("saved run has no suggestions") }
+    let decisions = try bounded(outcome.record)
+    guard try sealed.directory.read("decisions.json", maximum: limits.maximumFrozenBytes) == decisions else {
+      throw DreamRunError.corruption
+    }
+    let receipts = try savedReceipts(sealed, plans: outcome.plans, decisionsBytes: decisions)
+    let memory = try MemoryStore(repo: memoryRepository)
+    var published: [String] = []
+    for plan in outcome.plans {
+      let hash = SourceDigest(bytes: try bounded(DreamRunEncoding.Plan(plan))).rawValue
+      let existing = try memory.recoverProposal(
+        base: plan.base, path: plan.path, replacement: plan.replacement,
+        reason: plan.reason, contradictions: plan.contradictions)
+      if let receipt = receipts.first(where: { $0.planHash == hash }) {
+        guard existing?.commit == receipt.commit else { throw DreamRunError.corruption }
+      }
+      published.append(existing?.commit ?? "missing")
+    }
+    let main = try memory.approvedCommit()
+    let enrollment = try enrolledRecovery(sealed, outcome: outcome)
+    guard main != sealed.run.approvedBase || enrollment != nil else {
+      throw MemoryError("saved run can continue normally")
+    }
+    let checkpoint = try enrollment ?? recoveryCheckpoint(sealed, outcome: outcome, main: main)
+    let snapshot = try memory.reviewSnapshot(base: main)
+    let frozen = try memory.reviewSnapshot(base: sealed.run.approvedBase)
+    let suggestions = try outcome.atomicChanges.map { change -> SavedSuggestionSummary in
+      do {
+        _ = try MemoryReviewController.recoveredTarget(change, frozen: frozen, snapshot: snapshot)
+        return SavedSuggestionSummary(change: change, blocker: nil)
+      } catch let error as MemoryError {
+        return SavedSuggestionSummary(change: change, blocker: error.description)
+      }
+    }
+    let fingerprint = SourceDigest(bytes: try bounded([
+      SourceDigest(bytes: bounded(checkpoint)).rawValue, main, snapshotHash(snapshot),
+      SourceDigest(bytes: bounded(receipts)).rawValue,
+      SourceDigest(bytes: bounded(published)).rawValue,
+      SourceDigest(bytes: bounded(suggestions.map { [$0.change.id.rawValue, $0.blocker ?? "compatible"] })).rawValue,
+    ]))
+    return SavedRecoveryProof(
+      sealed: sealed, chain: chain, outcome: outcome, main: main, checkpoint: checkpoint,
+      fingerprint: fingerprint, suggestions: suggestions)
   }
 
   package func inspectQueue(
@@ -1117,7 +1293,7 @@ public final class DreamRunStore {
           sealed, plans: outcome.plans, decisionsBytes: decisionsBytes)
         guard receipts.count == outcome.plans.count else { throw DreamRunError.missingPayload }
         let completion = try completionRecord(
-          sealed, decisionsBytes: decisionsBytes, receipts: receipts)
+          sealed, outcome: outcome, decisionsBytes: decisionsBytes, receipts: receipts)
         let completionBytes = try sealed.directory.read(
           "completion.json", maximum: limits.maximumFrozenBytes)
         guard completionBytes == (try bounded(completion)),
@@ -1139,7 +1315,9 @@ public final class DreamRunStore {
               runID: runID, generation: generation, admissionHash: sealed.admissionHash,
               completionHash: SourceDigest(bytes: completionBytes),
               decisionsHash: SourceDigest(bytes: decisionsBytes), changes: outcome.atomicChanges,
-              receipts: reports, limitations: sealed.context.limitations))
+              receipts: reports, limitations: sealed.context.limitations,
+              recoveryCheckpointHash: try completion.recoveryCheckpointHash.map { try SourceDigest($0) },
+              recoveryCheckpoint: try enrolledRecovery(sealed, outcome: outcome)))
         }
       }
       let hash = SourceDigest(bytes: bytes)
@@ -1332,15 +1510,17 @@ public final class DreamRunStore {
   }
 
   private func completionRecord(
-    _ sealed: SealedRun, decisionsBytes: Data, receipts: [DreamRunEncoding.Receipt]
+    _ sealed: SealedRun, outcome: Outcome, decisionsBytes: Data,
+    receipts: [DreamRunEncoding.Receipt]
   ) throws -> DreamRunEncoding.Completion {
     let generation = sealed.run.progress.generation
     let (next, isOverflow) = generation.addingReportingOverflow(1)
     guard !isOverflow else { throw DreamRunError.staleGeneration }
     let decisions = try DreamRunEncoding.decode(
       DreamRunEncoding.Decisions.self, bytes: decisionsBytes)
+    let enrollment = try enrolledRecovery(sealed, outcome: outcome)
     return DreamRunEncoding.Completion(
-      schemaVersion: 2, admissionHash: sealed.admissionHash.rawValue,
+      schemaVersion: enrollment == nil ? 2 : 3, admissionHash: sealed.admissionHash.rawValue,
       decisionsHash: SourceDigest(bytes: decisionsBytes).rawValue,
       predecessorHash: sealed.admission.predecessorHash, predecessorGeneration: generation,
       nextGeneration: next,
@@ -1350,7 +1530,8 @@ public final class DreamRunStore {
       receiptHashes: try receipts.map { SourceDigest(bytes: try bounded($0)).rawValue },
       notes: decisions.notes,
       tails: sealed.run.batch.unfinishedTails.map(DreamRunEncoding.Tail.init),
-      isBacklog: sealed.run.batch.isBacklog)
+      isBacklog: sealed.run.batch.isBacklog,
+      recoveryCheckpointHash: try enrollment.map { SourceDigest(bytes: try bounded($0)).rawValue })
   }
 
   private func finish(
@@ -1362,6 +1543,7 @@ public final class DreamRunStore {
       if isCommitted { throw DreamRunError.corruption }
       return pending(sealed, reason: .invalidDecision, validationError: error)
     }
+    let enrollment = try enrolledRecovery(sealed, outcome: outcome)
     if !isCommitted, isCancelled() { return pending(sealed, reason: .cancelled) }
     if !sealed.run.batch.evidence.isEmpty {
       let attempt = try activeAttempt(sealed)
@@ -1413,6 +1595,10 @@ public final class DreamRunStore {
       }
     }
     try recoverAll()
+    if enrollment != nil, receipts.count != outcome.plans.count {
+      if isCommitted { throw DreamRunError.corruption }
+      return try pending(sealed, reason: .staleUnpublishedPlans, proposals: reports())
+    }
     for plan in outcome.plans where receipts[plan.path] == nil {
       if isCommitted { throw DreamRunError.corruption }
       if isCancelled() { return try pending(sealed, reason: .cancelled, proposals: reports()) }
@@ -1442,7 +1628,8 @@ public final class DreamRunStore {
       return try pending(sealed, reason: .cancelled, proposals: reports())
     }
     let ordered = outcome.plans.map { receipts[$0.path]! }
-    let completion = try completionRecord(sealed, decisionsBytes: decisionsBytes, receipts: ordered)
+    let completion = try completionRecord(
+      sealed, outcome: outcome, decisionsBytes: decisionsBytes, receipts: ordered)
     let completionBytes = try bounded(completion)
     try persist(
       completionBytes, name: "completion.json", directory: sealed.directory, isReplacing: false)

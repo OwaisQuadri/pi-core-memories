@@ -46,7 +46,10 @@ enum DreamRunEncoding {
     do {
       let decoder = JSONDecoder()
       let schema = try decoder.decode(Schema.self, from: bytes)
-      guard schema.schemaVersion == 2 else { throw DreamRunError.unsupportedSchema }
+      guard schema.schemaVersion == 2
+        || (type == Completion.self && schema.schemaVersion == 3)
+        || (type == RecoveryCheckpoint.self && schema.schemaVersion == 1)
+      else { throw DreamRunError.unsupportedSchema }
       let value = try decoder.decode(type, from: bytes)
       let encoded = try encode(value)
       if bytes == encoded { return value }
@@ -874,6 +877,24 @@ extension DreamRunEncoding {
     let notes: [Note]
     let tails: [Tail]
     let isBacklog: Bool
+    var recoveryCheckpointHash: String? = nil
+  }
+
+  struct RecoveryCheckpoint: Codable, Equatable, Sendable {
+    let schemaVersion: Int
+    let policyVersion: Int
+    let sourceBinding: String
+    let repositoryVolume: String
+    let repositoryInode: UInt64
+    let runID: String
+    let admissionHash: String
+    let predecessorHash: String
+    let frozenProofHash: String
+    let decisionsHash: String
+    let candidateIDs: [String]
+    let planHashes: [String]
+    let confirmedMain: String
+    let snapshotHash: String
   }
 
   private struct ContextPayload: Decodable {

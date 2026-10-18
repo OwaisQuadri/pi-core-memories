@@ -9,9 +9,22 @@ package struct DreamArtifact: Codable, Sendable, Identifiable {
   package var id: String { runID + "/" + name }
 }
 
+package struct SavedDreamAttempt: Codable, Sendable, Identifiable {
+  package let number: Int
+  package let provider: String
+  package let modelID: String
+  package let thinkingLevel: String
+  package let status: String
+  package let diagnostic: String?
+  package var id: Int { number }
+}
+
 package struct SavedDreamRun: Codable, Sendable, Identifiable {
   package let id: String
+  package let generation: UInt64?
   package let isCompleted: Bool
+  package let attempts: [SavedDreamAttempt]
+  package let diagnostic: String?
   package let artifacts: [DreamArtifact]
 }
 
@@ -32,7 +45,10 @@ package struct DreamInspection: Codable, Sendable {
       throw DreamRunError.missingPayload
     }
     let lock = try root.openReadLock()
-    defer { _ = flock(lock, LOCK_UN); _ = close(lock) }
+    defer {
+      _ = flock(lock, LOCK_UN)
+      _ = close(lock)
+    }
     guard flock(lock, LOCK_SH | LOCK_NB) == 0 else {
       return Self(isPresent: true, isBusy: true, runs: [])
     }
@@ -51,15 +67,107 @@ package struct DreamInspection: Codable, Sendable {
         if name == "receipts" {
           let receipts = try run.child(name)
           for receipt in try receipts.names() {
-            try appendArtifact(receipts, name: receipt, relative: "receipts/" + receipt, runID: id, to: &artifacts)
+            try appendArtifact(
+              receipts, name: receipt, relative: "receipts/" + receipt, runID: id, to: &artifacts)
           }
         } else if !name.hasPrefix(".") {
           try appendArtifact(run, name: name, relative: name, runID: id, to: &artifacts)
         }
       }
-      return SavedDreamRun(id: id, isCompleted: artifacts.contains { $0.name == "completion.json" }, artifacts: artifacts)
+      do {
+        return try inspectRun(
+          root: root, directory: run, id: id,
+          bindingHash: SourceDigest(bytes: bytes), artifacts: artifacts)
+      } catch {
+        return SavedDreamRun(
+          id: id, generation: nil,
+          isCompleted: artifacts.contains { $0.name == "completion.json" }, attempts: [],
+          diagnostic: String(describing: error), artifacts: artifacts)
+      }
     }
-    return Self(isPresent: true, isBusy: false, runs: runs)
+    return Self(
+      isPresent: true, isBusy: false,
+      runs: runs.sorted {
+        if $0.generation != $1.generation { return ($0.generation ?? 0) > ($1.generation ?? 0) }
+        return $0.id < $1.id
+      })
+  }
+
+  private static func inspectRun(
+    root: DreamStateDirectory, directory: DreamStateDirectory, id: String,
+    bindingHash: SourceDigest, artifacts: [DreamArtifact]
+  ) throws -> SavedDreamRun {
+    let limits = try DreamRunLimits()
+    let input = try directory.read("input.json", maximum: limits.maximumFrozenBytes)
+    let run = try DreamRunEncoding.frozen(
+      bytes: input, runID: id,
+      inputHash: SourceDigest(bytes: input), bindingHash: bindingHash, limits: limits)
+    let context = try DreamRunEncoding.context(
+      bytes: directory.read("context.json", maximum: limits.maximumFrozenBytes), run: run)
+    let requestBytes = try directory.read("request.json", maximum: limits.maximumFrozenBytes)
+    let request = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: requestBytes)
+      .domain(run: run, context: context, bytes: requestBytes)
+    let admissionBytes = try root.child("admissions").read(
+      "\(run.progress.generation).json", maximum: DreamRunEncoding.maximumMetadataBytes)
+    let admission = try DreamRunEncoding.decode(
+      DreamRunEncoding.Admission.self, bytes: admissionBytes)
+    guard admission.runID == id, admission.inputHash == run.inputHash.rawValue,
+      admission.contextHash == context.contextHash.rawValue,
+      admission.requestHash == request.requestHash.rawValue,
+      admission.bindingHash == bindingHash.rawValue,
+      admission.generation == run.progress.generation, admission.base == run.approvedBase,
+      try admission.selection.domain() == run.selection
+    else { throw DreamRunError.corruption }
+    let admissionHash = SourceDigest(bytes: admissionBytes)
+    var attempts: [SavedDreamAttempt] = []
+    for number in 0...32 {
+      let prefix = number == 0 ? "" : "replacement-\(number)-"
+      let callName = prefix + "call-started.json"
+      guard try directory.isPresent(callName) else { continue }
+      let intent = try DreamRunEncoding.decode(
+        DreamRunEncoding.Intent.self,
+        bytes: directory.read(callName, maximum: limits.maximumFrozenBytes))
+      guard intent.admissionHash == admissionHash.rawValue,
+        intent.requestHash == request.requestHash.rawValue
+      else { throw DreamRunError.corruption }
+      let selection = try intent.selection?.domain() ?? run.selection
+      let responseName = prefix + "response.json"
+      var status = "No saved reply"
+      var diagnostic: String?
+      if try directory.isPresent(responseName) {
+        let bytes = try directory.read(
+          responseName,
+          maximum: limits.maximumResponseBytes * 6 + DreamRunEncoding.maximumMetadataBytes)
+        let response = try DreamRunEncoding.decode(
+          DreamRunEncoding.BoundResponse.self, bytes: bytes
+        )
+        .domain(
+          run: run, context: context, request: request, admissionHash: admissionHash,
+          selection: selection, bytes: bytes, maximumResponseBytes: limits.maximumResponseBytes)
+        do {
+          _ = try DreamDecision.validate(response: response, context: context)
+          status = "Reply valid"
+        } catch let error as DreamDecisionError {
+          status = "Rejected reply"
+          switch error {
+          case .decision(let index, let category):
+            diagnostic = "Decision index \(index): \(category)"
+          case .context(let message): diagnostic = message
+          case .schema: diagnostic = "Reply has invalid decision syntax"
+          case .limitExceeded: diagnostic = "Reply exceeds a frozen validation limit"
+          }
+        }
+      }
+      attempts.append(
+        SavedDreamAttempt(
+          number: number, provider: selection.provider,
+          modelID: selection.modelID, thinkingLevel: selection.thinkingLevel,
+          status: status, diagnostic: diagnostic))
+    }
+    return SavedDreamRun(
+      id: id, generation: run.progress.generation,
+      isCompleted: artifacts.contains { $0.name == "completion.json" }, attempts: attempts,
+      diagnostic: nil, artifacts: artifacts)
   }
 
   package static func artifactBytes(_ artifact: DreamArtifact, stateRoot: URL) throws -> Data {
@@ -71,7 +179,8 @@ package struct DreamInspection: Codable, Sendable {
     let components = artifact.name.split(separator: "/").map(String.init)
     if components.count == 2 { directory = try directory.child("receipts") }
     let bytes = try directory.read(components.last!, maximum: 33_554_432)
-    guard bytes.count == artifact.byteCount, SourceDigest(bytes: bytes).rawValue == artifact.digest else {
+    guard bytes.count == artifact.byteCount, SourceDigest(bytes: bytes).rawValue == artifact.digest
+    else {
       throw MemoryError("saved artifact changed; refresh inspection")
     }
     return bytes
@@ -91,9 +200,10 @@ package struct DreamInspection: Codable, Sendable {
     guard isArtifactName(relative) else { throw DreamRunError.corruption }
     let bytes = try directory.read(name, maximum: 33_554_432)
     _ = try JSONSerialization.jsonObject(with: bytes)
-    artifacts.append(DreamArtifact(
-      runID: runID, name: relative, byteCount: bytes.count,
-      digest: SourceDigest(bytes: bytes).rawValue))
+    artifacts.append(
+      DreamArtifact(
+        runID: runID, name: relative, byteCount: bytes.count,
+        digest: SourceDigest(bytes: bytes).rawValue))
   }
 
   private static func isArtifactName(_ name: String) -> Bool {
@@ -101,12 +211,16 @@ package struct DreamInspection: Codable, Sendable {
     guard components.count == 1 || (components.count == 2 && components[0] == "receipts"),
       let last = components.last, last.hasSuffix(".json"), last.utf8.count <= 128
     else { return false }
-    return last.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 46 }
+    return last.utf8.allSatisfy {
+      (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 46
+    }
   }
 }
 
 package func canonicalExistingFile(_ url: URL) throws -> URL {
-  guard url.isFileURL, let resolved = realpath(url.path, nil) else { throw DreamRunError.unsafeState }
+  guard url.isFileURL, let resolved = realpath(url.path, nil) else {
+    throw DreamRunError.unsafeState
+  }
   defer { free(resolved) }
   guard url.path == String(cString: resolved) else { throw DreamRunError.unsafeState }
   var status = stat()

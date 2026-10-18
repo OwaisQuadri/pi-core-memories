@@ -700,6 +700,22 @@ extension DreamRunEncoding {
     let requestHash: String
     let selection: Selection
     let text: String
+
+    func domain(
+      run: FrozenDreamRun, context: DreamDecisionContext, request: DreamModelRequest,
+      admissionHash: SourceDigest, selection: DreamSelectedCall, bytes: Data,
+      maximumResponseBytes: Int
+    ) throws -> DurableDreamResponse {
+      guard self.admissionHash == admissionHash.rawValue,
+        runID == run.runID, generation == run.progress.generation,
+        inputHash == run.inputHash.rawValue, contextHash == context.contextHash.rawValue,
+        requestHash == request.requestHash.rawValue, try self.selection.domain() == selection,
+        text.utf8.count <= maximumResponseBytes
+      else { throw DreamRunError.corruption }
+      return DurableDreamResponse(
+        run: run, response: try DreamCompletedResponse(text: text),
+        responseHash: SourceDigest(bytes: bytes), isReplay: true, isBaseCurrent: false)
+    }
   }
 
   struct ScopeValue: Codable {
@@ -729,9 +745,13 @@ extension DreamRunEncoding {
     func domain() throws -> DreamMemoryScope {
       if let deviceKey {
         let scope: DreamMemoryScope
-        if kind == "device", key == nil { scope = .device(deviceKey) }
-        else if kind == "deviceProject", let key { scope = .deviceProject(device: deviceKey, project: key) }
-        else { throw DreamRunError.corruption }
+        if kind == "device", key == nil {
+          scope = .device(deviceKey)
+        } else if kind == "deviceProject", let key {
+          scope = .deviceProject(device: deviceKey, project: key)
+        } else {
+          throw DreamRunError.corruption
+        }
         guard MemoryDocument.isAllowedPath(scope.path) else { throw DreamRunError.corruption }
         return scope
       }

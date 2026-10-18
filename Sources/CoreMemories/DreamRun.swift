@@ -440,23 +440,28 @@ public final class DreamRunStore {
     var observedInputBytes = 0
     let result = try runLocked(
       selection: selection, resume: resume, isLockCreated: ownership.isCreated,
-      prepare: prepare, call: { request in
+      prepare: prepare,
+      call: { request in
         let started = ContinuousClock.now
         let response = try call(request)
         let elapsed = started.duration(to: .now).components
         measuredSeconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
         return response
-      }, observe: { progress, batch, isRepeated in
+      },
+      observe: { progress, batch, isRepeated in
         observedRecordCount = batch.exactSourceRecords.count
         observedInputBytes = batch.keptBytes
         var estimate: Double?
         if (try? self.root.isPresent("timing.json")) == true,
-          let timingBytes = try? self.root.read("timing.json", maximum: DreamRunEncoding.maximumMetadataBytes),
-          let timing = try? DreamRunEncoding.decode(DreamTiming.self, bytes: timingBytes) {
+          let timingBytes = try? self.root.read(
+            "timing.json", maximum: DreamRunEncoding.maximumMetadataBytes),
+          let timing = try? DreamRunEncoding.decode(DreamTiming.self, bytes: timingBytes)
+        {
           if timing.provider == selection.provider, timing.modelID == selection.modelID,
             timing.thinkingLevel == selection.thinkingLevel,
             timing.records == observedRecordCount, timing.inputBytes == observedInputBytes,
-            timing.seconds.isFinite, timing.seconds > 0 {
+            timing.seconds.isFinite, timing.seconds > 0
+          {
             estimate = timing.seconds
           }
         }
@@ -464,9 +469,11 @@ public final class DreamRunStore {
       })
     if case .completed = result, let measuredSeconds, measuredSeconds > 0 {
       try? persist(
-        bounded(DreamTiming(provider: selection.provider, modelID: selection.modelID,
-          thinkingLevel: selection.thinkingLevel, records: observedRecordCount,
-          inputBytes: observedInputBytes, seconds: measuredSeconds)),
+        bounded(
+          DreamTiming(
+            provider: selection.provider, modelID: selection.modelID,
+            thinkingLevel: selection.thinkingLevel, records: observedRecordCount,
+            inputBytes: observedInputBytes, seconds: measuredSeconds)),
         name: "timing.json", directory: root, isReplacing: true)
     }
     guard flock(lock, LOCK_UN) == 0 else { throw DreamRunError.persistenceFailure }
@@ -1232,20 +1239,12 @@ public final class DreamRunStore {
       let bytes = try sealed.directory.read(
         attempt.responseName, maximum: maximumResponseEnvelopeBytes)
       let response = try DreamRunEncoding.decode(DreamRunEncoding.BoundResponse.self, bytes: bytes)
-      guard response.admissionHash == sealed.admissionHash.rawValue,
-        response.runID == run.runID, response.generation == run.progress.generation,
-        response.inputHash == run.inputHash.rawValue,
-        response.contextHash == sealed.context.contextHash.rawValue,
-        response.requestHash == sealed.request.requestHash.rawValue,
-        try response.selection.domain() == callSelection,
-        response.text.utf8.count <= limits.maximumResponseBytes
-      else { throw DreamRunError.corruption }
-      responseHash = SourceDigest(bytes: bytes)
-      validated = try DreamDecision.validate(
-        response: DurableDreamResponse(
-          run: run, response: DreamCompletedResponse(text: response.text),
-          responseHash: responseHash!, isReplay: true, isBaseCurrent: false),
-        context: sealed.context)
+      let durable = try response.domain(
+        run: run, context: sealed.context, request: sealed.request,
+        admissionHash: sealed.admissionHash, selection: callSelection, bytes: bytes,
+        maximumResponseBytes: limits.maximumResponseBytes)
+      responseHash = durable.responseHash
+      validated = try DreamDecision.validate(response: durable, context: sealed.context)
     }
     let plans = validated?.plans ?? []
     let notes = validated?.notes ?? []

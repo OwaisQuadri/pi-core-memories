@@ -8,18 +8,21 @@ package final class MemoryBatchSession {
   let checkout: ReviewCheckoutWitness
   let date: Date
   let catalogLimit: Int
-  let catalogOffset: Int
-  let entryCount: Int
-  let candidateCount: Int
+  private(set) var catalogOffset: Int
+  private(set) var entryCount: Int
+  private(set) var candidateCount: Int
   let review: MemoryReviewController?
-  let preparedCandidates: [String: PreparedMemoryBatchCandidate]
+  private(set) var preparedCandidates: [String: PreparedMemoryBatchCandidate]
+  private var catalogCandidateIDs: Set<String>
   private(set) var draft: MemoryDraft
   private var selectedItemID: UUID?
-  private var undoItems: [(items: [MemoryBatchItem], bytes: Int)] = []
+  private var undoItems:
+    [(items: [MemoryBatchItem], candidates: [String: PreparedMemoryBatchCandidate], bytes: Int)] =
+      []
   private var undoBytes = 0
   private var presentations: [UUID: MemoryBatchPresentation] = [:]
   private var authority: [UUID: String] = [:]
-  let entries: [ManagedMemoryEntry]
+  private(set) var entries: [ManagedMemoryEntry]
 
   package init(
     repository: URL, drafts: MemoryDraftStore, review: MemoryReviewController? = nil,
@@ -57,15 +60,20 @@ package final class MemoryBatchSession {
         }
       }
     }
-    let paths = allowedPaths ?? snapshot.documents.map(\.path)
-    guard paths.count <= 256, paths.allSatisfy(MemoryDocument.isAllowedPath) else {
+    let preparedPaths = original.batch?.binding.preparedPaths
+    let scopePaths = allowedPaths ?? snapshot.documents.map(\.path)
+    let paths = Array(Set(scopePaths + (preparedPaths ?? []))).sorted()
+    guard scopePaths.count <= 256, paths.count <= 256,
+      paths.allSatisfy(MemoryDocument.isAllowedPath),
+      preparedPaths == nil || preparedPaths == Array(Set(preparedPaths!)).sorted()
+    else {
       throw MemoryError("invalid prepared memory scope")
     }
     let binding = MemoryBatchBinding(
       configurationPath: configurationURL?.path,
       configurationDigest: try configuration.map { try memoryBatchDigest($0) },
-      allowedPaths: Array(Set(paths)).sorted(),
-      reviewBinding: try review.map { try memoryBatchDigest($0.binding) })
+      allowedPaths: paths, reviewBinding: try review.map { try memoryBatchDigest($0.binding) },
+      preparedPaths: preparedPaths)
     if let previous = original.batch {
       guard try memoryBatchDigest(previous.binding) == memoryBatchDigest(binding) else {
         throw MemoryError("draft configuration changed; preserve and reconcile the draft")
@@ -81,7 +89,9 @@ package final class MemoryBatchSession {
               request: request, identity: memoryBatchIdentity("\(original.draftID):\(index)"),
               date: original.created)))
       }
-    guard original.revision < UInt64.max else { throw DreamRunError.limitExceeded }
+    guard items.count <= 256, original.revision < UInt64.max else {
+      throw DreamRunError.limitExceeded
+    }
     self.draft = MemoryDraft(
       schemaVersion: 2, draftID: original.draftID,
       revision: original.revision + (original.batch == nil ? 1 : 0),
@@ -91,17 +101,11 @@ package final class MemoryBatchSession {
     self.review = review
     let catalog = try review?.preparedBatchCandidates(
       snapshot: snapshot, date: date, limit: catalogLimit, offset: catalogOffset,
-      paths: binding.allowedPaths)
+      paths: binding.allowedPaths, retaining: Self.candidateIntents(items))
     let prepared = catalog?.rows ?? []
     self.candidateCount = catalog?.count ?? 0
-    guard
-      prepared.reduce(
-        0,
-        {
-          $0 + $1.candidate.change.after.count + ($1.effect?.before.count ?? 0)
-            + ($1.effect?.after.count ?? 0)
-        }) <= 16 * 1024 * 1024
-    else {
+    self.catalogCandidateIDs = catalog?.catalogIDs ?? []
+    guard Self.preparedBytes(prepared) <= 16 * 1024 * 1024 else {
       throw DreamRunError.limitExceeded
     }
     self.preparedCandidates = Dictionary(
@@ -114,25 +118,20 @@ package final class MemoryBatchSession {
     self.date = date
     self.catalogLimit = catalogLimit
     self.catalogOffset = catalogOffset
-    let scopedEntries = snapshot.reviewEntries().filter {
-      binding.allowedPaths.contains($0.path) && MemoryDocument.isMemoryContent($0.entry.bytes)
-    }
-    self.entryCount = scopedEntries.count
-    self.entries = scopedEntries.dropFirst(catalogOffset).prefix(catalogLimit).map { row in
-      ManagedMemoryEntry(
-        path: row.path, locator: row.entry.locator,
-        expected: String(decoding: row.entry.bytes, as: UTF8.self), identity: row.entry.identity,
-        reviewed: row.entry.lastReview?.rawValue, revised: row.entry.lastRevision?.rawValue,
-        isMutable: row.entry.isMutable, limitation: row.entry.limitation)
-    }
+    let entryCatalog = Self.entryCatalog(
+      snapshot: snapshot, paths: binding.allowedPaths, offset: catalogOffset, limit: catalogLimit)
+    self.entryCount = entryCatalog.count
+    self.entries = entryCatalog.rows
   }
 
   package var projection: MemoryBatchProjection {
     MemoryBatchProjection(
       draft: draft, entries: entries,
-      candidates: preparedCandidates.values.map(\.candidate).sorted {
-        $0.change.id.rawValue < $1.change.id.rawValue
-      },
+      candidates: preparedCandidates.filter { catalogCandidateIDs.contains($0.key) }
+        .values.map(\.candidate).sorted { $0.change.id.rawValue < $1.change.id.rawValue },
+      retainedEntries: retainedEntries,
+      retainedCandidates: preparedCandidates.filter { !catalogCandidateIDs.contains($0.key) }
+        .values.map(\.candidate).sorted { $0.change.id.rawValue < $1.change.id.rawValue },
       selectedItemID: selectedItemID, catalogOffset: catalogOffset,
       entryCount: entryCount, candidateCount: candidateCount,
       needsReview: Set(items.filter { $0.isReviewRequired && !isAuthorized($0) }.map(\.itemID)))
@@ -142,6 +141,121 @@ package final class MemoryBatchSession {
 
   var items: [MemoryBatchItem] { draft.batch!.items }
 
+  private var retainedEntries: [ManagedMemoryEntry] {
+    items.compactMap { item in
+      guard case .confirmReviewed(let intent) = item.intent,
+        !entries.contains(where: {
+          $0.path == intent.entry.path && $0.locator == intent.entry.locator
+        })
+      else { return nil }
+      return intent.entry
+    }
+  }
+
+  @discardableResult
+  package func prepareCatalog(offset: Int) throws -> MemoryBatchProjection {
+    try prepareCatalog(offset: offset, draft: draft)
+  }
+
+  @discardableResult
+  package func preparePath(_ path: String) throws -> MemoryBatchProjection {
+    guard MemoryDocument.isAllowedPath(path) else { throw MemoryError("invalid memory path") }
+    let binding = draft.batch!.binding
+    if binding.allowedPaths.contains(path) {
+      return try prepareCatalog(offset: catalogOffset)
+    }
+    guard binding.allowedPaths.count < 256, draft.revision < UInt64.max else {
+      throw DreamRunError.limitExceeded
+    }
+    let extended = MemoryBatchBinding(
+      configurationPath: binding.configurationPath,
+      configurationDigest: binding.configurationDigest,
+      allowedPaths: (binding.allowedPaths + [path]).sorted(), reviewBinding: binding.reviewBinding,
+      preparedPaths: ((binding.preparedPaths ?? []) + [path]).sorted())
+    let next = MemoryDraft(
+      schemaVersion: 2, draftID: draft.draftID, revision: draft.revision + 1,
+      repositoryBinding: draft.repositoryBinding, baseCommit: draft.baseCommit,
+      created: draft.created, operations: [],
+      batch: MemoryBatchContents(binding: extended, items: items))
+    _ = try MemoryReviewEncoding.encode(next)
+    return try prepareCatalog(offset: catalogOffset, draft: next)
+  }
+
+  private func prepareCatalog(offset: Int, draft next: MemoryDraft) throws -> MemoryBatchProjection
+  {
+    guard (0...10_000).contains(offset) else { throw DreamRunError.limitExceeded }
+    let store = try MemoryStore(repo: repository, environment: ProcessInfo.processInfo.environment)
+    try verifyCatalogContext(store)
+    let catalog = try review?.preparedBatchCandidates(
+      snapshot: snapshot, date: date, limit: catalogLimit, offset: offset,
+      paths: next.batch!.binding.allowedPaths, retaining: Self.candidateIntents(items))
+    let prepared = catalog?.rows ?? []
+    guard Self.preparedBytes(prepared) <= 16 * 1024 * 1024 else {
+      throw DreamRunError.limitExceeded
+    }
+    let entryCatalog = Self.entryCatalog(
+      snapshot: snapshot, paths: next.batch!.binding.allowedPaths, offset: offset,
+      limit: catalogLimit)
+    try verifyCatalogContext(store)
+    draft = next
+    preparedCandidates = Dictionary(
+      uniqueKeysWithValues: prepared.map { ($0.intent.candidateID, $0) })
+    catalogCandidateIDs = catalog?.catalogIDs ?? []
+    candidateCount = catalog?.count ?? 0
+    entryCount = entryCatalog.count
+    entries = entryCatalog.rows
+    catalogOffset = offset
+    presentations = presentations.filter { id, _ in items.contains { $0.itemID == id } }
+    return projection
+  }
+
+  private func verifyCatalogContext(_ store: MemoryStore) throws {
+    let binding = draft.batch!.binding
+    if let path = binding.configurationPath {
+      let configuration = try MemoryConfiguration.load(from: URL(fileURLWithPath: path))
+      guard try memoryBatchDigest(configuration) == binding.configurationDigest else {
+        throw MemoryError("selected configuration changed on disk; preserve the batch")
+      }
+    }
+    guard try store.approvedCommit() == snapshot.base,
+      try store.reviewGit.reviewCheckout().witness() == checkout,
+      try review.map({ try memoryBatchDigest($0.binding) }) == binding.reviewBinding
+    else { throw MemoryError("prepared context changed; preserve and reconcile the batch") }
+  }
+
+  private static func candidateIntents(_ items: [MemoryBatchItem]) -> [MemoryBatchCandidateIntent] {
+    items.compactMap {
+      if case .candidate(let intent) = $0.intent { return intent }
+      return nil
+    }
+  }
+
+  private static func preparedBytes(
+    _ candidates: some Sequence<PreparedMemoryBatchCandidate>
+  ) -> Int {
+    candidates.reduce(0) {
+      $0 + $1.candidate.change.after.count + ($1.effect?.before.count ?? 0)
+        + ($1.effect?.after.count ?? 0)
+    }
+  }
+
+  private static func entryCatalog(
+    snapshot: ApprovedDecisionSnapshot, paths: [String], offset: Int, limit: Int
+  ) -> (rows: [ManagedMemoryEntry], count: Int) {
+    let scoped = snapshot.reviewEntries().filter {
+      paths.contains($0.path) && MemoryDocument.isMemoryContent($0.entry.bytes)
+    }
+    return (
+      scoped.dropFirst(offset).prefix(limit).map { row in
+        ManagedMemoryEntry(
+          path: row.path, locator: row.entry.locator,
+          expected: String(decoding: row.entry.bytes, as: UTF8.self), identity: row.entry.identity,
+          reviewed: row.entry.lastReview?.rawValue, revised: row.entry.lastRevision?.rawValue,
+          isMutable: row.entry.isMutable, limitation: row.entry.limitation)
+      }, scoped.count
+    )
+  }
+
   package func presentAcceptance(
     candidateID: SourceDigest, amendment: MemoryBatchAmendment? = nil
   ) throws -> MemoryBatchPresentation {
@@ -149,10 +263,11 @@ package final class MemoryBatchSession {
     else {
       throw MemoryError("candidate is outside the selectable prepared catalog")
     }
+    let staged = Self.candidateIntents(items).first { $0.candidateID == candidateID.rawValue }
     let intent = MemoryBatchCandidateIntent(
       candidateID: prepared.intent.candidateID, admissionHash: prepared.intent.admissionHash,
       choice: .accept, identity: prepared.intent.identity, instant: prepared.intent.instant,
-      amendment: amendment)
+      amendment: amendment ?? staged?.amendment)
     let after = try MemoryReviewController.amendedBatchBytes(
       intent, proposal: effect.originalReviewedProposal!, before: effect.before)
     return try present(
@@ -209,14 +324,25 @@ package final class MemoryBatchSession {
   package func presentConfirmReviewed(_ entry: ManagedMemoryEntry) throws -> MemoryBatchPresentation
   {
     guard
-      entries.contains(where: {
+      (entries + retainedEntries).contains(where: {
         $0.path == entry.path && $0.locator == entry.locator && $0.expected == entry.expected
-      }), entry.isMutable
+      }), entry.isMutable,
+      snapshot.reviewEntries().contains(where: {
+        $0.path == entry.path && $0.entry.locator == entry.locator
+          && $0.entry.bytes == Data(entry.expected.utf8) && $0.entry.isMutable
+          && $0.entry.identity == entry.identity
+      })
     else { throw MemoryError("entry is outside the prepared catalog") }
     let id = memoryBatchIdentity("review:\(snapshot.base):\(entry.path):\(entry.locator.start)")
-    let intent = MemoryBatchReviewIntent(
-      entry: entry, identity: entry.identity ?? memoryBatchIdentity("review-entry:\(id)"),
-      instant: try MemoryDocument.ReviewInstant(ISO8601DateFormatter().string(from: date)))
+    let staged = items.first { $0.itemID == id }
+    let intent: MemoryBatchReviewIntent
+    if case .confirmReviewed(let existing) = staged?.intent {
+      intent = existing
+    } else {
+      intent = MemoryBatchReviewIntent(
+        entry: entry, identity: entry.identity ?? memoryBatchIdentity("review-entry:\(id)"),
+        instant: try MemoryDocument.ReviewInstant(ISO8601DateFormatter().string(from: date)))
+    }
     let after = try MemoryDocument.reviewedBytes(
       Data(entry.expected.utf8), identity: intent.identity, instant: intent.instant)
     return try present(
@@ -242,9 +368,16 @@ package final class MemoryBatchSession {
   }
 
   package func undo() throws {
-    guard let previous = undoItems.popLast() else { return }
-    undoBytes -= previous.bytes
+    guard let previous = undoItems.last else { return }
+    let prepared = preparedCandidates.filter { catalogCandidateIDs.contains($0.key) }
+      .merging(previous.candidates) { _, retained in retained }
+    guard Self.preparedBytes(prepared.values) <= 16 * 1024 * 1024 else {
+      throw DreamRunError.limitExceeded
+    }
     try update(previous.items, isRecordingUndo: false)
+    preparedCandidates = prepared
+    undoItems.removeLast()
+    undoBytes -= previous.bytes
     authority = authority.filter { id, digest in
       previous.items.contains { $0.itemID == id && (try? memoryBatchDigest($0)) == digest }
     }
@@ -294,13 +427,20 @@ package final class MemoryBatchSession {
       batch: MemoryBatchContents(binding: draft.batch!.binding, items: items))
     _ = try MemoryReviewEncoding.encode(next)
     if isRecordingUndo {
-      let bytes = try MemoryReviewEncoding.encode(self.items).count
+      let retainedIDs = Set(Self.candidateIntents(self.items).map(\.candidateID))
+      let retained = preparedCandidates.filter { retainedIDs.contains($0.key) }
+      let bytes =
+        try MemoryReviewEncoding.encode(self.items).count + Self.preparedBytes(retained.values)
+      guard bytes <= 16 * 1024 * 1024 else { throw DreamRunError.limitExceeded }
       while !undoItems.isEmpty, undoItems.count >= 32 || undoBytes + bytes > 16 * 1024 * 1024 {
         undoBytes -= undoItems.removeFirst().bytes
       }
-      undoItems.append((self.items, bytes))
+      undoItems.append((self.items, retained, bytes))
       undoBytes += bytes
     }
     draft = next
+    let retainedIDs = Set(Self.candidateIntents(items).map(\.candidateID))
+      .union(catalogCandidateIDs)
+    preparedCandidates = preparedCandidates.filter { retainedIDs.contains($0.key) }
   }
 }

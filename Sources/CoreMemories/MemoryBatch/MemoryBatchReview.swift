@@ -8,8 +8,9 @@ struct PreparedMemoryBatchCandidate {
 
 extension MemoryReviewController {
   func preparedBatchCandidates(
-    snapshot: ApprovedDecisionSnapshot, date: Date, limit: Int, offset: Int, paths: [String]
-  ) throws -> (rows: [PreparedMemoryBatchCandidate], count: Int) {
+    snapshot: ApprovedDecisionSnapshot, date: Date, limit: Int, offset: Int, paths: [String],
+    retaining: [MemoryBatchCandidateIntent] = []
+  ) throws -> (rows: [PreparedMemoryBatchCandidate], catalogIDs: Set<String>, count: Int) {
     try locked {
       try refresh()
       guard try store.approvedCommit() == snapshot.base else {
@@ -24,13 +25,25 @@ extension MemoryReviewController {
         let rightOrder = right.1 == .approved || right.1 == .rejected ? 1 : 0
         return leftOrder == rightOrder ? left.0 < right.0 : leftOrder < rightOrder
       }
-      let rows = try selectable.dropFirst(offset).prefix(limit).map { id, _ in
+      for intent in retaining {
+        guard let (change, admission, _) = candidates[intent.candidateID],
+          paths.contains(change.path), intent.admissionHash == (try memoryBatchDigest(admission)),
+          intent.identity == (try change.entryID ?? Self.assignedIdentity(intent.candidateID)),
+          try selection(intent.candidateID) != .approved,
+          try selection(intent.candidateID) != .rejected
+        else { throw MemoryError("staged candidate context changed") }
+      }
+      let catalog = selectable.dropFirst(offset).prefix(limit).map(\.0)
+      let catalogIDs = Set(catalog)
+      let retainedIDs = Set(retaining.map(\.candidateID)).subtracting(catalogIDs).sorted()
+      let rows = try (catalog + retainedIDs).map { id in
         let (change, admission, limitations) = candidates[id]!
         let disposition = try selection(id)
+        let retained = retaining.first { $0.candidateID == id }
         let intent = MemoryBatchCandidateIntent(
           candidateID: id, admissionHash: try memoryBatchDigest(admission), choice: .accept,
-          identity: try change.entryID ?? Self.assignedIdentity(id), instant: instant,
-          amendment: nil)
+          identity: try change.entryID ?? Self.assignedIdentity(id),
+          instant: retained?.instant ?? instant, amendment: nil)
         if disposition == .approved || disposition == .rejected {
           return PreparedMemoryBatchCandidate(
             candidate: MemoryReviewCandidate(
@@ -57,7 +70,7 @@ extension MemoryReviewController {
             intent: intent, effect: nil)
         }
       }
-      return (rows, selectable.count)
+      return (rows, catalogIDs, selectable.count)
     }
   }
 

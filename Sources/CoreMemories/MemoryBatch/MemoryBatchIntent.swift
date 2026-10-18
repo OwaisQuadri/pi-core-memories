@@ -52,6 +52,18 @@ package struct MemoryBatchBinding: Codable, Sendable {
   package let configurationDigest: String?
   package let allowedPaths: [String]
   package let reviewBinding: String?
+  package let preparedPaths: [String]?
+
+  package init(
+    configurationPath: String?, configurationDigest: String?, allowedPaths: [String],
+    reviewBinding: String?, preparedPaths: [String]? = nil
+  ) {
+    self.configurationPath = configurationPath
+    self.configurationDigest = configurationDigest
+    self.allowedPaths = allowedPaths
+    self.reviewBinding = reviewBinding
+    self.preparedPaths = preparedPaths
+  }
 }
 
 package struct MemoryBatchContents: Codable, Sendable {
@@ -73,6 +85,8 @@ package struct MemoryBatchProjection: Sendable {
   package let draft: MemoryDraft
   package let entries: [ManagedMemoryEntry]
   package let candidates: [MemoryReviewCandidate]
+  package let retainedEntries: [ManagedMemoryEntry]
+  package let retainedCandidates: [MemoryReviewCandidate]
   package let selectedItemID: UUID?
   package let catalogOffset: Int
   package let entryCount: Int

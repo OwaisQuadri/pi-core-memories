@@ -383,7 +383,7 @@ import Foundation
 
   func saveSettings(isSettingUpDevice: Bool = false) async {
     do {
-      guard isLoaded, !isBusy, !isDreamRunning, !isDraftDirty, stagedItems.isEmpty,
+      guard isLoaded, !isBusy, !isDreamRunning, !isInputDirty, stagedItems.isEmpty,
         !isSaveUnresolved
       else {
         throw WorkspaceError("Save or discard local edits before changing configuration")
@@ -394,6 +394,7 @@ import Foundation
       var value = configuration
       if isSettingUpDevice { value.setupDevice() }
       await pauseQueue()
+      try await flushInputAndPersistence()
       try await workspace.configure(value)
       workspaceGeneration &+= 1
       configuration = value

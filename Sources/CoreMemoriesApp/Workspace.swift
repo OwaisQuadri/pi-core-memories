@@ -25,13 +25,21 @@ func configurationIdentity(_ configuration: MemoryConfiguration) throws -> Data 
 
 actor Workspace {
   let configURL: URL
-  private var configuration: MemoryConfiguration = .defaults
-  private var draftStore: MemoryDraftStore?
-  private var currentDraft: MemoryDraft?
-  private var review: MemoryReviewController?
+  var configuration: MemoryConfiguration = .defaults
+  var draftStore: MemoryDraftStore?
+  var currentDraft: MemoryDraft?
+  var review: MemoryReviewController?
+  var session: MemoryBatchSession?
+  var durableRevision: UInt64?
+  var pendingPersistence: NativePendingPersistence?
+  var unresolvedSave: MemoryDraft?
+  let persistence: NativeBatchPersistence
   private var recovery: (DreamRunStore, SavedDreamRecoveryPreview, Data, String)?
 
-  init(configURL: URL) { self.configURL = configURL }
+  init(configURL: URL, persistence: NativeBatchPersistence = NativeBatchPersistence()) {
+    self.configURL = configURL
+    self.persistence = persistence
+  }
 
   func load() throws -> WorkspaceSnapshot {
     configuration = try MemoryConfiguration.load(from: configURL)
@@ -54,7 +62,7 @@ actor Workspace {
     if FileManager.default.fileExists(atPath: configuration.journal) {
       do {
         let store = try editorStore()
-        drafts = try store.list()
+        drafts = try store.list(review: availableReviewController())
         if currentDraft == nil { currentDraft = drafts.last }
       } catch { failures.append(String(describing: error)) }
     }
@@ -73,57 +81,25 @@ actor Workspace {
   }
 
   func configure(_ value: MemoryConfiguration) throws {
-    guard currentDraft == nil else {
+    guard pendingPersistence == nil, unresolvedSave == nil,
+      session?.projection.draft.batch?.items.isEmpty != false,
+      currentDraft?.batch?.items.isEmpty != false,
+      currentDraft?.operations.isEmpty != false
+    else {
       throw WorkspaceError("Save or discard the active draft before changing configuration")
     }
+    if let draft = session?.projection.draft ?? currentDraft {
+      try editorStore().discard(
+        draftID: draft.draftID, expectedRevision: durableRevision ?? draft.revision)
+    }
+    session = nil
+    currentDraft = nil
+    durableRevision = nil
     try value.save(to: configURL)
     configuration = value
     draftStore = nil
     review = nil
     recovery = nil
-  }
-
-  func autosave(_ operations: [MemoryManagementRequest], base: String) throws -> MemoryDraft {
-    let store = try editorStore()
-    guard let draft = currentDraft else {
-      let created = try store.create(base: base, operations: operations)
-      currentDraft = created
-      return created
-    }
-    guard draft.baseCommit == base else {
-      throw WorkspaceError("active draft has a different base; reconcile or discard it first")
-    }
-    let updated = try store.update(
-      draftID: draft.draftID, expectedRevision: draft.revision, operations: operations)
-    currentDraft = updated
-    return updated
-  }
-
-  func restore(_ draft: MemoryDraft) throws {
-    guard let latest = try editorStore().list().first(where: { $0.draftID == draft.draftID }),
-      latest.revision == draft.revision
-    else {
-      throw WorkspaceError("draft changed; refresh recovery")
-    }
-    currentDraft = latest
-  }
-
-  func save() throws -> MemoryDraftReceipt {
-    guard let draft = currentDraft else { throw WorkspaceError("no active draft") }
-    let store = try editorStore()
-    let receipt = try store.save(
-      draftID: draft.draftID, expectedRevision: draft.revision,
-      idempotencyKey: "native-save-\(draft.revision)")
-    try store.discard(draftID: draft.draftID, expectedRevision: draft.revision)
-    currentDraft = nil
-    return receipt
-  }
-
-  func discard() throws {
-    if let draft = currentDraft {
-      try editorStore().discard(draftID: draft.draftID, expectedRevision: draft.revision)
-    }
-    currentDraft = nil
   }
 
   func checkoutPreview() throws -> MemoryReviewCheckoutPreview {
@@ -164,33 +140,11 @@ actor Workspace {
     let identity = try configurationIdentity(configuration)
     guard try configurationIdentity(profile) == identity,
       try configurationIdentity(MemoryConfiguration.load(from: configURL)) == identity,
-      try MemoryStore(repo: configuration.memoryURL).approvedCommit() == base else {
+      try MemoryStore(repo: configuration.memoryURL).approvedCommit() == base
+    else {
       throw WorkspaceError("Load the matching profile and refresh saved memories first")
     }
     return identity
-  }
-
-  func candidates() throws -> [MemoryReviewCandidate] { try reviewController().list() }
-
-  func preview(_ id: SourceDigest) throws -> MemoryReviewPreview {
-    try reviewController().preview(candidateID: id, clockDate: Date())
-  }
-
-  func approve(_ preview: MemoryReviewPreview) throws -> MemoryReviewApproval {
-    try reviewController().apply(preview)
-  }
-
-  func disposition(_ id: SourceDigest, isRejected: Bool) throws {
-    if isRejected {
-      try reviewController().reject(candidateID: id)
-    } else {
-      try reviewController().deferCandidate(candidateID: id)
-    }
-  }
-
-  func confirmReviewed(_ entry: ManagedMemoryEntry, base: String) throws {
-    _ = try MemoryManagement(repository: configuration.memoryURL).confirmReviewed(
-      base: base, entry: entry)
   }
 
   func artifact(_ artifact: DreamArtifact) throws -> String {
@@ -216,7 +170,7 @@ actor Workspace {
     return configuration.memoryURL.resolvingSymlinksInPath()
   }
 
-  private func editorStore() throws -> MemoryDraftStore {
+  func editorStore() throws -> MemoryDraftStore {
     if let draftStore { return draftStore }
     let store = try MemoryDraftStore(
       repository: configuration.memoryURL,
@@ -225,7 +179,7 @@ actor Workspace {
     return store
   }
 
-  private func reviewController() throws -> MemoryReviewController {
+  func reviewController() throws -> MemoryReviewController {
     if let review { return review }
     let sources = try configuration.reviewSources()
     let controller = try MemoryReviewController(

@@ -33,13 +33,14 @@ func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() a
   await model.load()
   #expect(model.savedRecoveryRunID == pending.runID)
   await model.loadCandidates()
-  model.add()
+  await model.add()
   model.editorText = "Keep this unsaved draft. [source: fixture; added: 2026-10-17]"
   model.editorReason = "Retain local edit"
   model.editorChanged()
   let encoder = JSONEncoder()
   encoder.outputFormatting = [.sortedKeys]
-  let operations = try encoder.encode(model.operations)
+  try await model.flushInputAndPersistence()
+  let items = try encoder.encode(model.stagedItems)
   let before = try fixture.protectedState()
   var isPresentationBusy = false
   let observation = model.$savedRecovery.sink { presentation in
@@ -52,7 +53,7 @@ func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() a
   let suggestion = try #require(model.savedRecovery?.suggestions.first)
   #expect(!MemoryDocument.reviewText(suggestion.change.after).contains("[source:"))
   #expect(String(decoding: suggestion.change.after, as: UTF8.self).contains("[source:"))
-  #expect(model.preview == nil)
+  #expect(model.presentation == nil)
   #expect(try fixture.protectedState() == before)
   await model.refresh()
   #expect(model.savedRecovery == nil)
@@ -73,15 +74,16 @@ func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() a
   await model.confirmSavedRecovery()
   #expect(model.failure == nil)
   #expect(model.savedRecovery == nil)
-  #expect(model.section == "Review")
+  #expect(model.section == "Memories")
   #expect(model.actionableCandidates.count == 1)
-  #expect(model.preview == nil)
-  #expect(try encoder.encode(model.operations) == operations)
+  #expect(model.presentation == nil)
+  #expect(try encoder.encode(model.stagedItems) == items)
   let after = try fixture.protectedState()
   let changedPaths = after.filter { before[$0.key] != $0.value }.keys.sorted()
   #expect(changedPaths == [])
-  await model.showPreview(try #require(model.actionableCandidates.first))
-  #expect(model.preview != nil)
+  await model.selectMemory(
+    .candidate(try #require(model.actionableCandidates.first).change.id.rawValue))
+  #expect(model.presentation != nil)
   #expect(try fixture.protectedState() == after)
   try await model.shutdown()
 }
@@ -100,11 +102,12 @@ func nativeSaveFeedbackDoesNotExposeCommitIdentifiers() async throws {
   await model.confirmSavedRecovery()
   await model.prepareCheckout()
   await model.detach()
-  await model.showPreview(try #require(model.actionableCandidates.first))
-  await model.approve()
+  await model.selectMemory(
+    .candidate(try #require(model.actionableCandidates.first).change.id.rawValue))
+  await model.stageShown()
   #expect(model.failure == nil)
-  #expect(model.message == "Saved into memory")
-  model.add()
+  #expect(model.message == "Acceptance staged")
+  await model.add()
   model.editorText = "Keep feedback clear. [source: fixture; added: 2026-10-18]"
   model.editorReason = "Keep this synthetic edit"
   model.editorChanged()

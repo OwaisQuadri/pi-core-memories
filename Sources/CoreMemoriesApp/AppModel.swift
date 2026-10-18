@@ -10,13 +10,23 @@ import Foundation
   @Published var catalog: MemoryManagementResult?
   @Published var drafts: [MemoryDraft] = []
   @Published var inspection: DreamInspection?
-  @Published var candidates: [MemoryReviewCandidate] = []
-  @Published var preview: MemoryReviewPreview?
+  @Published var batchProjection: MemoryBatchProjection?
+  @Published var presentation: MemoryBatchPresentation?
+  @Published var selection: NativeMemorySelection?
+  @Published var retainedDraft: MemoryDraft?
+  @Published var saveOutcome: MemoryBatchSaveResult?
+  @Published var editorTarget: NativeEditorTarget?
+  @Published var editorText = ""
+  @Published var editorReason = ""
+  @Published var editorPath = "MEMORY.md"
+  @Published var isShowingDiff = false
+  @Published var isShowingAllDevices = false
+  @Published var isInputDirty = false
+  @Published var inputRevision: UInt64 = 0
   @Published var savedRecovery: SavedRecoveryPresentation?
-  @Published var draft: MemoryDraft?
-  @Published var operations: [MemoryManagementRequest] = []
   @Published var message = ""
   @Published var failure: String?
+  @Published var draftFailure: String?
   @Published var isBusy = true
   @Published var isDreamRunning = false
   @Published var dreamPhase = "Idle"
@@ -25,59 +35,42 @@ import Foundation
   @Published var isQueueLoading = false
   @Published var isReviewLoading = false
   @Published var reviewFailure: String?
-  private var queueTask: Task<Void, Never>?
-  private var queueRevision: UInt64 = 0
   @Published var eventCoverage: DreamQueueCoverage?
   @Published var coverageObservedAt: Date?
   @Published var invocationStatus: DreamInvocationStatus?
-  @Published var isShowingReviewedCandidates = false
-  private var isReviewLoaded = false
-  private var reviewRevision: UInt64 = 0
-  private var terminalPhase: String?
-  private var isCancellingDream = false
   @Published var resolvedSelection = "Not resolved"
   @Published var dreamEvents: [String] = []
   @Published var artifactText = ""
   @Published var selectedArtifact: DreamArtifact?
-  @Published var editorText = ""
-  @Published var editorReason = ""
-  @Published var editorPath = "MEMORY.md"
-  @Published var isEditing = false
-  @Published var isShowingAllDevices = false
   @Published var checkout: MemoryReviewCheckoutPreview?
   @Published var isConfirmingReplacement = false
   @Published var isConfirmingRetry = false
   @Published var isConfirmingDiscard = false
-  private var editorTarget: ManagedMemoryEntry?
-  private var editorIndex: Int?
-  private var isLoadingEditor = false
-  private var isLoaded = false
-  private var autosaveTask: Task<Void, Never>?
+  var stagedInputRevision: UInt64 = 0
+  var persistedBatchRevision: UInt64?
+  var workspaceGeneration: UInt64 = 0
+  var autosaveTask: Task<Void, Never>?
+  var isWorkspaceLoaded = false
+  var isLoaded = false
   private var shutdownTask: Task<Void, Error>?
-  private var editRevision: UInt64 = 0
-  private var persistedEditRevision: UInt64 = 0
+  private var queueTask: Task<Void, Never>?
+  private var queueRevision: UInt64 = 0
+  private(set) var queueScanCount = 0
+  private var terminalPhase: String?
+  private var isCancellingDream = false
   private var dreamTask: Task<Void, Never>?
   private var control: DreamControl?
   let workspace: Workspace
   let configURL: URL
-  private let autosaveDelay: Duration
+  let autosaveDelay: Duration
 
-  init(configURL: URL, autosaveDelay: Duration = .milliseconds(500)) {
+  init(
+    configURL: URL, autosaveDelay: Duration = .milliseconds(500),
+    persistence: NativeBatchPersistence = NativeBatchPersistence()
+  ) {
     self.configURL = configURL
     self.autosaveDelay = autosaveDelay
-    self.workspace = Workspace(configURL: configURL)
-
-  }
-
-  var isExistingEntry: Bool { editorTarget != nil }
-  var isDraftDirty: Bool { editRevision != persistedEditRevision }
-
-  var visibleEntries: [ManagedMemoryEntry] {
-    (catalog?.entries ?? []).filter { row in
-      guard MemoryDocument.isMemoryContent(Data(row.expected.utf8)) else { return false }
-      return isShowingAllDevices || !row.path.hasPrefix("devices/")
-        || configuration.deviceKey.map { row.path.hasPrefix("devices/\($0)/") } == true
-    }
+    self.workspace = Workspace(configURL: configURL, persistence: persistence)
   }
 
   func load() async {
@@ -86,46 +79,58 @@ import Foundation
       apply(try await workspace.load())
       isLoaded = true
       isBusy = false
-      if section == "Review" { await loadCandidates() }
+      if section == "Memories" { await loadCandidates() }
       reloadQueue()
     } catch { failure = String(describing: error) }
   }
 
   func refresh() async {
-    guard isLoaded, !isBusy, !isDreamRunning else { return }
-    await refreshSnapshot()
+    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    isBusy = true
+    defer { isBusy = false }
+    do {
+      try await flushInputAndPersistence()
+      await refreshSnapshot()
+    } catch { failure = String(describing: error) }
   }
 
-  private func refreshSnapshot() async {
+  func refreshSnapshot() async {
+    await pauseQueue()
     savedRecovery = nil
-    preview = nil
+    presentation = nil
     apply(await workspace.refresh())
-    if isReviewLoaded || section == "Review" { await reloadCandidates() }
+    if isWorkspaceLoaded || section == "Memories" {
+      workspaceGeneration &+= 1
+      do { applyBatch(try await workspace.reprepareBatch()) } catch {
+        failure = String(describing: error)
+      }
+    }
     reloadQueue()
   }
 
   var resumableRun: SavedDreamRun? {
-    inspection?.runs.first(where: {
-      !$0.isCompleted && $0.attempts.last?.status == "Reply valid"
-    })
+    inspection?.runs.first(where: { !$0.isCompleted && $0.attempts.last?.status == "Reply valid" })
   }
 
   var savedRecoveryRunID: String? {
     guard let run = resumableRun, let base = catalog?.base,
       let approvedBase = run.approvedBase, approvedBase != base,
-      let count = run.attempts.last?.suggestionCount, count > 0 else { return nil }
+      let count = run.attempts.last?.suggestionCount, count > 0
+    else { return nil }
     return run.id
   }
 
   func prepareSavedRecovery() async {
-    guard isLoaded, !isBusy, !isDreamRunning, let runID = savedRecoveryRunID,
-      let base = catalog?.base else { return }
+    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved,
+      let runID = savedRecoveryRunID, let base = catalog?.base
+    else { return }
     isBusy = true
     defer { isBusy = false }
     savedRecovery = nil
-    preview = nil
+    presentation = nil
     await pauseQueue()
     do {
+      try await flushInputAndPersistence()
       let prepared = try await workspace.prepareSavedRecovery(
         runID: runID, profile: configuration, base: base)
       isBusy = false
@@ -141,15 +146,16 @@ import Foundation
 
   func confirmSavedRecovery() async {
     guard isLoaded, !isBusy, !isDreamRunning, savedRecovery != nil,
-      let base = catalog?.base else { return }
+      let base = catalog?.base
+    else { return }
     isBusy = true
     defer { isBusy = false }
     savedRecovery = nil
-    preview = nil
+    presentation = nil
     do {
+      try await flushInputAndPersistence()
       try await workspace.confirmSavedRecovery(profile: configuration, base: base)
-      section = "Review"
-      isShowingReviewedCandidates = false
+      section = "Memories"
       invocationStatus = nil
       dreamPhase = "Ready to review"
       dreamDetail = ""
@@ -158,12 +164,13 @@ import Foundation
     } catch { failure = String(describing: error) }
   }
 
-  private func pauseQueue() async {
+  func pauseQueue() async {
     queueTask?.cancel()
     await queueTask?.value
   }
 
   private func reloadQueue() {
+    queueScanCount += 1
     queueTask?.cancel()
     queueRevision &+= 1
     let revision = queueRevision
@@ -173,7 +180,9 @@ import Foundation
     queueTask = Task {
       let snapshot = await withTaskCancellationHandler {
         await scan.value
-      } onCancel: { scan.cancel() }
+      } onCancel: {
+        scan.cancel()
+      }
       guard revision == queueRevision else { return }
       isQueueLoading = false
       if !Task.isCancelled { queueSnapshot = snapshot }
@@ -198,342 +207,58 @@ import Foundation
       }
     }
     drafts = snapshot.drafts
-    if draft == nil, !isDraftDirty, operations.isEmpty, let recovered = drafts.last {
-      draft = recovered
-      operations = recovered.operations
-      message = "Recovered draft · revision \(recovered.revision)"
+    if batchProjection == nil, !isInputDirty, let recovered = drafts.last {
+      retainedDraft = recovered
+      message = "Recovered draft"
     }
     if !snapshot.failures.isEmpty { failure = snapshot.failures.joined(separator: "\n") }
   }
 
-  func edit(_ entry: ManagedMemoryEntry) {
-    guard !isBusy else { return }
-    guard entry.isMutable else {
-      failure = entry.limitation
-      return
-    }
-    isLoadingEditor = true
-    editorTarget = entry
-    editorIndex = operations.firstIndex {
-      $0.path == entry.path && $0.locator == entry.locator && $0.operation != .add
-    }
-    editorPath = entry.path
-    editorReason = editorIndex.map { operations[$0].reason ?? "" } ?? ""
-    do {
-      editorText =
-        try editorIndex.map { operations[$0].replacement ?? entry.expected }
-        ?? MemoryDocument.editableEntry(Data(entry.expected.utf8))
-    } catch { failure = String(describing: error) }
-    isEditing = true
-    isLoadingEditor = false
-  }
-
-  func add(path: String = "MEMORY.md") {
-    guard !isBusy else { return }
-    isLoadingEditor = true
-    editorTarget = nil
-    editorIndex = nil
-    editorPath = path
-    editorReason = ""
-    editorText = ""
-    isEditing = true
-    section = "Memories"
-    isLoadingEditor = false
-  }
-
-  func addProject(isDeviceSpecific: Bool) async {
-    guard !isBusy else { return }
-    let panel = NSOpenPanel()
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.allowsMultipleSelection = false
-    panel.prompt = "Choose Project"
-    guard panel.runModal() == .OK, let directory = panel.url else { return }
-    let bindings = configuration.projectBindings
-    do {
-      guard
-        let key = try await Task.detached(operation: {
-          try MemoryStore.projectKey(cwd: directory, projectBindings: bindings)
-        }).value
-      else { throw WorkspaceError("choose a Git project directory") }
-      if isDeviceSpecific {
-        guard let device = configuration.deviceKey else {
-          throw WorkspaceError("set up this device first")
-        }
-        add(path: "devices/\(device)/projects/\(key).md")
-      } else {
-        add(path: "projects/\(key).md")
-      }
-    } catch { failure = String(describing: error) }
-  }
-
-  func editOperation(_ index: Int) {
-    guard !isBusy, operations.indices.contains(index) else { return }
-    let operation = operations[index]
-    isLoadingEditor = true
-    editorIndex = index
-    editorTarget = catalog?.entries.first {
-      $0.path == operation.path && $0.locator == operation.locator
-    }
-    editorPath = operation.path ?? "MEMORY.md"
-    editorText = operation.replacement ?? operation.expected ?? ""
-    editorReason = operation.reason ?? ""
-    isEditing = operation.operation != .delete
-    isLoadingEditor = false
-    section = "Memories"
-  }
-
-  func editorChanged() {
-    guard isEditing, !isBusy, !isLoadingEditor,
-      let base = draft?.baseCommit ?? operations.first?.base ?? catalog?.base
-    else {
-      return
-    }
-    let request = MemoryManagementRequest(
-      operation: editorTarget == nil ? .add : .update,
-      base: base, path: editorPath, locator: editorTarget?.locator,
-      expected: editorTarget?.expected,
-      replacement: editorText, reason: editorReason)
-    if let index = editorIndex, operations.indices.contains(index) {
-      operations[index] = request
-    } else {
-      operations.append(request)
-      editorIndex = operations.count - 1
-    }
-    queueAutosave()
-  }
-
-  func deleteEntry() {
-    guard !isBusy, let target = editorTarget,
-      let base = draft?.baseCommit ?? operations.first?.base ?? catalog?.base
-    else { return }
-    let operation = MemoryManagementRequest(
-      operation: .delete, base: base, path: target.path,
-      locator: target.locator, expected: target.expected, reason: editorReason)
-    if let index = editorIndex, operations.indices.contains(index) {
-      operations[index] = operation
-    } else {
-      operations.append(operation)
-    }
-    isEditing = false
-    section = "Changes"
-    queueAutosave()
-  }
-
-  func removeOperation(_ index: Int) {
-    guard !isBusy, operations.indices.contains(index) else { return }
-    operations.remove(at: index)
-    isEditing = false
-    editorIndex = nil
-    queueAutosave()
-  }
-
-  private func queueAutosave() {
-    editRevision &+= 1
-    let previous = autosaveTask
-    previous?.cancel()
-    message = "Draft not yet persisted"
-    autosaveTask = Task {
-      await previous?.value
-      do {
-        try Task.checkCancellation()
-        try await Task.sleep(for: autosaveDelay)
-        try Task.checkCancellation()
-        try await persistEditor()
-      } catch is CancellationError {} catch { failure = String(describing: error) }
-    }
-  }
-
-  private func persistEditor() async throws {
-    guard let base = draft?.baseCommit ?? operations.first?.base ?? catalog?.base else {
-      throw WorkspaceError("approved catalog is unavailable")
-    }
-    let revision = editRevision
-    draft = try await workspace.autosave(operations, base: base)
-    persistedEditRevision = revision
-    message = "Draft saved locally · revision \(draft?.revision ?? 0)"
-  }
-
-  func save() async {
-    guard !isBusy else { return }
-    isBusy = true
-    defer { isBusy = false }
-    autosaveTask?.cancel()
-    await autosaveTask?.value
-    do {
-      try await persistEditor()
-      _ = try await workspace.save()
-      operations = []
-      persistedEditRevision = editRevision
-      draft = nil
-      isEditing = false
-      message = "Saved changes in one commit"
-      await refreshSnapshot()
-    } catch { failure = String(describing: error) }
-  }
-
-  func discard() async {
-    guard !isBusy else { return }
-    isBusy = true
-    defer { isBusy = false }
-    autosaveTask?.cancel()
-    await autosaveTask?.value
-    do {
-      try await workspace.discard()
-      operations = []
-      persistedEditRevision = editRevision
-      draft = nil
-      isEditing = false
-      message = "Draft discarded"
-      await refreshSnapshot()
-    } catch { failure = String(describing: error) }
-  }
-
-  func restore(_ value: MemoryDraft) async {
-    guard !isBusy else { return }
-    isBusy = true
-    defer { isBusy = false }
-    autosaveTask?.cancel()
-    await autosaveTask?.value
-    do {
-      if isDraftDirty { try await persistEditor() }
-      try await workspace.restore(value)
-      draft = value
-      operations = value.operations
-      persistedEditRevision = editRevision
-      isEditing = false
-      message = "Recovered draft · revision \(value.revision)"
-    } catch { failure = String(describing: error) }
-  }
-
   func prepareCheckout() async {
-    guard isLoaded, !isBusy, !isDreamRunning else { return }
+    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
     isBusy = true
     defer { isBusy = false }
-    do { checkout = try await workspace.checkoutPreview() } catch {
-      failure = String(describing: error)
-    }
+    do {
+      await pauseQueue()
+      try await flushInputAndPersistence()
+      checkout = try await workspace.checkoutPreview()
+    } catch { failure = String(describing: error) }
   }
 
   func detach() async {
-    guard isLoaded, !isBusy, !isDreamRunning, let checkout else { return }
+    guard isLoaded, !isBusy, !isDreamRunning, let checkout, !isSaveUnresolved else { return }
     isBusy = true
     defer { isBusy = false }
     do {
+      await pauseQueue()
+      try await flushInputAndPersistence()
       try await workspace.detach(checkout)
       self.checkout = nil
+      if isWorkspaceLoaded {
+        workspaceGeneration &+= 1
+        applyBatch(try await workspace.reprepareBatch())
+      }
+      presentation = nil
       message = "Checkout prepared; no memory was approved"
     } catch { failure = String(describing: error) }
-  }
-
-  func loadCandidates() async {
-    guard isLoaded, !isBusy, !isDreamRunning else { return }
-    await reloadCandidates()
-  }
-
-  private func reloadCandidates() async {
-    isReviewLoaded = true
-    isReviewLoading = true
-    reviewFailure = nil
-    defer { isReviewLoading = false }
-    await pauseQueue()
-    reviewRevision &+= 1
-    preview = nil
-    do { candidates = try await workspace.candidates() } catch {
-      candidates = []
-      reviewFailure = String(describing: error)
-      failure = reviewFailure
-    }
-  }
-
-  var reviewEmptyMessage: String {
-    if isReviewLoading { return "Loading suggestions…" }
-    if reviewFailure != nil { return "Suggestions unavailable. Refresh to try again." }
-    return actionableCandidates.isEmpty
-      ? "No candidates await review"
-      : "Choose Review Suggestion to check a change before saving it into memory"
-  }
-
-  var reviewActionTitle: String {
-    isReviewLoaded && reviewFailure == nil
-      ? "Review Suggestions (\(actionableCandidates.count))" : "Review Suggestions"
-  }
-
-  var actionableCandidates: [MemoryReviewCandidate] {
-    candidates.filter { [.pending, .deferred].contains($0.disposition) }
-  }
-
-  var blockedCandidates: [MemoryReviewCandidate] {
-    candidates.filter { $0.disposition == .blocked }
-  }
-
-  var reviewedCandidates: [MemoryReviewCandidate] {
-    candidates.filter { [.approved, .rejected].contains($0.disposition) }
   }
 
   var queueCoverage: DreamQueueCoverage? {
     if let eventCoverage, eventCoverage.segments != nil,
       coverageObservedAt.map({ $0 > (queueSnapshot?.observedAt ?? .distantPast) }) == true
-    { return eventCoverage }
+    {
+      return eventCoverage
+    }
     return queueSnapshot?.coverage ?? eventCoverage
   }
 
   var queueObservedAt: Date? {
     if let eventCoverage, eventCoverage.segments != nil,
       coverageObservedAt.map({ $0 > (queueSnapshot?.observedAt ?? .distantPast) }) == true
-    { return coverageObservedAt }
-    return queueSnapshot?.coverage == nil ? coverageObservedAt : queueSnapshot?.observedAt
-  }
-
-  func showPreview(_ candidate: MemoryReviewCandidate) async {
-    guard isLoaded, !isBusy, !isDreamRunning else { return }
-    isBusy = true
-    defer { isBusy = false }
-    preview = nil
-    await pauseQueue()
-    let revision = reviewRevision
-    do {
-      let fresh = try await workspace.preview(candidate.change.id)
-      if reviewRevision == revision, !isShowingReviewedCandidates { preview = fresh }
-    } catch {
-      failure = String(describing: error)
+    {
+      return coverageObservedAt
     }
-  }
-
-  func approve() async {
-    guard isLoaded, !isBusy, !isDreamRunning, let shown = preview else { return }
-    isBusy = true
-    defer { isBusy = false }
-    preview = nil
-    await pauseQueue()
-    do {
-      _ = try await workspace.approve(shown)
-      message = "Saved into memory"
-      await reloadCandidates()
-      await refreshSnapshot()
-    } catch { failure = String(describing: error) }
-  }
-
-  func disposition(_ candidate: MemoryReviewCandidate, isRejected: Bool) async {
-    guard isLoaded, !isBusy, !isDreamRunning else { return }
-    isBusy = true
-    defer { isBusy = false }
-    preview = nil
-    await pauseQueue()
-    do {
-      try await workspace.disposition(candidate.change.id, isRejected: isRejected)
-      await reloadCandidates()
-    } catch { failure = String(describing: error) }
-  }
-
-  func confirmReviewed(_ entry: ManagedMemoryEntry) async {
-    guard isLoaded, !isBusy, !isDreamRunning, let base = catalog?.base else { return }
-    isBusy = true
-    defer { isBusy = false }
-    do {
-      try await workspace.confirmReviewed(entry, base: base)
-      await refreshSnapshot()
-    } catch { failure = String(describing: error) }
+    return queueSnapshot?.coverage == nil ? coverageObservedAt : queueSnapshot?.observedAt
   }
 
   func inspect(_ artifact: DreamArtifact) async {
@@ -560,9 +285,8 @@ import Foundation
   }
 
   func run(_ operation: DreamControlOperation) {
-    guard isLoaded, !isBusy, !isDreamRunning else { return }
+    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
     savedRecovery = nil
-    Task { await workspace.cancelSavedRecovery() }
     isDreamRunning = true
     dreamPhase = "Starting"
     dreamDetail = ""
@@ -577,12 +301,12 @@ import Foundation
     self.control = control
     let config = configuration
     dreamTask = Task {
+      await workspace.cancelSavedRecovery()
       await pauseQueue()
       let events = AsyncStream<Data>.makeStream()
-      let consumer = Task {
-        for await bytes in events.stream { receive(bytes) }
-      }
+      let consumer = Task { for await bytes in events.stream { receive(bytes) } }
       do {
+        try await flushInputAndPersistence()
         try await Task.detached {
           defer { events.continuation.finish() }
           try control.run(
@@ -593,6 +317,7 @@ import Foundation
         await consumer.value
         dreamPhase = terminalPhase ?? "Invocation ended; completion not established"
       } catch {
+        events.continuation.finish()
         await consumer.value
         dreamPhase = isCancellingDream ? "Cancelled" : "Stopped"
         if !isCancellingDream { failure = String(describing: error) }
@@ -631,9 +356,7 @@ import Foundation
     if event["event"] as? String == "report", let report = event["report"] as? [String: Any],
       let status = report["status"] as? String
     {
-      if let saved = DreamInvocationStatus(report: report) {
-        applyStatus(saved)
-      }
+      if let saved = DreamInvocationStatus(report: report) { applyStatus(saved) }
       terminalPhase =
         isCancellingDream && report["reason"] as? String == "callInterrupted"
         ? "Cancelled" : invocationStatus?.title ?? status.capitalized
@@ -660,7 +383,9 @@ import Foundation
 
   func saveSettings(isSettingUpDevice: Bool = false) async {
     do {
-      guard isLoaded, !isBusy, !isDreamRunning, !isDraftDirty, operations.isEmpty else {
+      guard isLoaded, !isBusy, !isDreamRunning, !isDraftDirty, stagedItems.isEmpty,
+        !isSaveUnresolved
+      else {
         throw WorkspaceError("Save or discard local edits before changing configuration")
       }
       isBusy = true
@@ -670,10 +395,13 @@ import Foundation
       if isSettingUpDevice { value.setupDevice() }
       await pauseQueue()
       try await workspace.configure(value)
+      workspaceGeneration &+= 1
       configuration = value
+      batchProjection = nil
+      retainedDraft = nil
+      isWorkspaceLoaded = false
       queueSnapshot = nil
-      candidates = []
-      preview = nil
+      presentation = nil
       invocationStatus = nil
       eventCoverage = nil
       coverageObservedAt = nil
@@ -695,13 +423,20 @@ import Foundation
     savedRecovery = nil
     let task = Task<Void, Error> {
       await workspace.cancelSavedRecovery()
-      autosaveTask?.cancel()
-      await autosaveTask?.value
-      if isDraftDirty { try await persistEditor() }
+      await pauseQueue()
+      try await flushInputAndPersistence()
+      guard !isSaveUnresolved else {
+        throw WorkspaceError("Resolve the Save outcome before quitting")
+      }
       control?.cancel()
       await dreamTask?.value
       queueTask?.cancel()
       await queueTask?.value
+      retainedDraft = await workspace.closeBatch()
+      workspaceGeneration &+= 1
+      batchProjection = nil
+      presentation = nil
+      isWorkspaceLoaded = false
     }
     shutdownTask = task
     defer {

@@ -4,24 +4,20 @@ import Testing
 @testable import CoreMemories
 @testable import CoreMemoriesApp
 
-@MainActor private func pendingNativeModel(_ fixture: TransactionFixture) async throws -> AppModel {
-  var configuration = MemoryConfiguration.defaults
-  configuration.roots = DreamControlRoots(
-    state: fixture.state.path, sessions: fixture.sessions.path, memory: fixture.memory.path,
-    snippets: fixture.snippets.path, prompts: nil, globalAgents: nil)
-  configuration.journal = fixture.root.appendingPathComponent("journal").path
-  configuration.reviewState = fixture.root.appendingPathComponent("review").path
-  configuration.diagnostics = fixture.root.appendingPathComponent("diagnostics").path
+@MainActor func pendingNativeModel(
+  _ fixture: TransactionFixture, persistence: NativeBatchPersistence = NativeBatchPersistence()
+) async throws -> AppModel {
+  let configuration = queueConfiguration(fixture)
   let url = fixture.root.appendingPathComponent("profile/config.json")
   try configuration.save(to: url)
-  let model = AppModel(configURL: url, autosaveDelay: .seconds(3600))
+  let model = AppModel(configURL: url, autosaveDelay: .seconds(3600), persistence: persistence)
   await model.load()
   _ = try #require(model.catalog)
-  model.add()
+  await model.add()
   model.editorText = "Retain this synthetic draft. [source: fixture; added: 2026-10-17]"
   model.editorReason = "Synthetic edit"
   model.editorChanged()
-  #expect(model.operations.count == 1)
+  #expect(model.isInputDirty)
   return model
 }
 
@@ -32,29 +28,22 @@ import Testing
   defer { fixture.clean() }
   let url = fixture.root.appendingPathComponent("profile/selected.json")
   let model = AppModel(configURL: url)
-  var fallback = MemoryConfiguration.defaults
-  fallback.roots = DreamControlRoots(
-    state: fixture.state.path, sessions: fixture.sessions.path, memory: fixture.memory.path,
-    snippets: fixture.snippets.path, prompts: nil, globalAgents: nil)
-  fallback.journal = fixture.root.appendingPathComponent("journal").path
-  fallback.reviewState = fixture.root.appendingPathComponent("review").path
-  fallback.diagnostics = fixture.root.appendingPathComponent("diagnostics").path
-  try await model.workspace.configure(fallback)
+  try await model.workspace.configure(queueConfiguration(fixture))
   try FileManager.default.removeItem(at: url)
   if variant == "corrupt" { try fixture.write("{", file: url) }
   #expect(model.isBusy)
-  model.add()
+  await model.add()
   #expect(!model.isEditing)
   await model.load()
   #expect(model.failure != nil)
   #expect(model.isBusy)
-  model.add()
+  await model.add()
   #expect(!model.isEditing)
   #expect(model.catalog == nil)
-  let beforePreparation = try fixture.snapshot(fixture.memory)
+  let before = try fixture.snapshot(fixture.memory)
   await model.prepareCheckout()
   #expect(model.checkout == nil)
-  #expect(try fixture.snapshot(fixture.memory) == beforePreparation)
+  #expect(try fixture.snapshot(fixture.memory) == before)
   model.checkout = try MemoryManagement(repository: fixture.memory).checkoutPreview()
   let beforeDetachment = try fixture.snapshot(fixture.memory)
   await model.detach()
@@ -70,13 +59,14 @@ import Testing
   defer { fixture.clean() }
   let model = try await pendingNativeModel(fixture)
   try await model.shutdown()
-  model.removeOperation(0)
+  await model.removeItem(try #require(model.stagedItems.first).itemID)
   try await model.shutdown()
   let reopened = AppModel(configURL: model.configURL)
   await reopened.load()
-  #expect(reopened.operations.isEmpty)
-  #expect(reopened.draft?.operations.isEmpty == true)
+  #expect(reopened.stagedItems.isEmpty)
+  #expect(reopened.draft?.batch?.items.isEmpty == true)
   #expect(!model.isDraftDirty)
+  try await reopened.shutdown()
 }
 
 @Test @MainActor func nativeDraftStaleFirstAutosavePreservesEditsThroughRefreshAndRelaunch()
@@ -89,35 +79,97 @@ import Testing
   try fixture.advance()
   let advanced = try fixture.main()
   await model.refresh()
-  #expect(model.operations.count == 1)
-  #expect(model.operations.first?.base == base)
+  #expect(model.stagedItems.count == 1)
+  #expect(model.draft?.baseCommit == base)
   try await model.shutdown()
   let reopened = AppModel(configURL: model.configURL)
   await reopened.load()
-  #expect(reopened.operations.count == 1)
+  #expect(reopened.stagedItems.count == 1)
   #expect(reopened.draft?.baseCommit == base)
-  await reopened.save()
+  await reopened.loadCandidates()
   #expect(reopened.failure != nil)
-  #expect(reopened.operations.count == 1)
+  #expect(reopened.stagedItems.count == 1)
+  await reopened.save()
+  #expect(reopened.stagedItems.count == 1)
   #expect(try fixture.main() == advanced)
+  try await reopened.shutdown()
 }
 
 @Test @MainActor func nativeTerminationRefusesFailedDraftFlushAndCanRetry() async throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
-  let model = try await pendingNativeModel(fixture)
-  let journal = URL(fileURLWithPath: model.configuration.journal)
-  try Data("Blocked journal".utf8).write(to: journal)
+  let control = NativePersistenceControl()
+  await control.failWrites()
+  let model = try await pendingNativeModel(
+    fixture, persistence: NativeBatchPersistence(write: control.write))
   let delegate = ApplicationDelegate()
   delegate.model = model
   #expect(await delegate.isTerminationReady() == false)
   #expect(model.failure != nil)
-  #expect(model.operations.count == 1)
+  #expect(model.stagedItems.count == 1)
   #expect(model.isDraftDirty)
   #expect(!model.isBusy)
-  try FileManager.default.removeItem(at: journal)
+  await control.resumeWrites()
   #expect(await delegate.isTerminationReady())
   #expect(!model.isDraftDirty)
+  let requests = await control.requests
+  #expect(requests.count == 2)
+  let encoder = JSONEncoder()
+  encoder.outputFormatting = [.sortedKeys]
+  #expect(try encoder.encode(requests[0]) == encoder.encode(requests[1]))
+}
+
+@Test @MainActor func nativeFailedAutosaveKeepsInputDirtyAndRetriesWithoutInterruptingEditing()
+  async throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let configuration = queueConfiguration(fixture)
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  let control = NativePersistenceControl()
+  await control.failWrites()
+  let model = AppModel(
+    configURL: url, autosaveDelay: .milliseconds(1),
+    persistence: NativeBatchPersistence(write: control.write))
+  await model.load()
+  await model.add()
+  model.editorText = fact("Failed autosave keeps this text.")
+  model.editorReason = "Retain this reason"
+  model.editorChanged()
+  let deadline = ContinuousClock.now + .seconds(5)
+  while model.draftFailure == nil && ContinuousClock.now < deadline {
+    try await Task.sleep(for: .milliseconds(5))
+  }
+  #expect(model.draftFailure != nil)
+  #expect(model.failure == nil)
+  #expect(model.isDraftDirty)
+  #expect(model.editorText == fact("Failed autosave keeps this text."))
+  #expect(model.editorReason == "Retain this reason")
+  await control.resumeWrites()
+  try await model.shutdown()
+  #expect(!model.isDraftDirty)
+  #expect(model.draftFailure == nil)
+}
+
+@Test @MainActor func nativeFailedRestoreLeavesTheActiveSessionAndInputIntact() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let store = try MemoryDraftStore(
+    repository: fixture.memory, journal: URL(fileURLWithPath: queueConfiguration(fixture).journal))
+  let stale = try store.create()
+  try fixture.advance()
+  _ = try store.create()
+  let model = try await pendingNativeModel(fixture)
+  try await model.flushInputAndPersistence()
+  let active = try #require(model.draft)
+  await model.restore(stale)
+  #expect(model.failure != nil)
+  #expect(model.draft?.draftID == active.draftID)
+  #expect(model.stagedItems.count == 1)
+  #expect(model.editorText == "Retain this synthetic draft. [source: fixture; added: 2026-10-17]")
+  #expect(model.retainedDraft?.draftID == stale.draftID)
+  try await model.shutdown()
 }
 
 @Test @MainActor func nativeSettingsCannotRedirectAnEditDuringInitialDebounce() async throws {
@@ -126,7 +178,6 @@ import Testing
   let model = try await pendingNativeModel(fixture)
   let other = fixture.root.appendingPathComponent("other-memory")
   try FileManager.default.copyItem(at: fixture.memory, to: other)
-  #expect(try MemoryStore(repo: other, environment: [:]).approvedCommit() == fixture.main())
   model.configuration.roots?.memory = other.path
   model.configuration.journal = fixture.root.appendingPathComponent("other-journal").path
   await model.saveSettings()
@@ -135,9 +186,10 @@ import Testing
   try await model.shutdown()
   let reopened = AppModel(configURL: model.configURL)
   await reopened.load()
-  #expect(reopened.operations.count == 1)
+  #expect(reopened.stagedItems.count == 1)
   #expect(reopened.configuration.memoryURL.path == fixture.memory.path)
   #expect(
     !FileManager.default.fileExists(
       atPath: fixture.root.appendingPathComponent("other-journal").path))
+  try await reopened.shutdown()
 }

@@ -237,13 +237,12 @@ func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPre
   let url = fixture.root.appendingPathComponent("profile/config.json")
   try configuration.save(to: url)
   let model = AppModel(configURL: url)
-  model.section = "Review"
+  model.section = "Memories"
   await model.load()
   #expect(model.actionableCandidates.count == 1)
-  #expect(!model.isShowingReviewedCandidates)
   await model.loadCandidates()
-  await model.showPreview(try #require(model.candidates.first))
-  #expect(model.preview != nil)
+  await model.selectMemory(.candidate(try #require(model.candidates.first).change.id.rawValue))
+  #expect(model.presentation != nil)
   try fixture.append(dreamUser("u1", nil, dreamOld, "Keep B.") + "\n")
   _ = try transactionCompleted(
     fixture.store().run(
@@ -259,11 +258,12 @@ func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPre
   #expect(!model.isDreamRunning)
   #expect(model.failure == nil)
   #expect(model.actionableCandidates.count == 2)
-  #expect(model.preview == nil)
+  #expect(model.presentation == nil)
   model.section = "Dreams"
+  await model.selectMemory(nil)
   await model.loadCandidates()
-  await model.showPreview(try #require(model.candidates.first))
-  #expect(model.preview != nil)
+  await model.selectMemory(.candidate(try #require(model.candidates.first).change.id.rawValue))
+  #expect(model.presentation != nil)
   try fixture.append(dreamUser("u2", nil, dreamOld, "Keep C.") + "\n")
   _ = try transactionCompleted(
     fixture.store().run(
@@ -271,21 +271,19 @@ func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPre
       call: { try transactionAdd($0) }))
   await model.refresh()
   #expect(model.actionableCandidates.count == 3)
-  #expect(model.preview == nil)
-  let first = try #require(model.actionableCandidates.first)
+  #expect(model.presentation == nil)
+  let first = model.actionableCandidates[0]
+  let second = model.actionableCandidates[1]
   await model.disposition(first, isRejected: true)
-  let second = try #require(model.actionableCandidates.first)
   await model.disposition(second, isRejected: false)
+  #expect(model.actionableCandidates.count == 3)
+  #expect(model.reviewedCandidates.isEmpty)
+  #expect(model.stagedItems.count == 2)
+  await model.save()
+  #expect(model.message == "Decisions saved")
   #expect(model.actionableCandidates.count == 2)
   #expect(model.actionableCandidates.contains { $0.disposition == .deferred })
   #expect(model.reviewedCandidates.count == 1)
   #expect(model.reviewedCandidates.first?.disposition == .rejected)
-  let blocked = MemoryReviewCandidate(
-    change: first.change, disposition: .blocked, limitation: "Synthetic conflict",
-    frozenLimitations: [])
-  model.candidates.append(blocked)
-  #expect(model.actionableCandidates.count == 2)
-  #expect(model.blockedCandidates.count == 1)
-  #expect(model.reviewedCandidates.count == 1)
   try await model.shutdown()
 }

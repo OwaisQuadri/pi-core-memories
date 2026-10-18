@@ -18,6 +18,7 @@ final class MemoryReviewWorkerProcessHelper: XCTestCase {
     }
     _ = close(null)
     let result = executeMemoryReviewWorker(arguments: ["memory-review-worker"]) { controller in
+      guard mode != "after-batch" else { return }
       controller.persistenceFault = { event in
         if case .beforeWrite(let name) = event,
           name.hasPrefix(mode == "approve" ? "outcome-" : "detach-outcome-")
@@ -30,13 +31,33 @@ final class MemoryReviewWorkerProcessHelper: XCTestCase {
   }
 }
 
-@Test(arguments: ["approve", "detach"])
-func reviewWorkerReportsIrreversibleMutationWhenFollowUpAndQueuePersistentlyFail(mode: String)
+@Test(arguments: ["approve", "detach", "after-batch"])
+func reviewWorkerPreservesOneItemApprovalAndReportsIrreversibleFollowUpFailures(mode: String)
   throws
 {
-  let fixture = try TransactionFixture()
+  let batchFixture = try mode == "after-batch" ? ReviewFlowFixture() : nil
+  let fixture = try batchFixture?.transaction ?? TransactionFixture()
   defer { fixture.clean() }
-  let sources = try reviewCompletedSiblings(fixture)
+  let sources = try batchFixture?.sources ?? reviewCompletedSiblings(fixture)
+  if let batchFixture {
+    let controller = try batchFixture.controller()
+    let drafts = try MemoryDraftStore(
+      repository: fixture.memory, journal: memoryBatchTestJournal(fixture.root))
+    let session = try MemoryBatchSession(
+      repository: fixture.memory, drafts: drafts, review: controller,
+      date: ReviewFlowFixture.reviewDate)
+    for candidate in session.projection.candidates.filter({ $0.disposition == .pending }).prefix(2)
+    {
+      try session.stage(session.presentAcceptance(candidateID: candidate.change.id))
+    }
+    _ = try session.stageManual(
+      MemoryManagementRequest(
+        operation: .add, base: session.projection.draft.baseCommit, path: "MEMORY.md",
+        replacement: fact("Manual sibling in a batch."), reason: "Requested addition"))
+    guard case .saved = try session.save() else {
+      throw MemoryError("synthetic mixed batch did not publish")
+    }
+  }
   if mode == "approve" {
     let controller = try MemoryReviewController(
       repository: fixture.memory, stateRoot: fixture.root.appendingPathComponent("review"),
@@ -97,35 +118,49 @@ func reviewWorkerReportsIrreversibleMutationWhenFollowUpAndQueuePersistentlyFail
   let queue = try frame()
   #expect(queue["type"] as? String == "queue")
   let rows = try #require(queue["candidates"] as? [[String: Any]])
-  let id = try #require(rows[0]["candidateID"] as? String)
+  let pending = try #require(rows.first { $0["disposition"] as? String == "pending" })
+  let id = try #require(pending["candidateID"] as? String)
+  let beforeMain = try fixture.main()
   try send(["version": 1, "type": "preview", "invocationID": invocation, "candidateID": id])
   let preview = try frame()
   #expect(preview["type"] as? String == "preview")
   try send(
     [
       "version": 1, "type": "choice", "invocationID": invocation, "candidateID": id,
-      "sequence": preview["sequence"]!, "digest": preview["digest"]!, "action": mode,
+      "sequence": preview["sequence"]!, "digest": preview["digest"]!,
+      "action": mode == "after-batch" ? "approve" : mode,
     ], isControl: true)
   let operation = try frame()
   #expect(operation["type"] as? String == "operation")
-  #expect(operation["status"] as? String == (mode == "approve" ? "approved" : "detached"))
+  #expect(operation["status"] as? String == (mode == "detach" ? "detached" : "approved"))
   let commit = try #require(operation["commit"] as? String)
   let git = Git(repo: fixture.memory, environment: [:])
-  #expect(commit == (mode == "approve" ? try fixture.main() : try git.text(["rev-parse", "HEAD"])))
-  if mode == "approve" {
+  #expect(commit == (mode == "detach" ? try git.text(["rev-parse", "HEAD"]) : try fixture.main()))
+  if mode != "detach" {
     let audit = try #require(operation["auditRef"] as? String)
     #expect(try git.text(["rev-parse", audit]) == commit)
   } else {
     #expect((operation["auditRef"] as? String)?.hasPrefix("refs/memory-review/detach/") == true)
   }
-  #expect(
-    (operation["reason"] as? String)?.contains("follow-up persistence or recovery is incomplete")
-      == true)
+  if mode == "after-batch" {
+    #expect(operation["reason"] is NSNull)
+    #expect(try git.text(["rev-list", "--count", beforeMain + ".." + commit]) == "1")
+    let refreshed = try frame()
+    #expect(refreshed["type"] as? String == "queue")
+    let refreshedRows = try #require(refreshed["candidates"] as? [[String: Any]])
+    #expect(refreshedRows.filter { $0["disposition"] as? String == "approved" }.count == 7)
+    #expect(refreshedRows.filter { $0["disposition"] as? String == "pending" }.count == 5)
+    try send(["version": 1, "type": "finish", "invocationID": invocation])
+  } else {
+    #expect(
+      (operation["reason"] as? String)?.contains("follow-up persistence or recovery is incomplete")
+        == true)
+  }
   let final = try frame()
   #expect(final["type"] as? String == "final")
-  #expect(final["status"] as? String == "failed")
+  #expect(final["status"] as? String == (mode == "after-batch" ? "completed" : "failed"))
   process.waitUntilExit()
-  #expect(process.terminationStatus == 1)
+  #expect(process.terminationStatus == (mode == "after-batch" ? 0 : 1))
 }
 
 @Test func reviewWorkerWithoutInheritedControlChannelCannotPublish() throws {

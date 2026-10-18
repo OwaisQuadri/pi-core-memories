@@ -15,6 +15,8 @@ package final class MemoryBatchSession {
   private(set) var preparedCandidates: [String: PreparedMemoryBatchCandidate]
   private var catalogCandidateIDs: Set<String>
   private(set) var draft: MemoryDraft
+  private let persistenceID = UUID()
+  private var expectedDurableDigest: String
   private var selectedItemID: UUID?
   private var undoItems:
     [(items: [MemoryBatchItem], candidates: [String: PreparedMemoryBatchCandidate], bytes: Int)] =
@@ -40,6 +42,7 @@ package final class MemoryBatchSession {
     }
     try verifyMemoryBatchRepository(store, review: review)
     let original = try restoring ?? drafts.create()
+    self.expectedDurableDigest = try memoryBatchDigest(original)
     let snapshot = try store.reviewSnapshot(base: original.baseCommit)
     guard snapshot.documents.reduce(0, { $0 + ($1.bytes?.count ?? 0) }) <= 16 * 1024 * 1024 else {
       throw DreamRunError.limitExceeded
@@ -142,6 +145,26 @@ package final class MemoryBatchSession {
   }
 
   package var persistenceSnapshot: MemoryDraft { draft }
+
+  package var persistenceRequest: MemoryBatchPersistenceRequest {
+    MemoryBatchPersistenceRequest(
+      draft: draft, sessionID: persistenceID, expectedDigest: expectedDurableDigest)
+  }
+
+  package func acknowledgePersistence(_ receipt: MemoryBatchPersistenceReceipt) throws {
+    guard receipt.sessionID == persistenceID, receipt.revision <= draft.revision,
+      receipt.expectedDigest == expectedDurableDigest || receipt.digest == expectedDurableDigest
+    else { throw MemoryError("persistence acknowledgment is stale or belongs to another session") }
+    expectedDurableDigest = receipt.digest
+  }
+
+  package func save() throws -> MemoryBatchSaveResult {
+    try drafts.saveBatch(
+      persistenceSnapshot, expectedDigest: expectedDurableDigest, review: review,
+      checkout: checkout,
+      authorized: Set(items.filter(isAuthorized).map(\.itemID)),
+      didPersist: { self.expectedDurableDigest = $0 })
+  }
 
   var items: [MemoryBatchItem] { draft.batch!.items }
 

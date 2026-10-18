@@ -2,11 +2,13 @@ import Foundation
 
 extension MemoryDraftStore {
   func saveBatch(
-    _ draft: MemoryDraft, review: MemoryReviewController?, checkout: ReviewCheckoutWitness,
-    authorized: Set<UUID>
+    _ draft: MemoryDraft, expectedDigest: String, review: MemoryReviewController?,
+    checkout: ReviewCheckoutWitness, authorized: Set<UUID>, didPersist: ((String) -> Void)? = nil
   ) throws -> MemoryBatchSaveResult {
     do {
-      return try performBatchSave(draft, review: review, checkout: checkout, authorized: authorized)
+      return try performBatchSave(
+        draft, expectedDigest: expectedDigest, review: review, checkout: checkout,
+        authorized: authorized, didPersist: didPersist)
     } catch {
       let saveID = try memoryBatchDigest(draft)
       let isKnownUnpublished: Bool
@@ -32,8 +34,8 @@ extension MemoryDraftStore {
   }
 
   private func performBatchSave(
-    _ draft: MemoryDraft, review: MemoryReviewController?, checkout: ReviewCheckoutWitness,
-    authorized: Set<UUID>
+    _ draft: MemoryDraft, expectedDigest: String, review: MemoryReviewController?,
+    checkout: ReviewCheckoutWitness, authorized: Set<UUID>, didPersist: ((String) -> Void)?
   ) throws -> MemoryBatchSaveResult {
     try withBatchJournal(review) { state in
       let publisher = batchPublisher(review)
@@ -42,27 +44,57 @@ extension MemoryDraftStore {
       } catch {
         return .outcomeUnknown(saveID: try memoryBatchDigest(draft), details: "\(error)")
       }
-      guard let durable = try drafts(only: draft.draftID, review: review).first,
-        durable.revision <= draft.revision, durable.repositoryBinding == draft.repositoryBinding,
-        durable.baseCommit == draft.baseCommit, durable.created == draft.created
-      else {
-        throw MemoryError("draft changed or was discarded before final Save")
-      }
-      if durable.revision == draft.revision {
-        guard try memoryBatchDigest(durable) == memoryBatchDigest(draft) else {
-          throw MemoryError("draft revision contains different intent")
-        }
-      }
-      if durable.schemaVersion == 1 {
-        try root.installReviewFile(
-          DreamRunEncoding.encode(durable), name: "\(durable.draftID)-\(durable.revision).json")
-      }
-      try persist(draft)
+      try flushBatch(
+        draft, expectedDigest: expectedDigest, review: review, didPersist: didPersist)
       try root.installReviewFile(
         DreamRunEncoding.encode(draft), name: "\(draft.draftID)-\(draft.revision).json")
       return try publisher.save(
         draft, checkout: checkout, authorized: authorized, leaseState: state)
     }
+  }
+
+  package func persistBatch(_ request: MemoryBatchPersistenceRequest) throws
+    -> MemoryBatchPersistenceReceipt
+  {
+    try locked {
+      try flushBatch(request.draft, expectedDigest: request.expectedDigest)
+      return MemoryBatchPersistenceReceipt(
+        revision: request.draft.revision, sessionID: request.sessionID,
+        expectedDigest: request.expectedDigest, digest: try memoryBatchDigest(request.draft))
+    }
+  }
+
+  private func flushBatch(
+    _ draft: MemoryDraft, expectedDigest: String, review: MemoryReviewController? = nil,
+    didPersist: ((String) -> Void)? = nil
+  ) throws {
+    let bytes = try MemoryReviewEncoding.encode(draft)
+    let digest = SourceDigest(bytes: bytes).rawValue
+    guard let durable = try drafts(only: draft.draftID, review: review).first,
+      durable.repositoryBinding == draft.repositoryBinding, durable.baseCommit == draft.baseCommit,
+      durable.created == draft.created
+    else { throw MemoryError("draft changed or was discarded before persistence") }
+    let durableDigest = try memoryBatchDigest(durable)
+    guard durableDigest == expectedDigest || durableDigest == digest else {
+      throw MemoryError("durable draft changed; preserve and reconcile local intent")
+    }
+    if durableDigest != digest {
+      if durable.schemaVersion == 1 {
+        try root.installReviewFile(
+          DreamRunEncoding.encode(durable), name: "\(durable.draftID)-\(durable.revision).json")
+      }
+      do {
+        try persist(draft)
+      } catch {
+        if (try? root.read(
+          "\(draft.draftID)-current.json", maximum: MemoryReviewEncoding.maximumFileBytes)) == bytes
+        {
+          didPersist?(digest)
+        }
+        throw error
+      }
+    }
+    didPersist?(digest)
   }
 
   package func recoverBatch(
@@ -128,13 +160,5 @@ extension MemoryDraftStore {
     }
     if let review { return try review.withBatchOwnership(acquireJournal) }
     return try acquireJournal()
-  }
-}
-
-extension MemoryBatchSession {
-  package func save() throws -> MemoryBatchSaveResult {
-    try drafts.saveBatch(
-      persistenceSnapshot, review: review, checkout: checkout,
-      authorized: Set(items.filter(isAuthorized).map(\.itemID)))
   }
 }

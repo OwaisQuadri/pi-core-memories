@@ -71,6 +71,19 @@ package struct MemoryBatchContents: Codable, Sendable {
   package let items: [MemoryBatchItem]
 }
 
+package struct MemoryBatchPersistenceRequest: Sendable {
+  package let draft: MemoryDraft
+  let sessionID: UUID
+  let expectedDigest: String
+}
+
+package struct MemoryBatchPersistenceReceipt: Sendable {
+  package let revision: UInt64
+  let sessionID: UUID
+  let expectedDigest: String
+  let digest: String
+}
+
 package struct MemoryBatchPresentation: Sendable {
   package let itemID: UUID
   package let path: String

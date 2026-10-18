@@ -53,7 +53,8 @@ import Testing
   let before = try draftsB.root.names()
   #expect(throws: (any Error).self) {
     try draftsB.saveBatch(
-      manual.persistenceSnapshot, review: controller, checkout: manual.checkout, authorized: [])
+      manual.persistenceSnapshot, expectedDigest: try memoryBatchDigest(manual.persistenceSnapshot),
+      review: controller, checkout: manual.checkout, authorized: [])
   }
   #expect(throws: (any Error).self) { try draftsB.list(review: controller) }
   let recovered = try draftsB.recoverBatch(

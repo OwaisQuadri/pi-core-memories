@@ -15,6 +15,7 @@ package struct SavedDreamAttempt: Codable, Sendable, Identifiable {
   package let modelID: String
   package let thinkingLevel: String
   package let status: String
+  package let suggestionCount: Int?
   package let diagnostic: String?
   package var id: Int { number }
 }
@@ -22,6 +23,7 @@ package struct SavedDreamAttempt: Codable, Sendable, Identifiable {
 package struct SavedDreamRun: Codable, Sendable, Identifiable {
   package let id: String
   package let generation: UInt64?
+  package let approvedBase: String?
   package let isCompleted: Bool
   package let attempts: [SavedDreamAttempt]
   package let diagnostic: String?
@@ -80,7 +82,7 @@ package struct DreamInspection: Codable, Sendable {
           bindingHash: SourceDigest(bytes: bytes), artifacts: artifacts)
       } catch {
         return SavedDreamRun(
-          id: id, generation: nil,
+          id: id, generation: nil, approvedBase: nil,
           isCompleted: artifacts.contains { $0.name == "completion.json" }, attempts: [],
           diagnostic: String(describing: error), artifacts: artifacts)
       }
@@ -133,6 +135,7 @@ package struct DreamInspection: Codable, Sendable {
       let selection = try intent.selection?.domain() ?? run.selection
       let responseName = prefix + "response.json"
       var status = "No saved reply"
+      var suggestionCount: Int?
       var diagnostic: String?
       if try directory.isPresent(responseName) {
         let bytes = try directory.read(
@@ -145,7 +148,7 @@ package struct DreamInspection: Codable, Sendable {
           run: run, context: context, request: request, admissionHash: admissionHash,
           selection: selection, bytes: bytes, maximumResponseBytes: limits.maximumResponseBytes)
         do {
-          _ = try DreamDecision.validate(response: response, context: context)
+          suggestionCount = try DreamDecision.validate(response: response, context: context).plans.count
           status = "Reply valid"
         } catch let error as DreamDecisionError {
           status = "Rejected reply"
@@ -162,10 +165,10 @@ package struct DreamInspection: Codable, Sendable {
         SavedDreamAttempt(
           number: number, provider: selection.provider,
           modelID: selection.modelID, thinkingLevel: selection.thinkingLevel,
-          status: status, diagnostic: diagnostic))
+          status: status, suggestionCount: suggestionCount, diagnostic: diagnostic))
     }
     return SavedDreamRun(
-      id: id, generation: run.progress.generation,
+      id: id, generation: run.progress.generation, approvedBase: run.approvedBase,
       isCompleted: artifacts.contains { $0.name == "completion.json" }, attempts: attempts,
       diagnostic: nil, artifacts: artifacts)
   }

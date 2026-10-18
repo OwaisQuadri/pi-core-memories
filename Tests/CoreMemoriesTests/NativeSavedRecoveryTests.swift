@@ -79,6 +79,48 @@ func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() a
   try await model.shutdown()
 }
 
+@Test(arguments: [false, true], [false, true]) @MainActor
+func nativeSavedReplyOffersRecoveryOnlyForChangedBaseSuggestions(
+  isNotesOnly: Bool, isBaseChanged: Bool
+) async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let store = try fixture.store()
+  store.persistenceFault = { event in
+    if event == .beforeWrite("completion.json") { throw POSIXError(.EIO) }
+  }
+  store.beforePublication = { _ in throw POSIXError(.EIO) }
+  #expect(throws: (any Error).self) {
+    try store.run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { try isNotesOnly ? transactionNotes($0) : transactionAdd($0) })
+  }
+  if isBaseChanged { try fixture.advance() }
+  let configuration = queueConfiguration(fixture)
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  let before = try fixture.snapshot(fixture.root)
+  let model = AppModel(configURL: url)
+  await model.load()
+  let run = try #require(model.inspection?.runs.first)
+  #expect(!run.isCompleted)
+  #expect(run.attempts.last?.status == "Reply valid")
+  #expect(run.approvedBase != nil)
+  #expect(run.attempts.last?.suggestionCount == (isNotesOnly ? 0 : 1))
+  #expect(model.resumableRun?.id == run.id)
+  #expect(model.savedRecoveryRunID == (isBaseChanged && !isNotesOnly ? run.id : nil))
+  #expect(model.savedRecovery == nil)
+  #expect(try fixture.snapshot(fixture.root) == before)
+  try await model.shutdown()
+  if !isBaseChanged || isNotesOnly {
+    _ = try transactionCompleted(
+      fixture.store().run(
+        selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled
+      ))
+  }
+}
+
 @Test @MainActor
 func nativeSavedRecoveryRejectsAnUnloadedOrReplacedProfileWithoutPublishing() async throws {
   let fixture = try TransactionFixture()

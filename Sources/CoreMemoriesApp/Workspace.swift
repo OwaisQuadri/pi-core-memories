@@ -7,6 +7,7 @@ struct WorkspaceSnapshot: Sendable {
   let drafts: [MemoryDraft]
   let inspection: DreamInspection?
   let invocationStatus: DreamInvocationStatus?
+  let invocationStatusFailure: String?
   let failures: [String]
 }
 
@@ -57,12 +58,18 @@ actor Workspace {
         if currentDraft == nil { currentDraft = drafts.last }
       } catch { failures.append(String(describing: error)) }
     }
-    let invocationStatus = try? DreamInvocationStatus.read(
-      configuration: configuration, inspection: inspection)
+    var invocationStatus: DreamInvocationStatus?
+    var invocationStatusFailure: String?
+    do {
+      invocationStatus = try DreamInvocationStatus.read(
+        configuration: configuration, inspection: inspection)
+    } catch {
+      invocationStatusFailure = "Saved invocation status unavailable: \(error)"
+    }
     return WorkspaceSnapshot(
       configuration: configuration, catalog: catalog,
       drafts: drafts, inspection: inspection, invocationStatus: invocationStatus,
-      failures: failures)
+      invocationStatusFailure: invocationStatusFailure, failures: failures)
   }
 
   func configure(_ value: MemoryConfiguration) throws {

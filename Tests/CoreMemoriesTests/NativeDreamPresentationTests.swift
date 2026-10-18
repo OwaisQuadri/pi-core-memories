@@ -11,9 +11,10 @@ private func nativeReportEvent(_ report: [String: Any]) throws -> Data {
 
 private func savedNativeReport(
   configuration: MemoryConfiguration, runID: String
-) throws {
+) throws -> URL {
   let root = try DreamStateDirectory.openRoot(URL(fileURLWithPath: configuration.diagnostics))
-  let invocation = try root.child(UUID().uuidString, isCreating: true)
+  let name = UUID().uuidString
+  let invocation = try root.child(name, isCreating: true)
   try invocation.installReviewFile(
     JSONSerialization.data(withJSONObject: [
       "requestedSettings": try JSONSerialization.jsonObject(
@@ -28,6 +29,7 @@ private func savedNativeReport(
     nativeReportEvent([
       "status": "pending", "reason": "staleUnpublishedPlans", "runID": runID,
     ]), name: "event-1.json")
+  return URL(fileURLWithPath: configuration.diagnostics).appendingPathComponent(name)
 }
 
 @Test @MainActor func nativeStaleReportSurvivesReloadWithoutClaimingCompletedProgress() async throws
@@ -48,7 +50,7 @@ private func savedNativeReport(
       selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
     reason: .staleUnpublishedPlans)
   let configuration = queueConfiguration(fixture)
-  try savedNativeReport(configuration: configuration, runID: pending.runID)
+  _ = try savedNativeReport(configuration: configuration, runID: pending.runID)
   let url = fixture.root.appendingPathComponent("profile/config.json")
   try configuration.save(to: url)
   let before = try fixture.snapshot(fixture.root)
@@ -78,7 +80,6 @@ private func savedNativeReport(
     try nativeReportEvent([
       "status": "pending", "reason": "staleUnpublishedPlans", "runID": pending.runID,
     ]))
-  try await model.shutdown()
   #expect(model.eventCoverage?.completedBytes == 0)
   #expect(model.queueCoverage?.segments?.undreamt == 28)
   #expect(try fixture.snapshot(fixture.root) == before)
@@ -88,6 +89,104 @@ private func savedNativeReport(
     try DreamInvocationStatus.read(
       configuration: otherProfile, inspection: DreamInspection.read(stateRoot: fixture.state))
       == nil)
+  let recoveryStore = try fixture.store()
+  _ = try transactionCompleted(
+    recoveryStore.confirmSavedRecovery(recoveryStore.previewSavedRecovery(runID: pending.runID)))
+  model.isDreamRunning = true
+  model.receive(try JSONSerialization.data(withJSONObject: ["phase": "modelCall"]))
+  await model.refresh()
+  #expect(model.dreamPhase == "Model working")
+  #expect(model.invocationStatus?.isPublicationBlocked == true)
+  model.isDreamRunning = false
+  await model.refresh()
+  #expect(model.inspection?.runs.first?.isCompleted == true)
+  #expect(model.invocationStatus == nil)
+  #expect(model.dreamPhase == "Idle")
+  #expect(model.dreamDetail.isEmpty)
+  try await model.shutdown()
+}
+
+@Test @MainActor
+func nativeLatestStatusSurvivesMoreThan256RetainedInvocationsWithoutReadingObsoletePayloads() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let (_, pending) = try savedRecoveryPendingAddition(fixture)
+  let configuration = queueConfiguration(fixture)
+  let diagnostics = URL(fileURLWithPath: configuration.diagnostics)
+  let root = try DreamStateDirectory.openRoot(diagnostics)
+  for _ in 0..<257 {
+    let name = UUID().uuidString
+    let old = try root.child(name, isCreating: true)
+    try old.installReviewFile(Data("obsolete invalid JSON".utf8), name: "request.json")
+    try FileManager.default.setAttributes(
+      [.modificationDate: Date(timeIntervalSince1970: 1)],
+      ofItemAtPath: diagnostics.appendingPathComponent(name).path)
+  }
+  _ = try savedNativeReport(configuration: configuration, runID: pending.runID)
+  var otherProfile = configuration
+  otherProfile.settings.modelID = "another profile"
+  let newer = try savedNativeReport(configuration: otherProfile, runID: pending.runID)
+  try FileManager.default.setAttributes(
+    [.modificationDate: Date().addingTimeInterval(10)], ofItemAtPath: newer.path)
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  #expect(throws: DreamRunError.limitExceeded) { try root.names(maximum: 256) }
+  #expect(try root.names(maximum: Int.max).count == 259)
+  let before = try fixture.snapshot(fixture.root)
+  let model = AppModel(configURL: url)
+  await model.load()
+  #expect(model.failure == nil)
+  #expect(model.invocationStatus?.runID == pending.runID)
+  #expect(model.invocationStatus?.isPublicationBlocked == true)
+  #expect(try fixture.snapshot(fixture.root) == before)
+  try await model.shutdown()
+}
+
+@Test func nativeStatusLookupDoesNotReadRequestsOutsideTheRecent256Invocations() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let configuration = queueConfiguration(fixture)
+  let diagnostics = URL(fileURLWithPath: configuration.diagnostics)
+  let root = try DreamStateDirectory.openRoot(diagnostics)
+  let name = UUID().uuidString
+  try root.child(name, isCreating: true).installReviewFile(
+    Data("obsolete invalid JSON".utf8), name: "request.json")
+  try FileManager.default.setAttributes(
+    [.modificationDate: Date(timeIntervalSince1970: 1)],
+    ofItemAtPath: diagnostics.appendingPathComponent(name).path)
+  var otherProfile = configuration
+  otherProfile.settings.modelID = "another profile"
+  for _ in 0..<256 {
+    _ = try savedNativeReport(configuration: otherProfile, runID: UUID().uuidString)
+  }
+  let before = try fixture.snapshot(diagnostics)
+  #expect(try DreamInvocationStatus.read(configuration: configuration, inspection: nil) == nil)
+  #expect(try fixture.snapshot(diagnostics) == before)
+}
+
+@Test @MainActor
+func nativeStatusReadFailureIsUnavailableRatherThanRetainingTheOldReport() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let (_, pending) = try savedRecoveryPendingAddition(fixture)
+  let configuration = queueConfiguration(fixture)
+  let invocation = try savedNativeReport(configuration: configuration, runID: pending.runID)
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  let model = AppModel(configURL: url)
+  await model.load()
+  #expect(model.invocationStatus?.isPublicationBlocked == true)
+  #expect(chmod(invocation.appendingPathComponent("request.json").path, 0o644) == 0)
+  await model.refresh()
+  #expect(model.invocationStatus == nil)
+  #expect(model.dreamPhase == "Status unavailable")
+  #expect(model.dreamDetail.contains("status unavailable"))
+  #expect(chmod(invocation.appendingPathComponent("request.json").path, 0o600) == 0)
+  await model.refresh()
+  #expect(model.invocationStatus?.isPublicationBlocked == true)
+  #expect(model.dreamPhase == "Publication blocked")
+  #expect(!model.dreamDetail.contains("status unavailable"))
+  try await model.shutdown()
 }
 
 @Test @MainActor

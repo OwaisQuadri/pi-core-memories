@@ -17,7 +17,9 @@ struct DreamsView: View {
           }
         }
         Text(statusTitle).font(.headline)
-        if !model.dreamDetail.isEmpty, model.invocationStatus?.isPublicationBlocked != true {
+        if !model.dreamDetail.isEmpty, model.invocationStatus?.isPublicationBlocked != true,
+          model.dreamPhase != "Status unavailable"
+        {
           Text(model.dreamDetail).textSelection(.enabled)
         }
         DreamQueueView(model: model)
@@ -27,6 +29,8 @@ struct DreamsView: View {
               Button("Prepare Saved Suggestions…") {
                 Task { await model.prepareSavedRecovery() }
               }.fixedSize()
+            } else if model.resumableRun != nil {
+              Button("Continue Saved Work") { model.run(.start) }.fixedSize()
             } else if model.invocationStatus?.reason == "invalidDecision" {
               Button("Replace Invalid Reply…") { model.isConfirmingReplacement = true }.fixedSize()
             } else if ["interruptedCall", "callInterrupted", "callbackFailure"].contains(
@@ -128,6 +132,7 @@ struct DreamsView: View {
       default: return status.title
       }
     }
+    if model.dreamPhase == "Status unavailable" { return model.dreamPhase }
     if let run = model.inspection?.runs.first, !run.isCompleted {
       return runTitle(run)
     }
@@ -137,7 +142,9 @@ struct DreamsView: View {
 
   private var details: some View {
     VStack(alignment: .leading, spacing: 12) {
-      if model.invocationStatus?.isPublicationBlocked == true {
+      if model.invocationStatus?.isPublicationBlocked == true
+        || model.dreamPhase == "Status unavailable"
+      {
         Text(model.dreamDetail).textSelection(.enabled)
       }
       LabeledContent(

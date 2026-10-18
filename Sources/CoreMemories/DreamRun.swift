@@ -1851,7 +1851,7 @@ final class DreamStateDirectory {
     }
   }
 
-  func names() throws -> [String] {
+  func names(maximum: Int = 10_000) throws -> [String] {
     let copy = openat(descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     guard copy >= 0 else { throw DreamRunError.persistenceFailure }
     guard let directory = fdopendir(copy) else {
@@ -1871,7 +1871,7 @@ final class DreamStateDirectory {
         String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self))
       }
       if name != ".", name != ".." { names.append(name) }
-      guard names.count <= 10_000 else { throw DreamRunError.limitExceeded }
+      guard names.count <= maximum else { throw DreamRunError.limitExceeded }
     }
     guard closedir(directory) == 0 else { throw DreamRunError.persistenceFailure }
     isClosed = true

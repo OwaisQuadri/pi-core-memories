@@ -62,13 +62,16 @@ package struct DreamInvocationStatus: Sendable {
     guard FileManager.default.fileExists(atPath: configuration.diagnostics) else { return nil }
     let root = try DreamStateDirectory.openRoot(
       URL(fileURLWithPath: configuration.diagnostics), isCreating: false)
-    let names = try root.names()
-    guard names.count <= 256 else { throw DreamRunError.limitExceeded }
+    let invocations = try root.names(maximum: Int.max).filter { UUID(uuidString: $0) != nil }.map {
+      (name: $0, date: try root.modificationDate($0, isDirectory: true))
+    }.sorted {
+      if $0.date != $1.date { return $0.date > $1.date }
+      return $0.name < $1.name
+    }
     let settings = try DreamRunEncoding.encode(configuration.settings)
     let roots = try configuration.roots.map { try DreamRunEncoding.encode($0) } ?? Data("null".utf8)
-    var latest: (DreamStateDirectory, Date)?
-    for name in names where UUID(uuidString: name) != nil {
-      let invocation = try root.child(name)
+    for candidate in invocations.prefix(256) {
+      let invocation = try root.child(candidate.name)
       let requestBytes = try invocation.read("request.json", maximum: 262_144)
       guard let saved = try JSONSerialization.jsonObject(with: requestBytes) as? [String: Any],
         let requested = saved["requestedSettings"],
@@ -80,28 +83,26 @@ package struct DreamInvocationStatus: Sendable {
         (request["deviceKey"] as? String) == configuration.deviceKey,
         (request["projectBindings"] as? [String: String] ?? [:]) == configuration.projectBindings
       else { continue }
-      let date = try invocation.modificationDate("request.json")
-      if latest == nil || date > latest!.1 { latest = (invocation, date) }
-    }
-    guard let (invocation, _) = latest else { return nil }
-    let events = try invocation.names().compactMap { name -> (String, Int)? in
-      guard name.hasPrefix("event-"), name.hasSuffix(".json"),
-        let number = Int(name.dropFirst(6).dropLast(5)), (1...10_000).contains(number)
+      let events = try invocation.names().compactMap { name -> (String, Int)? in
+        guard name.hasPrefix("event-"), name.hasSuffix(".json"),
+          let number = Int(name.dropFirst(6).dropLast(5)), (1...10_000).contains(number)
+        else { return nil }
+        return (name, number)
+      }
+      guard let last = events.max(by: { $0.1 < $1.1 }) else { return nil }
+      let bytes = try invocation.read(last.0, maximum: 1_048_576)
+      guard let event = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+        event["event"] as? String == "report", let report = event["report"] as? [String: Any],
+        let status = Self(report: report, observedAt: try invocation.modificationDate(last.0))
       else { return nil }
-      return (name, number)
+      if let id = status.runID {
+        guard let run = inspection?.runs.first(where: { $0.id == id }),
+          run.isCompleted == (status.status == "completed")
+        else { return nil }
+      }
+      return status
     }
-    guard let last = events.max(by: { $0.1 < $1.1 }) else { return nil }
-    let bytes = try invocation.read(last.0, maximum: 1_048_576)
-    guard let event = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-      event["event"] as? String == "report", let report = event["report"] as? [String: Any],
-      let status = Self(report: report, observedAt: try invocation.modificationDate(last.0))
-    else { return nil }
-    if let id = status.runID {
-      guard let run = inspection?.runs.first(where: { $0.id == id }),
-        run.isCompleted == (status.status == "completed")
-      else { return nil }
-    }
-    return status
+    return nil
   }
 
   private static func canonicalJSON(_ value: Any) throws -> Data {
@@ -110,12 +111,12 @@ package struct DreamInvocationStatus: Sendable {
 }
 
 extension DreamStateDirectory {
-  fileprivate func modificationDate(_ name: String) throws -> Date {
+  fileprivate func modificationDate(_ name: String, isDirectory: Bool = false) throws -> Date {
     var status = stat()
     guard fstatat(descriptor, name, &status, AT_SYMLINK_NOFOLLOW) == 0 else {
       throw DreamRunError.unsafeState
     }
-    try DreamRunStore.validateStateIdentity(status, isDirectory: false)
+    try DreamRunStore.validateStateIdentity(status, isDirectory: isDirectory)
     return Date(
       timeIntervalSince1970: TimeInterval(status.st_mtimespec.tv_sec)
         + TimeInterval(status.st_mtimespec.tv_nsec) / 1_000_000_000)

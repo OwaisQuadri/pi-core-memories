@@ -104,10 +104,17 @@ import Foundation
     reloadQueue()
   }
 
-  var savedRecoveryRunID: String? {
+  var resumableRun: SavedDreamRun? {
     inspection?.runs.first(where: {
       !$0.isCompleted && $0.attempts.last?.status == "Reply valid"
-    })?.id
+    })
+  }
+
+  var savedRecoveryRunID: String? {
+    guard let run = resumableRun, let base = catalog?.base,
+      let approvedBase = run.approvedBase, approvedBase != base,
+      let count = run.attempts.last?.suggestionCount, count > 0 else { return nil }
+    return run.id
   }
 
   func prepareSavedRecovery() async {
@@ -176,8 +183,16 @@ import Foundation
     catalog = snapshot.catalog
     inspection = snapshot.inspection
     if !isDreamRunning {
-      if let status = snapshot.invocationStatus {
+      if let unavailable = snapshot.invocationStatusFailure {
+        invocationStatus = nil
+        dreamPhase = "Status unavailable"
+        dreamDetail = unavailable
+      } else if let status = snapshot.invocationStatus {
         applyStatus(status)
+      } else if invocationStatus != nil || dreamPhase == "Status unavailable" {
+        invocationStatus = nil
+        dreamPhase = "Idle"
+        dreamDetail = ""
       }
     }
     drafts = snapshot.drafts

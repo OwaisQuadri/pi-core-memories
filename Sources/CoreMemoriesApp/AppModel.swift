@@ -360,12 +360,12 @@ import Foundation
     await autosaveTask?.value
     do {
       try await persistEditor()
-      let receipt = try await workspace.save()
+      _ = try await workspace.save()
       operations = []
       persistedEditRevision = editRevision
       draft = nil
       isEditing = false
-      message = "Saved one commit · \(receipt.commit)"
+      message = "Saved changes in one commit"
       await refreshSnapshot()
     } catch { failure = String(describing: error) }
   }
@@ -505,8 +505,8 @@ import Foundation
     preview = nil
     await pauseQueue()
     do {
-      let receipt = try await workspace.approve(shown)
-      message = "Approved entry · \(receipt.commit)"
+      _ = try await workspace.approve(shown)
+      message = "Saved into memory"
       await reloadCandidates()
       await refreshSnapshot()
     } catch { failure = String(describing: error) }

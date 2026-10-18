@@ -79,6 +79,34 @@ func nativeSavedRecoveryRequiresConfirmationRefreshesReviewAndPreservesDraft() a
   try await model.shutdown()
 }
 
+@Test @MainActor
+func nativeSaveFeedbackDoesNotExposeCommitIdentifiers() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  _ = try savedRecoveryPendingAddition(fixture)
+  let configuration = queueConfiguration(fixture)
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  let model = AppModel(configURL: url, autosaveDelay: .seconds(3600))
+  await model.load()
+  await model.prepareSavedRecovery()
+  await model.confirmSavedRecovery()
+  await model.prepareCheckout()
+  await model.detach()
+  await model.showPreview(try #require(model.actionableCandidates.first))
+  await model.approve()
+  #expect(model.failure == nil)
+  #expect(model.message == "Saved into memory")
+  model.add()
+  model.editorText = "Keep feedback clear. [source: fixture; added: 2026-10-18]"
+  model.editorReason = "Keep this synthetic edit"
+  model.editorChanged()
+  await model.save()
+  #expect(model.failure == nil)
+  #expect(model.message == "Saved changes in one commit")
+  try await model.shutdown()
+}
+
 @Test(arguments: [false, true], [false, true]) @MainActor
 func nativeSavedReplyOffersRecoveryOnlyForChangedBaseSuggestions(
   isNotesOnly: Bool, isBaseChanged: Bool

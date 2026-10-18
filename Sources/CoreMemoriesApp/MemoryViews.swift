@@ -33,7 +33,8 @@ struct MemoriesView: View {
                 model.edit(entry)
               } label: {
                 VStack(alignment: .leading, spacing: 5) {
-                  Text(entry.expected).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
+                  Text((try? MemoryDocument.editableEntry(Data(entry.expected.utf8))) ?? entry.expected)
+                    .lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
                   Text(
                     MemoryScopeConfiguration.label(
                       path: entry.path, deviceKey: model.configuration.deviceKey)
@@ -107,11 +108,11 @@ struct ChangesView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 16) {
       HStack {
-        Text("Draft Changes").font(.title2.bold())
+        Text("Your Changes").font(.title2.bold())
         Spacer()
         Button("Discard Draft…", role: .destructive) { model.isConfirmingDiscard = true }.disabled(
           model.draft == nil)
-        Button("Save One Commit") { Task { await model.save() } }.disabled(
+        Button("Save Changes") { Task { await model.save() } }.disabled(
           model.operations.isEmpty || model.isBusy)
       }
       if let draft = model.draft {
@@ -160,34 +161,41 @@ struct ReviewView: View {
   @ObservedObject var model: AppModel
   var body: some View {
     HSplitView {
-      List {
-        ForEach(model.candidates, id: \.change.id) { candidate in
-          VStack(alignment: .leading, spacing: 8) {
-            Text(String(decoding: candidate.change.after, as: UTF8.self)).lineLimit(4)
-            Text(
-              "\(candidate.disposition.rawValue.capitalized) · \(MemoryScopeConfiguration.label(path: candidate.change.path, deviceKey: model.configuration.deviceKey))"
-            )
-            .font(.caption).foregroundStyle(.secondary)
-            if let limitation = candidate.limitation {
-              Text(limitation).font(.caption).foregroundStyle(.orange)
+      VStack(spacing: 0) {
+        Picker("Candidates", selection: $model.isShowingReviewedCandidates) {
+          Text("To Review (\(model.actionableCandidates.count))").tag(false)
+          Text("Reviewed (\(model.reviewedCandidates.count))").tag(true)
+        }.pickerStyle(.segmented).padding(12)
+        List {
+          if model.isShowingReviewedCandidates {
+            ForEach(model.reviewedCandidates, id: \.change.id) { candidate in
+              candidateRow(candidate)
             }
-            HStack {
-              Button("Preview") { Task { await model.showPreview(candidate) } }
-              Button("Defer") { Task { await model.disposition(candidate, isRejected: false) } }
-              Button("Reject", role: .destructive) {
-                Task { await model.disposition(candidate, isRejected: true) }
+            if model.reviewedCandidates.isEmpty { Text("No reviewed candidates") }
+          } else {
+            if model.isReviewLoading {
+              ProgressView("Loading suggestions…")
+            } else if model.actionableCandidates.isEmpty { Text(model.reviewEmptyMessage) }
+            ForEach(model.actionableCandidates, id: \.change.id) { candidate in
+              candidateRow(candidate)
+            }
+            if !model.blockedCandidates.isEmpty {
+              Section("Blocked (\(model.blockedCandidates.count))") {
+                ForEach(model.blockedCandidates, id: \.change.id) { candidate in
+                  candidateRow(candidate)
+                }
               }
-            }.disabled(![.pending, .deferred].contains(candidate.disposition))
-          }.padding(.vertical, 8)
+            }
+          }
         }
-      }.frame(minWidth: 300, idealWidth: 360)
+      }.frame(minWidth: 300, idealWidth: 390)
       VStack(alignment: .leading, spacing: 12) {
         if let preview = model.preview {
           HStack {
-            Text("Current Preview").font(.title2.bold())
+            Text("Review Suggestion").font(.title2.bold())
             Spacer()
             Button("Back") { model.preview = nil }.keyboardShortcut(.cancelAction)
-            Button("Approve This Entry") { Task { await model.approve() } }
+            Button("Save into Memory") { Task { await model.approve() } }
           }
           Text("Base · \(preview.currentBase)").font(.system(.caption, design: .monospaced))
             .textSelection(.enabled)
@@ -201,10 +209,48 @@ struct ReviewView: View {
               + preview.change.sources.map { $0.exactText }.joined(separator: "\n\n")
               + "\n\nCONTRADICTIONS\n" + String(describing: preview.change.contradictions))
         } else {
-          Text("Select a candidate for a fresh preview").foregroundStyle(.secondary).frame(
-            maxWidth: .infinity, maxHeight: .infinity)
+          VStack(alignment: .leading, spacing: 12) {
+            Text(model.reviewEmptyMessage)
+              .foregroundStyle(.secondary)
+            if model.invocationStatus?.isPublicationBlocked == true {
+              Text(model.invocationStatus?.explanation ?? "")
+              Button("Show Blocked Dream") { model.section = "Dreams" }
+            }
+          }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
       }.padding(20).frame(minWidth: 400)
     }.task { await model.loadCandidates() }
+      .onChange(of: model.isShowingReviewedCandidates) { _ in model.preview = nil }
+  }
+
+  private func dispositionTitle(_ disposition: MemoryReviewDisposition) -> String {
+    switch disposition {
+    case .pending: "To review"
+    case .deferred: "Decide later"
+    case .approved: "Saved into memory"
+    case .rejected: "Dismissed"
+    case .blocked: "Blocked"
+    }
+  }
+
+  private func candidateRow(_ candidate: MemoryReviewCandidate) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text((try? MemoryDocument.editableEntry(candidate.change.after))
+        ?? String(decoding: candidate.change.after, as: UTF8.self)).lineLimit(4)
+      Text(
+        "\(dispositionTitle(candidate.disposition)) · \(MemoryScopeConfiguration.label(path: candidate.change.path, deviceKey: model.configuration.deviceKey))"
+      )
+      .font(.caption).foregroundStyle(.secondary)
+      if let limitation = candidate.limitation {
+        Text(limitation).font(.caption).foregroundStyle(.orange)
+      }
+      HStack {
+        Button("Review Suggestion") { Task { await model.showPreview(candidate) } }
+        Button("Decide Later") { Task { await model.disposition(candidate, isRejected: false) } }
+        Button("Dismiss", role: .destructive) {
+          Task { await model.disposition(candidate, isRejected: true) }
+        }
+      }.disabled(![.pending, .deferred].contains(candidate.disposition))
+    }.padding(.vertical, 8)
   }
 }

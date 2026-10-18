@@ -106,7 +106,9 @@ package struct MemoryConfiguration: Codable, Sendable {
     try reviewSources(stateRoot: stateURL, memoryRepository: memoryURL)
   }
 
-  package func reviewSources(stateRoot: URL, memoryRepository: URL) throws -> DreamRunStore {
+  package func reviewSources(
+    stateRoot: URL, memoryRepository: URL, isReadOnly: Bool = false
+  ) throws -> DreamRunStore {
     let root = try DreamStateDirectory.openRoot(stateRoot, isCreating: false)
     let bytes = try root.read("root.json", maximum: 1_048_576)
     guard let saved = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
@@ -131,7 +133,7 @@ package struct MemoryConfiguration: Codable, Sendable {
           URL(fileURLWithPath: $0)
         },
         globalAgents: roots.globalAgents.map { URL(fileURLWithPath: $0) }, deviceKey: deviceKey,
-        projectBindings: projectBindings)
+        projectBindings: projectBindings, isReadOnly: isReadOnly)
     }
     let sessionRoot = URL(fileURLWithPath: original[0])
     let managedSnippets = sessionRoot.deletingLastPathComponent()
@@ -149,7 +151,7 @@ package struct MemoryConfiguration: Codable, Sendable {
       memoryRepository: URL(fileURLWithPath: original[1]),
       strippingRoots: strippingRoots,
       globalAgents: (saved["globalAgents"] as? String).map { URL(fileURLWithPath: $0) },
-      deviceKey: deviceKey, projectBindings: projectBindings)
+      deviceKey: deviceKey, projectBindings: projectBindings, isReadOnly: isReadOnly)
   }
 
   package func validate() throws {

@@ -18,6 +18,18 @@ import Foundation
   @Published var isDreamRunning = false
   @Published var dreamPhase = "Idle"
   @Published var dreamDetail = ""
+  @Published var queueSnapshot: DreamQueueSnapshot?
+  @Published var isQueueLoading = false
+  @Published var isReviewLoading = false
+  @Published var reviewFailure: String?
+  private var queueTask: Task<Void, Never>?
+  private var queueRevision: UInt64 = 0
+  @Published var eventCoverage: DreamQueueCoverage?
+  @Published var coverageObservedAt: Date?
+  @Published var invocationStatus: DreamInvocationStatus?
+  @Published var isShowingReviewedCandidates = false
+  private var isReviewLoaded = false
+  private var reviewRevision: UInt64 = 0
   private var terminalPhase: String?
   private var isCancellingDream = false
   @Published var resolvedSelection = "Not resolved"
@@ -72,18 +84,48 @@ import Foundation
       isLoaded = true
       isBusy = false
       if section == "Review" { await loadCandidates() }
+      reloadQueue()
     } catch { failure = String(describing: error) }
   }
 
   func refresh() async {
     guard isLoaded else { return }
     apply(await workspace.refresh())
+    if isReviewLoaded || section == "Review" { await loadCandidates() }
+    reloadQueue()
+  }
+
+  private func pauseQueue() async {
+    queueTask?.cancel()
+    await queueTask?.value
+  }
+
+  private func reloadQueue() {
+    queueTask?.cancel()
+    queueRevision &+= 1
+    let revision = queueRevision
+    let configuration = configuration
+    isQueueLoading = true
+    let scan = Task.detached { DreamQueueSnapshot.read(configuration: configuration) }
+    queueTask = Task {
+      let snapshot = await withTaskCancellationHandler {
+        await scan.value
+      } onCancel: { scan.cancel() }
+      guard revision == queueRevision else { return }
+      isQueueLoading = false
+      if !Task.isCancelled { queueSnapshot = snapshot }
+    }
   }
 
   private func apply(_ snapshot: WorkspaceSnapshot) {
     configuration = snapshot.configuration
     catalog = snapshot.catalog
     inspection = snapshot.inspection
+    if !isDreamRunning {
+      if let status = snapshot.invocationStatus {
+        applyStatus(status)
+      }
+    }
     drafts = snapshot.drafts
     if draft == nil, !isDraftDirty, operations.isEmpty, let recovered = drafts.last {
       draft = recovered
@@ -315,14 +357,67 @@ import Foundation
 
   func loadCandidates() async {
     guard isLoaded else { return }
+    isReviewLoaded = true
+    isReviewLoading = true
+    reviewFailure = nil
+    defer { isReviewLoading = false }
+    await pauseQueue()
+    reviewRevision &+= 1
+    preview = nil
     do { candidates = try await workspace.candidates() } catch {
-      failure = String(describing: error)
+      candidates = []
+      reviewFailure = String(describing: error)
+      failure = reviewFailure
     }
+  }
+
+  var reviewEmptyMessage: String {
+    if isReviewLoading { return "Loading suggestions…" }
+    if reviewFailure != nil { return "Suggestions unavailable. Refresh to try again." }
+    return actionableCandidates.isEmpty
+      ? "No candidates await review"
+      : "Choose Review Suggestion to check a change before saving it into memory"
+  }
+
+  var reviewActionTitle: String {
+    isReviewLoaded && reviewFailure == nil
+      ? "Review Suggestions (\(actionableCandidates.count))" : "Review Suggestions"
+  }
+
+  var actionableCandidates: [MemoryReviewCandidate] {
+    candidates.filter { [.pending, .deferred].contains($0.disposition) }
+  }
+
+  var blockedCandidates: [MemoryReviewCandidate] {
+    candidates.filter { $0.disposition == .blocked }
+  }
+
+  var reviewedCandidates: [MemoryReviewCandidate] {
+    candidates.filter { [.approved, .rejected].contains($0.disposition) }
+  }
+
+  var queueCoverage: DreamQueueCoverage? {
+    if let eventCoverage, eventCoverage.segments != nil,
+      coverageObservedAt.map({ $0 > (queueSnapshot?.observedAt ?? .distantPast) }) == true
+    { return eventCoverage }
+    return queueSnapshot?.coverage ?? eventCoverage
+  }
+
+  var queueObservedAt: Date? {
+    if let eventCoverage, eventCoverage.segments != nil,
+      coverageObservedAt.map({ $0 > (queueSnapshot?.observedAt ?? .distantPast) }) == true
+    { return coverageObservedAt }
+    return queueSnapshot?.coverage == nil ? coverageObservedAt : queueSnapshot?.observedAt
   }
 
   func showPreview(_ candidate: MemoryReviewCandidate) async {
     preview = nil
-    do { preview = try await workspace.preview(candidate.change.id) } catch {
+    await pauseQueue()
+    let revision = reviewRevision
+    do {
+      let fresh = try await workspace.preview(candidate.change.id)
+      if reviewRevision == revision, !isShowingReviewedCandidates { preview = fresh }
+    } catch {
       failure = String(describing: error)
     }
   }
@@ -330,6 +425,7 @@ import Foundation
   func approve() async {
     guard let shown = preview else { return }
     preview = nil
+    await pauseQueue()
     do {
       let receipt = try await workspace.approve(shown)
       message = "Approved entry · \(receipt.commit)"
@@ -340,6 +436,7 @@ import Foundation
 
   func disposition(_ candidate: MemoryReviewCandidate, isRejected: Bool) async {
     preview = nil
+    await pauseQueue()
     do {
       try await workspace.disposition(candidate.change.id, isRejected: isRejected)
       await loadCandidates()
@@ -382,6 +479,9 @@ import Foundation
     isDreamRunning = true
     dreamPhase = "Starting"
     dreamDetail = ""
+    invocationStatus = nil
+    eventCoverage = nil
+    coverageObservedAt = nil
     terminalPhase = nil
     isCancellingDream = false
     dreamEvents = []
@@ -390,6 +490,7 @@ import Foundation
     self.control = control
     let config = configuration
     dreamTask = Task {
+      await pauseQueue()
       let events = AsyncStream<Data>.makeStream()
       let consumer = Task {
         for await bytes in events.stream { receive(bytes) }
@@ -403,7 +504,7 @@ import Foundation
             projectBindings: config.projectBindings, onEvent: { events.continuation.yield($0) })
         }.value
         await consumer.value
-        dreamPhase = terminalPhase ?? "Finished"
+        dreamPhase = terminalPhase ?? "Invocation ended; completion not established"
       } catch {
         await consumer.value
         dreamPhase = isCancellingDream ? "Cancelled" : "Stopped"
@@ -415,7 +516,7 @@ import Foundation
     }
   }
 
-  private func receive(_ bytes: Data) {
+  func receive(_ bytes: Data) {
     guard let event = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else {
       return
     }
@@ -423,20 +524,44 @@ import Foundation
       resolvedSelection = [selection["provider"], selection["modelID"], selection["thinkingLevel"]]
         .map { $0 as? String ?? "unknown" }.joined(separator: " / ")
     }
-    if let phase = event["phase"] as? String { dreamPhase = phase }
+    if let phase = event["phase"] as? String {
+      switch phase {
+      case "modelCall": dreamPhase = "Model working"
+      case "planning": dreamPhase = "Preparing batch"
+      case "saving": dreamPhase = "Saving inference"
+      default: dreamPhase = phase
+      }
+    }
+    if event["event"] as? String == "progress", let coverage = event["coverage"] as? [String: Any] {
+      do {
+        eventCoverage = try DreamQueueCoverage(json: coverage)
+        coverageObservedAt = Date()
+      } catch {
+        eventCoverage = nil
+        dreamDetail = "Invalid queue progress received; showing the last read-only snapshot."
+      }
+    }
     if event["event"] as? String == "report", let report = event["report"] as? [String: Any],
       let status = report["status"] as? String
     {
+      if let saved = DreamInvocationStatus(report: report) {
+        applyStatus(saved)
+      }
       terminalPhase =
         isCancellingDream && report["reason"] as? String == "callInterrupted"
-        ? "Cancelled" : status == "noNewRecords" ? "No new records" : status.capitalized
-      dreamDetail = report["detail"] as? String ?? report["reason"] as? String ?? ""
+        ? "Cancelled" : invocationStatus?.title ?? status.capitalized
     }
     let formatted =
       (try? JSONSerialization.data(withJSONObject: event, options: [.sortedKeys, .prettyPrinted]))
       ?? bytes
     dreamEvents.append(String(decoding: formatted, as: UTF8.self))
     if dreamEvents.count > 200 { dreamEvents.removeFirst() }
+  }
+
+  private func applyStatus(_ status: DreamInvocationStatus) {
+    invocationStatus = status
+    dreamPhase = status.title
+    dreamDetail = status.explanation
   }
 
   func cancelDream() {
@@ -453,8 +578,17 @@ import Foundation
       }
       var value = configuration
       if isSettingUpDevice { value.setupDevice() }
+      await pauseQueue()
       try await workspace.configure(value)
       configuration = value
+      queueSnapshot = nil
+      candidates = []
+      preview = nil
+      invocationStatus = nil
+      eventCoverage = nil
+      coverageObservedAt = nil
+      dreamPhase = "Idle"
+      dreamDetail = ""
       message = "Settings saved"
       await refresh()
     } catch { failure = String(describing: error) }
@@ -474,6 +608,8 @@ import Foundation
       if isDraftDirty { try await persistEditor() }
       control?.cancel()
       await dreamTask?.value
+      queueTask?.cancel()
+      await queueTask?.value
     }
     shutdownTask = task
     defer {

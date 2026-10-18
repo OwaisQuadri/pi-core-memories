@@ -6,6 +6,7 @@ struct WorkspaceSnapshot: Sendable {
   let catalog: MemoryManagementResult?
   let drafts: [MemoryDraft]
   let inspection: DreamInspection?
+  let invocationStatus: DreamInvocationStatus?
   let failures: [String]
 }
 
@@ -42,9 +43,12 @@ actor Workspace {
         if currentDraft == nil { currentDraft = drafts.last }
       } catch { failures.append(String(describing: error)) }
     }
+    let invocationStatus = try? DreamInvocationStatus.read(
+      configuration: configuration, inspection: inspection)
     return WorkspaceSnapshot(
       configuration: configuration, catalog: catalog,
-      drafts: drafts, inspection: inspection, failures: failures)
+      drafts: drafts, inspection: inspection, invocationStatus: invocationStatus,
+      failures: failures)
   }
 
   func configure(_ value: MemoryConfiguration) throws {

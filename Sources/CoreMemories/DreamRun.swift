@@ -249,11 +249,23 @@ public final class DreamRunStore {
       && parts[5...8].joined(separator: "/") == "pi/extensions/prompt-snippets/snippets"
   }
 
-  public init(
+  public convenience init(
     stateRoot: URL, sessionsRoot: URL, memoryRepository: URL, strippingRoots: [URL],
     globalAgents: URL? = nil, deviceKey: String? = nil, projectBindings: [String: String] = [:],
     limits: DreamRunLimits = try! DreamRunLimits(),
     isCancelled: @escaping @Sendable () -> Bool = { false }
+  ) throws {
+    try self.init(
+      stateRoot: stateRoot, sessionsRoot: sessionsRoot, memoryRepository: memoryRepository,
+      strippingRoots: strippingRoots, globalAgents: globalAgents, deviceKey: deviceKey,
+      projectBindings: projectBindings, limits: limits, isCancelled: isCancelled, isReadOnly: false)
+  }
+
+  package init(
+    stateRoot: URL, sessionsRoot: URL, memoryRepository: URL, strippingRoots: [URL],
+    globalAgents: URL? = nil, deviceKey: String? = nil, projectBindings: [String: String] = [:],
+    limits: DreamRunLimits = try! DreamRunLimits(),
+    isCancelled: @escaping @Sendable () -> Bool = { false }, isReadOnly: Bool
   ) throws {
     try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     self.deviceKey = deviceKey
@@ -288,7 +300,7 @@ public final class DreamRunStore {
     if isEstablished,
       FileManager.default.fileExists(atPath: state.appendingPathComponent("root.json").path)
     {
-      let directory = try DreamStateDirectory.openRoot(state)
+      let directory = try DreamStateDirectory.openRoot(state, isCreating: !isReadOnly)
       let bytes = try directory.read("root.json", maximum: DreamRunEncoding.maximumMetadataBytes)
       let binding = try DreamRunEncoding.decode(RootBinding.self, bytes: bytes)
       let accepted = [binding.sessions, binding.memory] + binding.stripping
@@ -347,7 +359,7 @@ public final class DreamRunStore {
     self.suppliedRoots = suppliedRoots
     self.memoryRepository = sources[1]
     self.globalAgents = globalAgents
-    root = try storedDirectory ?? DreamStateDirectory.openRoot(state)
+    root = try storedDirectory ?? DreamStateDirectory.openRoot(state, isCreating: !isReadOnly)
     reviewStateURL = state
     self.limits = limits
     self.isCancelled = isCancelled
@@ -413,6 +425,39 @@ public final class DreamRunStore {
     } catch DreamRunError.busy { throw DreamRunError.busy } catch {
       throw DreamRunError.nativeReviewLimitation("saved completion verification failed: \(error)")
     }
+  }
+
+  package func inspectQueue(
+    isSnippetsPresent: Bool, isPromptsPresent: Bool, date: Date = Date()
+  ) throws -> DreamQueueCoverage {
+    guard operationLock.try() else { throw DreamRunError.busy }
+    defer { operationLock.unlock() }
+    let lock = try root.openReadLock()
+    defer {
+      _ = flock(lock, LOCK_UN)
+      _ = close(lock)
+    }
+    guard flock(lock, LOCK_SH | LOCK_NB) == 0 else { throw DreamRunError.busy }
+    try root.verifyLock(lock)
+    _ = try root.retainedBytes(maximum: limits.maximumStateBytes)
+    _ = try reviewSourceBinding()
+    let progress = try loadChain().record.progress.domain()
+    let sources = acceptedSources
+    guard sources.stripping.count == (isSnippetsPresent ? 1 : 0) + (isPromptsPresent ? 1 : 0)
+    else { throw DreamRunError.unsafeState }
+    var backlog: DreamBacklog?
+    let batch = try SessionReader(
+      sessions: sources.sessions, snippets: isSnippetsPresent ? sources.stripping[0] : nil,
+      prompts: isPromptsPresent ? sources.stripping[isSnippetsPresent ? 1 : 0] : nil
+    ).prepare(
+      progress: progress, limits: DreamInputLimits(),
+      modifiedAfter: date.addingTimeInterval(-SessionReader.dreamWindow),
+      backlog: { backlog = $0 }, isCancelled: { Task.isCancelled })
+    guard let backlog else { throw DreamRunError.missingPayload }
+    return try DreamQueueCoverage(
+      backlogBytes: backlog.backlogBytes, backlogLimitBytes: SessionReader.dreamBacklogBytes,
+      undreamtBytes: backlog.undreamtBytes, nextBytes: backlog.nextBytes,
+      plannedBytes: UInt64(batch.keptBytes), completedBytes: 0)
   }
 
   public func run(

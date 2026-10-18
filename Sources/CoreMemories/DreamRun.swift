@@ -228,7 +228,7 @@ public final class DreamRunStore {
     return Darwin.renameatx_np(directory, temporary, directory, name, UInt32(RENAME_EXCL))
   }
 
-  private static func isManagedSnippets(_ path: String, state: URL, sessions: URL) -> Bool {
+  static func isManagedSnippets(_ path: String, state: URL, sessions: URL) -> Bool {
     let logical = sessions.deletingLastPathComponent()
       .appendingPathComponent("extensions/prompt-snippets/snippets").path
     if path == logical { return true }

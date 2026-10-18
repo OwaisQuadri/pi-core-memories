@@ -133,10 +133,21 @@ package struct MemoryConfiguration: Codable, Sendable {
         globalAgents: roots.globalAgents.map { URL(fileURLWithPath: $0) }, deviceKey: deviceKey,
         projectBindings: projectBindings)
     }
+    let sessionRoot = URL(fileURLWithPath: original[0])
+    let managedSnippets = sessionRoot.deletingLastPathComponent()
+      .appendingPathComponent("extensions/prompt-snippets/snippets")
+    let strippingRoots = original.dropFirst(2).map { path in
+      if DreamRunStore.isManagedSnippets(path, state: stateRoot, sessions: sessionRoot),
+        FileManager.default.fileExists(atPath: managedSnippets.path)
+      {
+        return managedSnippets
+      }
+      return URL(fileURLWithPath: path)
+    }
     return try DreamRunStore(
-      stateRoot: stateRoot, sessionsRoot: URL(fileURLWithPath: original[0]),
+      stateRoot: stateRoot, sessionsRoot: sessionRoot,
       memoryRepository: URL(fileURLWithPath: original[1]),
-      strippingRoots: original.dropFirst(2).map { URL(fileURLWithPath: $0) },
+      strippingRoots: strippingRoots,
       globalAgents: (saved["globalAgents"] as? String).map { URL(fileURLWithPath: $0) },
       deviceKey: deviceKey, projectBindings: projectBindings)
   }

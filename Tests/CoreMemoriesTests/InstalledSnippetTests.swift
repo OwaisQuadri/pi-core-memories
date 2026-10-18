@@ -68,9 +68,14 @@ func installerReplacementPreservesDreamGenerationAndReviewDecisions(isStable: Bo
   }
   #expect(generation == 1)
   #expect(try fixture.snapshot(state) == dreamBefore)
-  let reviewReopened = try MemoryReviewController(
-    repository: fixture.memory, stateRoot: reviewState, sources: reopened, environment: [:])
-  #expect(try reviewReopened.list().first?.disposition == .deferred)
+  var configuration = MemoryConfiguration.defaults
+  configuration.deviceKey = String(repeating: "d", count: 64)
+  let configuredSources = try configuration.reviewSources(
+    stateRoot: state, memoryRepository: fixture.memory)
+  #expect(configuredSources.acceptedSources.stripping.map(\.path) == [current.path])
+  let configuredReview = try MemoryReviewController(
+    repository: fixture.memory, stateRoot: reviewState, sources: configuredSources, environment: [:])
+  #expect(try configuredReview.list().first?.disposition == .deferred)
   #expect(try fixture.snapshot(reviewState) == reviewBefore)
   #expect(try fixture.snapshot(fixture.memory) == memoryBefore)
   try FileManager.default.removeItem(at: logical)
@@ -79,6 +84,9 @@ func installerReplacementPreservesDreamGenerationAndReviewDecisions(isStable: Bo
     try DreamRunStore(
       stateRoot: state, sessionsRoot: fixture.sessions, memoryRepository: fixture.memory,
       strippingRoots: [logical])
+  }
+  #expect(throws: DreamRunError.unsafeState) {
+    try configuration.reviewSources(stateRoot: state, memoryRepository: fixture.memory)
   }
   #expect(try fixture.snapshot(state) == dreamBefore)
   #expect(try fixture.snapshot(reviewState) == reviewBefore)

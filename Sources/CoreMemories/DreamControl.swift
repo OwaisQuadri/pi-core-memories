@@ -153,11 +153,11 @@ package final class DreamControl: @unchecked Sendable {
     let invocation = try journal.child(invocationID.uuidString, isCreating: true)
     var request: [String: Any] = [
       "operation": operation.rawValue,
+      "projectBindings": projectBindings,
       "roots": try roots.map { try JSONSerialization.jsonObject(with: DreamRunEncoding.encode($0)) }
         ?? NSNull(),
     ]
     if let deviceKey { request["deviceKey"] = deviceKey }
-    if !projectBindings.isEmpty { request["projectBindings"] = projectBindings }
     try invocation.installReviewFile(
       JSONSerialization.data(
         withJSONObject: [

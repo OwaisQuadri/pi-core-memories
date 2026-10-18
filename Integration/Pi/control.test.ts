@@ -10,7 +10,7 @@ const selection: DreamSelection = { provider: "fixture", modelID: "chosen", thin
 const report: DreamReport = { version: 1, type: "final", invocationID: "fixture", status: "noNewRecords", generation: "0", runID: null, base: null, proposals: [], notes: [], isBacklog: false, isRecovered: false, reason: null, detail: null, unfinishedTails: 0 };
 const json = (operation = "start", chosenRoots: DreamRoots | null = roots) => JSON.stringify({ operation, roots: chosenRoots });
 
-function fixture(run: typeof runDreamWorker, call: typeof callDreamModel = async () => assert.fail("No model call expected")) {
+function fixture(run: typeof runDreamWorker, call: typeof callDreamModel = async () => assert.fail("No model call expected"), scopeFor: Parameters<typeof registerDreamControl>[4] = async () => ({})) {
 	const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	const events = new Map<string, () => Promise<void>>();
 	const notices: Record<string, unknown>[] = [];
@@ -18,7 +18,7 @@ function fixture(run: typeof runDreamWorker, call: typeof callDreamModel = async
 	let rootCalls = 0;
 	const pi = { registerCommand: (name: string, value: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) => commands.set(name, value), on: (name: string, value: () => Promise<void>) => events.set(name, value), getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
 	const ctx = { mode: "rpc", cwd: "/work", model: { provider: selection.provider, id: selection.modelID, contextWindow: 262_144 }, thinkingLevel: selection.thinkingLevel, waitForIdle: async () => { idle++; }, ui: { notify: (text: string) => notices.push(JSON.parse(text)) } } as unknown as ExtensionCommandContext;
-	const abort = registerDreamControl(pi, run, async () => { rootCalls++; return roots; }, call, async () => ({}));
+	const abort = registerDreamControl(pi, run, async () => { rootCalls++; return roots; }, call, scopeFor);
 	return { commands, events, notices, ctx, abort, get idle() { return idle; }, get rootCalls() { return rootCalls; }, start: (args = json()) => commands.get("memory-dream-control")!.handler(args, ctx), cancel: () => commands.get("memory-dream-cancel")!.handler("", ctx) };
 }
 
@@ -58,6 +58,20 @@ test("control preserves explicit device and shared-project scope without changin
 	assert.equal(captured!.deviceKey, deviceKey);
 	assert.deepEqual(captured!.projectBindings, projectBindings);
 	for (const invalid of [{ ...request, deviceKey: "device-name" }, { ...request, projectBindings: { relative: "a".repeat(64) } }, { ...request, projectBindings: { "/project/.git": "invalid" } }]) assert.throws(() => parseControlRequest(JSON.stringify(invalid)));
+});
+
+test("an explicit empty profile scope does not inherit the default profile device", async () => {
+	let captured: DreamStart | undefined;
+	let scopeCalls = 0;
+	const f = fixture(async (start) => { captured = start; return report; }, undefined, async () => {
+		scopeCalls++;
+		return { deviceKey: "d".repeat(64), projectBindings: { "/default/.git": "a".repeat(64) } };
+	});
+	await f.start(JSON.stringify({ operation: "start", roots: null, projectBindings: {} }));
+	assert.equal(scopeCalls, 0);
+	assert.equal(captured!.deviceKey, undefined);
+	assert.deepEqual(captured!.projectBindings ?? {}, {});
+	assert.equal(f.rootCalls, 1);
 });
 
 test("control refuses a missing model or a small context before starting a worker", async () => {

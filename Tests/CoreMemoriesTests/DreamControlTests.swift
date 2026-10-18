@@ -88,7 +88,9 @@ private final class ControlEvents: @unchecked Sendable {
   let request =
     try JSONSerialization.jsonObject(
       with: Data(message.dropFirst("/memory-dream-control ".count).utf8)) as! [String: Any]
-  #expect(Set(request.keys) == ["operation", "roots"])
+  #expect(Set(request.keys) == ["operation", "roots", "projectBindings"])
+  #expect((request["projectBindings"] as? [String: String]) == [:])
+  #expect(request["deviceKey"] == nil)
   #expect(request["roots"] is NSNull)
 }
 

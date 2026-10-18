@@ -53,29 +53,35 @@ package struct MemoryConfiguration: Codable, Sendable {
   package var projectBindings: [String: String] = [:]
 
   package static var defaultURL: URL {
-    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/pi-core-memories/config.json")
+    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(
+      ".config/pi-core-memories/config.json")
   }
 
   package static var defaults: Self {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
-    return Self(settings: .defaults, journal: home + "/.local/state/pi-core-memories-drafts",
+    return Self(
+      settings: .defaults, journal: home + "/.local/state/pi-core-memories-drafts",
       reviewState: home + "/.local/state/pi-core-memories-review",
       diagnostics: home + "/.local/state/pi-core-memories-control")
   }
 
   package var memoryURL: URL {
-    URL(fileURLWithPath: roots?.memory ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_REPO"]
-      ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/pi-core-memories")
+    URL(
+      fileURLWithPath: roots?.memory ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_REPO"]
+        ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.local/share/pi-core-memories")
   }
 
   package var stateURL: URL {
-    URL(fileURLWithPath: roots?.state ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.local/state/pi-core-memories")
+    URL(
+      fileURLWithPath: roots?.state ?? FileManager.default.homeDirectoryForCurrentUser.path
+        + "/.local/state/pi-core-memories")
   }
 
   package static func load(from url: URL = defaultURL) throws -> Self {
     guard FileManager.default.fileExists(atPath: url.path) else { return defaults }
     let root = try DreamStateDirectory.openRoot(url.deletingLastPathComponent(), isCreating: false)
-    let value = try JSONDecoder().decode(Self.self, from: root.read(url.lastPathComponent, maximum: 262_144))
+    let value = try JSONDecoder().decode(
+      Self.self, from: root.read(url.lastPathComponent, maximum: 262_144))
     try value.validate()
     return value
   }
@@ -83,7 +89,8 @@ package struct MemoryConfiguration: Codable, Sendable {
   package func save(to url: URL = defaultURL) throws {
     try validate()
     let root = try DreamStateDirectory.openRoot(url.deletingLastPathComponent())
-    try root.installReviewFile(DreamRunEncoding.encode(self), name: url.lastPathComponent, isReplacing: true)
+    try root.installReviewFile(
+      DreamRunEncoding.encode(self), name: url.lastPathComponent, isReplacing: true)
   }
 
   package mutating func setupDevice() {
@@ -91,22 +98,40 @@ package struct MemoryConfiguration: Codable, Sendable {
   }
 
   package func reviewSources() throws -> DreamRunStore {
-    let root = try DreamStateDirectory.openRoot(stateURL, isCreating: false)
+    try reviewSources(stateRoot: stateURL, memoryRepository: memoryURL)
+  }
+
+  package func reviewSources(stateRoot: URL, memoryRepository: URL) throws -> DreamRunStore {
+    let root = try DreamStateDirectory.openRoot(stateRoot, isCreating: false)
     let bytes = try root.read("root.json", maximum: 1_048_576)
     guard let saved = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
       saved["schemaVersion"] as? Int == 2,
       let sessions = saved["sessions"] as? String, let memory = saved["memory"] as? String,
       let stripping = saved["stripping"] as? [String]
     else { throw DreamRunError.corruption }
-    if let roots {
-      return try DreamRunStore(stateRoot: stateURL, sessionsRoot: URL(fileURLWithPath: roots.sessions),
-        memoryRepository: memoryURL, strippingRoots: [roots.snippets, roots.prompts].compactMap { $0 }.map { URL(fileURLWithPath: $0) },
-        globalAgents: roots.globalAgents.map { URL(fileURLWithPath: $0) }, deviceKey: deviceKey, projectBindings: projectBindings)
-    }
     let original = saved["originalRoots"] as? [String] ?? ([sessions, memory] + stripping)
     guard original.count == 2 + stripping.count else { throw DreamRunError.corruption }
-    return try DreamRunStore(stateRoot: stateURL, sessionsRoot: URL(fileURLWithPath: original[0]),
-      memoryRepository: URL(fileURLWithPath: original[1]), strippingRoots: original.dropFirst(2).map { URL(fileURLWithPath: $0) },
+    guard let activeRepository = try MemoryStore.projectBindingDirectory(cwd: memoryRepository),
+      activeRepository
+        == (try MemoryStore.projectBindingDirectory(cwd: URL(fileURLWithPath: original[1])))
+    else {
+      throw MemoryError(
+        "Saved dream review belongs to another memory repository. Select its matching profile.")
+    }
+    if let roots {
+      return try DreamRunStore(
+        stateRoot: stateRoot, sessionsRoot: URL(fileURLWithPath: roots.sessions),
+        memoryRepository: memoryRepository,
+        strippingRoots: [roots.snippets, roots.prompts].compactMap { $0 }.map {
+          URL(fileURLWithPath: $0)
+        },
+        globalAgents: roots.globalAgents.map { URL(fileURLWithPath: $0) }, deviceKey: deviceKey,
+        projectBindings: projectBindings)
+    }
+    return try DreamRunStore(
+      stateRoot: stateRoot, sessionsRoot: URL(fileURLWithPath: original[0]),
+      memoryRepository: URL(fileURLWithPath: original[1]),
+      strippingRoots: original.dropFirst(2).map { URL(fileURLWithPath: $0) },
       globalAgents: (saved["globalAgents"] as? String).map { URL(fileURLWithPath: $0) },
       deviceKey: deviceKey, projectBindings: projectBindings)
   }

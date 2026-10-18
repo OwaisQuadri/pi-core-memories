@@ -4,6 +4,39 @@ import Testing
 
 @testable import CoreMemories
 
+@Test func draftUpdateWithoutTrailingNewlinePreservesTheFollowingEntry() throws {
+  let fixture = try Fixture()
+  defer { fixture.clean() }
+  try fixture.write("# Memory\n\n" + fact("First.") + "\n" + fact("Second."), path: "MEMORY.md")
+  try fixture.commit()
+  let manager = try MemoryManagement(repository: fixture.repo)
+  try manager.confirmDetach(manager.checkoutPreview())
+  let catalog = try manager.execute(MemoryManagementRequest(operation: .list))
+  let entries = catalog.entries.filter(\.isMutable)
+  #expect(entries.count == 2)
+  let first = try #require(entries.first)
+  let sibling = try #require(entries.last)
+  let drafts = try MemoryDraftStore(
+    repository: fixture.repo,
+    journal: canonicalDraftJournal(fixture.root.appendingPathComponent("drafts")))
+  let draft = try drafts.create(
+    base: catalog.base,
+    operations: [
+      MemoryManagementRequest(
+        operation: .update, base: catalog.base, path: first.path,
+        locator: first.locator, expected: first.expected,
+        replacement: fact("Corrected.").trimmingCharacters(in: .newlines), reason: "Requested edit")
+    ])
+  _ = try drafts.save(
+    draftID: draft.draftID, expectedRevision: draft.revision, idempotencyKey: "boundary")
+  let saved = try manager.execute(MemoryManagementRequest(operation: .list)).entries.filter(
+    \.isMutable)
+  #expect(saved.count == 2)
+  #expect(saved.first?.expected.contains("Corrected.") == true)
+  #expect(saved.last?.expected == sibling.expected)
+  #expect(try fixture.store.check().isEmpty)
+}
+
 @Test func draftSavePublishesOneCommitAcrossDocumentsAndRecoversLostReceipt() throws {
   let fixture = try Fixture()
   defer { fixture.clean() }

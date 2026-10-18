@@ -130,10 +130,12 @@ package final class MemoryManagement {
       )
     }
     if request.operation == .get {
-      guard let expected = request.expected, let row = all.first(where: {
-        $0.path == request.path && $0.locator == request.locator
-          && Data($0.expected.utf8) == Data(expected.utf8)
-      }) else { throw MemoryError("entry locator or expected bytes changed; list entries again") }
+      guard let expected = request.expected,
+        let row = all.first(where: {
+          $0.path == request.path && $0.locator == request.locator
+            && Data($0.expected.utf8) == Data(expected.utf8)
+        })
+      else { throw MemoryError("entry locator or expected bytes changed; list entries again") }
       return MemoryManagementResult(
         base: base, entries: [row], commit: nil, auditRef: nil,
         message: "Exact committed approved entry.")
@@ -192,8 +194,10 @@ package final class MemoryManagement {
         throw MemoryError(
           "update must retain existing source annotations; add new references as needed")
       }
-      after = try MemoryDocument.revisedBytes(
+      let revised = try MemoryDocument.revisedBytes(
         bytes, previous: entry, identity: identity!, instant: instant)
+      let terminator = entry?.bytes.suffix(2) == Data([13, 10]) ? Data([13, 10]) : Data([10])
+      after = entry?.bytes.last == 10 && revised.last != 10 ? revised + terminator : revised
     }
     let document = snapshot.documents.first { $0.path == path }?.bytes ?? Data("# Memory\n".utf8)
     var replacement = document
@@ -259,11 +263,14 @@ package final class MemoryManagement {
     }
   }
 
-  package func reviewCatalog(cwd: URL, deviceKey: String? = nil, projectBindings: [String: String] = [:]) throws -> MemoryManagementResult {
+  package func reviewCatalog(
+    cwd: URL, deviceKey: String? = nil, projectBindings: [String: String] = [:]
+  ) throws -> MemoryManagementResult {
     let catalog = try execute(MemoryManagementRequest(operation: .list))
     try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     let key = try MemoryStore.projectKey(cwd: cwd, projectBindings: projectBindings)
-    let paths = MemoryScopeConfiguration.paths(projectKeys: key.map { [$0] } ?? [], deviceKey: deviceKey)
+    let paths = MemoryScopeConfiguration.paths(
+      projectKeys: key.map { [$0] } ?? [], deviceKey: deviceKey)
     return MemoryManagementResult(
       base: catalog.base,
       entries: catalog.entries.filter {

@@ -13,6 +13,16 @@ enum MemoryReviewEncoding {
     return bytes
   }
 
+  static func volumeUUID(at url: URL) throws -> String {
+    guard let value = try url.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString,
+      let uuid = UUID(uuidString: value)
+    else {
+      throw DreamRunError.nativeReviewLimitation(
+        "persistent volume identity is unavailable for \(url.path)")
+    }
+    return uuid.uuidString
+  }
+
   static func decode<T: Codable>(_ type: T.Type, bytes: Data) throws -> T {
     let value = try JSONDecoder().decode(type, from: bytes)
     guard try encode(value) == bytes else { throw DreamRunError.corruption }
@@ -45,6 +55,17 @@ struct ReviewAdmission: Codable, Equatable {
 }
 
 struct ReviewRootBinding: Codable, Equatable {
+  let schemaVersion: Int
+  let repository: String
+  let repositoryVolumeUUID: String
+  let repositoryInode: UInt64
+  let sourceBinding: String
+  let state: String
+  let stateVolumeUUID: String
+  let stateInode: UInt64
+}
+
+struct LegacyReviewRootBinding: Codable, Equatable {
   let schemaVersion: Int
   let repository: String
   let repositoryDevice: UInt64
@@ -183,7 +204,8 @@ extension DreamStateDirectory {
     guard io.sync(file) == 0, close(file) == 0 else { throw DreamRunError.persistenceFailure }
     isClosed = true
     try fault?(.beforeInstall(name))
-    let installed = isReplacing
+    let installed =
+      isReplacing
       ? Darwin.renameat(descriptor, temporary, descriptor, name)
       : io.install(descriptor, temporary, name)
     guard installed == 0 else {

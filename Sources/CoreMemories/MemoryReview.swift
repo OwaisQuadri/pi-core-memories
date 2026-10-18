@@ -58,6 +58,8 @@ package final class MemoryReviewController {
   private let sources: DreamRunStore
   private let store: MemoryStore
   private let binding: ReviewRootBinding
+  private let repositoryDevice: dev_t
+  private let stateDevice: dev_t
   private let writer: Int32
   private let operationLock = NSLock()
   private var candidates: [String: (AtomicMemoryChange, ReviewAdmission, [String])] = [:]
@@ -114,12 +116,34 @@ package final class MemoryReviewController {
         repoStatus.st_uid == geteuid(), fstat(directory.descriptor, &stateStatus) == 0
       else { throw DreamRunError.unsafeState }
       let binding = ReviewRootBinding(
-        schemaVersion: 1, repository: repo.path,
-        repositoryDevice: UInt64(repoStatus.st_dev), repositoryInode: UInt64(repoStatus.st_ino),
-        sourceBinding: try sources.reviewSourceBinding().rawValue,
-        stateDevice: UInt64(stateStatus.st_dev), stateInode: UInt64(stateStatus.st_ino))
+        schemaVersion: 2, repository: repo.path,
+        repositoryVolumeUUID: try MemoryReviewEncoding.volumeUUID(at: repo),
+        repositoryInode: UInt64(repoStatus.st_ino),
+        sourceBinding: try sources.reviewSourceBinding().rawValue, state: stateRoot.path,
+        stateVolumeUUID: try MemoryReviewEncoding.volumeUUID(at: stateRoot),
+        stateInode: UInt64(stateStatus.st_ino))
       let bytes = try MemoryReviewEncoding.encode(binding)
-      try directory.installReviewFile(bytes, name: "root.json")
+      if try directory.isPresent("root.json") {
+        let existing = try directory.read(
+          "root.json", maximum: MemoryReviewEncoding.maximumFileBytes)
+        if let legacy = try? MemoryReviewEncoding.decode(
+          LegacyReviewRootBinding.self, bytes: existing), legacy.schemaVersion == 1
+        {
+          let expected = LegacyReviewRootBinding(
+            schemaVersion: 1, repository: repo.path,
+            repositoryDevice: UInt64(repoStatus.st_dev), repositoryInode: UInt64(repoStatus.st_ino),
+            sourceBinding: try sources.reviewSourceBinding(isLegacy: true).rawValue,
+            stateDevice: UInt64(stateStatus.st_dev), stateInode: UInt64(stateStatus.st_ino))
+          guard try existing == MemoryReviewEncoding.encode(expected) else {
+            throw DreamRunError.corruption
+          }
+          try directory.installReviewFile(bytes, name: "root.json", isReplacing: true)
+        } else {
+          guard existing == bytes else { throw DreamRunError.corruption }
+        }
+      } else {
+        try directory.installReviewFile(bytes, name: "root.json")
+      }
       self.root = directory
       self.writer = lock
       self.stateURL = stateRoot
@@ -127,6 +151,8 @@ package final class MemoryReviewController {
       self.sources = sources
       self.store = try MemoryStore(repo: repo, environment: environment)
       self.binding = binding
+      self.repositoryDevice = repoStatus.st_dev
+      self.stateDevice = stateStatus.st_dev
     } catch {
       _ = flock(lock, LOCK_UN)
       _ = close(lock)
@@ -714,12 +740,17 @@ package final class MemoryReviewController {
     try root.verifyLock(writer)
     var repoStatus = stat()
     var stateStatus = stat()
+    var heldState = stat()
     guard lstat(repository.path, &repoStatus) == 0, lstat(stateURL.path, &stateStatus) == 0,
+      fstat(root.descriptor, &heldState) == 0,
       repoStatus.st_mode & S_IFMT == S_IFDIR, stateStatus.st_mode & S_IFMT == S_IFDIR,
-      UInt64(repoStatus.st_dev) == binding.repositoryDevice,
+      repoStatus.st_dev == repositoryDevice,
       UInt64(repoStatus.st_ino) == binding.repositoryInode,
-      UInt64(stateStatus.st_dev) == binding.stateDevice,
+      stateStatus.st_dev == stateDevice, heldState.st_dev == stateStatus.st_dev,
+      heldState.st_ino == stateStatus.st_ino,
       UInt64(stateStatus.st_ino) == binding.stateInode,
+      try MemoryReviewEncoding.volumeUUID(at: repository) == binding.repositoryVolumeUUID,
+      try MemoryReviewEncoding.volumeUUID(at: stateURL) == binding.stateVolumeUUID,
       try sources.reviewSourceBinding().rawValue == binding.sourceBinding,
       try root.read("root.json", maximum: MemoryReviewEncoding.maximumFileBytes)
         == MemoryReviewEncoding.encode(binding)

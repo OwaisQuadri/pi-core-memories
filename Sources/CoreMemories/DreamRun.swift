@@ -228,7 +228,7 @@ public final class DreamRunStore {
     return Darwin.renameatx_np(directory, temporary, directory, name, UInt32(RENAME_EXCL))
   }
 
-  private static func isManagedSnippets(_ path: String, state: URL, sessions: URL) -> Bool {
+  static func isManagedSnippets(_ path: String, state: URL, sessions: URL) -> Bool {
     let logical = sessions.deletingLastPathComponent()
       .appendingPathComponent("extensions/prompt-snippets/snippets").path
     if path == logical { return true }
@@ -370,16 +370,20 @@ public final class DreamRunStore {
 
   package var reviewStateRoot: URL { reviewStateURL }
 
-  package func reviewSourceBinding() throws -> SourceDigest {
+  package func reviewSourceBinding(isLegacy: Bool = false) throws -> SourceDigest {
     var held = stat()
     var named = stat()
     guard fstat(root.descriptor, &held) == 0, lstat(reviewStateURL.path, &named) == 0,
       held.st_dev == named.st_dev, held.st_ino == named.st_ino
     else { throw DreamRunError.unsafeState }
     try Self.validateStateIdentity(named, isDirectory: true)
+    guard try root.read("root.json", maximum: DreamRunEncoding.maximumMetadataBytes) == bindingBytes
+    else { throw DreamRunError.corruption }
+    let volume =
+      try isLegacy ? String(held.st_dev) : MemoryReviewEncoding.volumeUUID(at: reviewStateURL)
     return SourceDigest(
       bytes: Data(
-        "\(reviewStateURL.path)\0\(held.st_dev)\0\(held.st_ino)\0\(bindingHash.rawValue)".utf8))
+        "\(reviewStateURL.path)\0\(volume)\0\(held.st_ino)\0\(bindingHash.rawValue)".utf8))
   }
 
   public var acceptedSources: (sessions: URL, memory: URL, stripping: [URL]) {

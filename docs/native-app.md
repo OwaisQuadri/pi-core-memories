@@ -47,7 +47,7 @@ pi install https://github.com/OwaisQuadri/pi-core-memories
 
 Start a new Pi session. Set `PI_CORE_MEMORIES_REPO` when your data store differs from the loader's default. If you already use a separate core-memories extension, disable that copy before enabling this package. Do not load both copies.
 
-The package adds memory loading, `/dream`, `/mem-review`, `/memory review`, `/mem-prepare`, and the existing memory management tools. Installing the package does not approve candidates or run a dream.
+The package adds memory loading, `/dream`, `/mem-review`, `/mem-rereview`, `/mem-prepare`, and the existing memory management tools. Installing the package does not approve candidates or run a dream.
 
 ## Dreams
 

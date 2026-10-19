@@ -40,7 +40,7 @@ struct DreamsView: View {
             } else {
               Button("Find Suggestions") { model.run(.start) }.fixedSize()
             }
-            Button(model.reviewActionTitle) { model.section = "Review" }.fixedSize()
+            Button(model.reviewActionTitle) { model.section = "Memories" }.fixedSize()
             Menu("Other Actions") {
               Button("Find Suggestions in One Batch") { model.run(.start) }
               Button("Find Suggestions in All Waiting Batches") { model.run(.all) }
@@ -54,7 +54,7 @@ struct DreamsView: View {
           }
           if model.invocationStatus?.isPublicationBlocked != true {
             Text(
-              "Finding suggestions uses your selected model and may incur a charge. It never changes saved memories. Review suggestions and choose Save into Memory to apply them."
+              "Finding suggestions uses your selected model and may incur a charge. It never changes saved memories. Stage reviewed suggestions in Memories, then choose Save Changes."
             )
             .font(.callout).foregroundStyle(.secondary)
           }
@@ -72,7 +72,7 @@ struct DreamsView: View {
       VStack(alignment: .leading, spacing: 16) {
         Text("Prepare Saved Suggestions").font(.title2.bold())
         Text(
-          "No model call or charge. Nothing is saved into memory now. Each memory needs a fresh preview and separate Save into Memory approval."
+          "No model call or charge. Nothing is saved into memory now. Review and stage each suggestion, then choose Save Changes once."
         )
         if let recovery = model.savedRecovery {
           Text("\(recovery.actionableCount) ready to review").font(.headline)
@@ -123,6 +123,7 @@ struct DreamsView: View {
 
   private var statusTitle: String {
     if model.isDreamRunning { return model.dreamPhase }
+    if model.dreamInspectionFailure != nil { return "Saved dream details unavailable" }
     if let status = model.invocationStatus {
       switch status.status {
       case "completed": return "Conversation processing finished"
@@ -143,6 +144,9 @@ struct DreamsView: View {
 
   private var details: some View {
     VStack(alignment: .leading, spacing: 12) {
+      if let unavailable = model.dreamInspectionFailure {
+        Text(unavailable).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+      }
       if model.invocationStatus?.isPublicationBlocked == true
         || model.dreamPhase == "Status unavailable"
       {

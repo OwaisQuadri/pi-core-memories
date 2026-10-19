@@ -232,3 +232,49 @@ private func canonicalDraftJournal(_ url: URL) throws -> URL {
   #expect(entry.bytes == prepared.insertion)
   #expect(saved.documents.first?.bytes == prepared.document)
 }
+
+@Test func draftRecoveryOnlyRequiresExactCurrentIntentAndApprovedPublication() throws {
+  let fixture = try Fixture()
+  defer { fixture.clean() }
+  let manager = try MemoryManagement(repository: fixture.repo)
+  try manager.confirmDetach(manager.checkoutPreview())
+  let drafts = try MemoryDraftStore(
+    repository: fixture.repo,
+    journal: canonicalDraftJournal(fixture.root.appendingPathComponent("drafts")))
+  let legacy = try drafts.create(operations: [
+    MemoryManagementRequest(
+      operation: .add, base: fixture.store.approvedCommit(), path: "MEMORY.md",
+      replacement: fact("Exact recovery intent."), reason: "Requested addition")
+  ])
+  let key = "native-save-\(legacy.revision)"
+  #expect(
+    try drafts.recoverSave(
+      draftID: legacy.draftID, expectedRevision: legacy.revision, idempotencyKey: key) == nil)
+  #expect(try fixture.store.approvedCommit() == legacy.baseCommit)
+  let receipt = try drafts.save(
+    draftID: legacy.draftID, expectedRevision: legacy.revision, idempotencyKey: key)
+  #expect(
+    try drafts.recoverSave(
+      draftID: legacy.draftID, expectedRevision: legacy.revision, idempotencyKey: key)?.commit
+      == receipt.commit)
+  _ = try fixture.git(["update-ref", "refs/heads/main", legacy.baseCommit, receipt.commit])
+  #expect(throws: (any Error).self) {
+    try drafts.recoverSave(
+      draftID: legacy.draftID, expectedRevision: legacy.revision, idempotencyKey: key)
+  }
+  _ = try fixture.git(["update-ref", "refs/heads/main", receipt.commit, legacy.baseCommit])
+  _ = try fixture.git(["update-ref", "-d", receipt.auditRef])
+  _ = try fixture.git(["update-ref", receipt.auditRef + "/descendant", receipt.commit])
+  #expect(throws: (any Error).self) {
+    try drafts.recoverSave(
+      draftID: legacy.draftID, expectedRevision: legacy.revision, idempotencyKey: key)
+  }
+  _ = try fixture.git(["update-ref", "-d", receipt.auditRef + "/descendant"])
+  _ = try fixture.git(["update-ref", receipt.auditRef, receipt.commit])
+  _ = try drafts.update(draftID: legacy.draftID, expectedRevision: legacy.revision, operations: [])
+  #expect(throws: (any Error).self) {
+    try drafts.recoverSave(
+      draftID: legacy.draftID, expectedRevision: legacy.revision, idempotencyKey: key)
+  }
+  #expect(try fixture.store.approvedCommit() == receipt.commit)
+}

@@ -53,11 +53,24 @@ import SwiftUI
     }
     .commands {
       CommandGroup(replacing: .newItem) {
-        Button("New Memory") { model.add() }.keyboardShortcut("n").disabled(model.isBusy)
+        Button("New Memory") { Task { await model.add() } }.keyboardShortcut("n").disabled(
+          model.isBusy)
       }
       CommandGroup(replacing: .saveItem) {
         Button("Save Changes") { Task { await model.save() } }.keyboardShortcut("s")
-          .disabled(model.operations.isEmpty || model.isBusy)
+          .disabled(!model.isSaveEnabled)
+      }
+      CommandGroup(replacing: .undoRedo) {
+        Button("Undo") {
+          if let editor = editableUndoResponder(NSApp.keyWindow?.firstResponder) {
+            editor.undoManager?.undo()
+          } else {
+            Task { await model.undoStaging() }
+          }
+        }.keyboardShortcut("z").disabled(model.isBusy || model.isSaveUnresolved)
+        Button("Redo Text") {
+          (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.redo()
+        }.keyboardShortcut("z", modifiers: [.command, .shift])
       }
       CommandGroup(after: .toolbar) {
         Button("Refresh") { Task { await model.refresh() } }.keyboardShortcut("r")
@@ -71,17 +84,13 @@ import SwiftUI
 
 struct WorkspaceView: View {
   @ObservedObject var model: AppModel
-  private let sections = ["Dreams", "Review", "Memories", "Changes", "Settings"]
-  private let icons = [
-    "moon.stars", "checkmark.seal", "text.book.closed", "square.and.pencil", "gearshape",
-  ]
+  private let sections = ["Dreams", "Memories", "Settings"]
+  private let icons = ["moon.stars", "text.book.closed", "gearshape"]
 
   private func sectionTitle(_ section: String) -> String {
     switch section {
     case "Dreams": "Find Suggestions"
-    case "Review": "Review Suggestions"
-    case "Memories": "Saved Memories"
-    case "Changes": "Your Changes"
+    case "Memories": "Memories"
     default: section
     }
   }
@@ -98,9 +107,7 @@ struct WorkspaceView: View {
         Group {
           switch model.section {
           case "Dreams": DreamsView(model: model)
-          case "Review": ReviewView(model: model)
-          case "Memories": MemoriesView(model: model)
-          case "Changes": ChangesView(model: model)
+          case "Memories": MemoryWorkspaceView(model: model)
           default: ScrollView { SettingsView(model: model).padding(24) }
           }
         }.frame(maxWidth: .infinity, maxHeight: .infinity).disabled(model.isBusy)
@@ -109,8 +116,8 @@ struct WorkspaceView: View {
           if model.isBusy { ProgressView().controlSize(.small) }
           Text(model.message).font(.caption).lineLimit(2).textSelection(.enabled)
           Spacer()
-          if !model.operations.isEmpty {
-            Text(model.operations.count == 1 ? "1 change" : "\(model.operations.count) changes")
+          if !model.stagedItems.isEmpty {
+            Text(model.stagedItems.count == 1 ? "1 change" : "\(model.stagedItems.count) changes")
               .font(.caption)
           }
         }.padding(.horizontal, 16).padding(.vertical, 9)
@@ -131,16 +138,19 @@ struct WorkspaceView: View {
           } label: {
             Label("Save Changes", systemImage: "square.and.arrow.down")
           }
-          .disabled(model.operations.isEmpty || model.isBusy)
+          .disabled(!model.isSaveEnabled)
         }
     }
-    .alert(
-      "Operation failed",
+    .sheet(
       isPresented: Binding(get: { model.failure != nil }, set: { if !$0 { model.failure = nil } })
     ) {
-      Button("OK", role: .cancel) { model.failure = nil }
-    } message: {
-      Text(model.failure ?? "")
+      VStack(alignment: .leading, spacing: 16) {
+        Text("Operation failed").font(.headline)
+        DisclosureGroup("Details") {
+          PlainTextView(text: model.failure ?? "").frame(height: 240)
+        }
+        Button("Close") { model.failure = nil }.keyboardShortcut(.cancelAction)
+      }.padding(20).frame(width: 640)
     }
     .sheet(
       isPresented: Binding(get: { model.checkout != nil }, set: { if !$0 { model.checkout = nil } })
@@ -164,6 +174,11 @@ struct WorkspaceView: View {
       }.padding(24).frame(width: 530)
     }
   }
+}
+
+@MainActor func editableUndoResponder(_ responder: NSResponder?) -> NSTextView? {
+  guard let editor = responder as? NSTextView, editor.isEditable else { return nil }
+  return editor
 }
 
 struct PlainTextView: NSViewRepresentable {

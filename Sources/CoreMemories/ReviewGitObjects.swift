@@ -45,6 +45,7 @@ final class ReviewGitObjects {
     self.process = process
     self.input = input.fileHandleForWriting
     self.output = output.fileHandleForReading
+    Git.memoryBatchCommandObserver?()
     self.exit = try launch(process)
     try? input.fileHandleForReading.close()
     try? output.fileHandleForWriting.close()

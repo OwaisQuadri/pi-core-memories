@@ -62,7 +62,7 @@ import SwiftUI
       }
       CommandGroup(replacing: .undoRedo) {
         Button("Undo") {
-          if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
+          if let editor = editableUndoResponder(NSApp.keyWindow?.firstResponder) {
             editor.undoManager?.undo()
           } else {
             Task { await model.undoStaging() }
@@ -174,6 +174,11 @@ struct WorkspaceView: View {
       }.padding(24).frame(width: 530)
     }
   }
+}
+
+@MainActor func editableUndoResponder(_ responder: NSResponder?) -> NSTextView? {
+  guard let editor = responder as? NSTextView, editor.isEditable else { return nil }
+  return editor
 }
 
 struct PlainTextView: NSViewRepresentable {

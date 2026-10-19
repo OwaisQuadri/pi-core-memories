@@ -227,6 +227,349 @@ func nativeRecoverySelectionIsReadOnlyAndAcknowledgedManualCreationReleasesDetai
   try await model.shutdown()
 }
 
+@Test @MainActor func nativeSaveDoesNotLoseInputDeliveredDuringFinalPersistence() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let retained = try await retainedNativeReviewSave(fixture)
+  let control = NativePersistenceControl()
+  let model = AppModel(
+    configURL: retained.url, autosaveDelay: .seconds(3600),
+    persistence: NativeBatchPersistence(write: control.write))
+  await model.load()
+  await model.pauseQueue()
+  await model.startIndependentManualBatch()
+  await model.add()
+  let initialRequestCount = await control.requests.count
+  await control.pauseWrites()
+  let owner = try #require(model.editorOwner)
+  model.setEditorText(fact("Initial input before final persistence."), owner: owner)
+  model.setEditorReason("Initial reason", owner: owner)
+  let save = Task { await model.save() }
+  let deadline = ContinuousClock.now + .seconds(5)
+  while await control.requests.count == initialRequestCount && ContinuousClock.now < deadline {
+    await Task.yield()
+  }
+  let isHeld = await control.requests.count == initialRequestCount + 1
+  if !isHeld { await control.resumeWrites() }
+  try #require(isHeld)
+  try #require(model.isBusy)
+  let newerText = fact("Newer exact input delivered during final persistence.")
+  let newerReason = "Newer exact reason"
+  model.setEditorText(newerText, owner: owner)
+  model.setEditorReason(newerReason, owner: owner)
+  await model.stageEditor()
+  #expect(model.isBusy, "Stage Edit must not compete with final Save")
+  await control.resumeWrites()
+  await save.value
+  guard case .saved(let receipt) = model.saveOutcome, let commit = receipt.commit else {
+    throw MemoryError("Expected actual independent manual publication")
+  }
+  #expect(commit == (try fixture.main()))
+  let published = try MemoryStore(repo: fixture.memory).reviewSnapshot(base: commit)
+  let isNewerPublished = published.reviewEntries().contains {
+    $0.entry.bytes.range(of: Data("Newer exact input delivered during final persistence.".utf8))
+      != nil
+  }
+  let manifest = try MemoryBatchReplay.read(
+    commit, git: Git(repo: fixture.memory, environment: [:]))
+  let isNewerSubmitted =
+    manifest.draft.batch?.items.contains { item in
+      guard case .manual(let intent) = item.intent else { return false }
+      return intent.request.replacement == newerText && intent.request.reason == newerReason
+    } == true
+  let isNewerRetained =
+    model.isInputDirty && model.editorText == newerText && model.editorReason == newerReason
+  #expect(
+    (isNewerPublished && isNewerSubmitted) || isNewerRetained,
+    "Input delivered during final persistence must be published exactly or retained for Discard")
+  if isNewerPublished && isNewerSubmitted {
+    let revision = model.inputRevision
+    model.setEditorText(newerText, owner: owner)
+    model.setEditorReason(newerReason, owner: owner)
+    #expect(model.inputRevision == revision)
+    #expect(!model.isInputDirty)
+    #expect(model.editorText.isEmpty)
+    #expect(model.editorReason.isEmpty)
+    #expect(model.autosaveTask == nil)
+    let lateText = fact("Late exact text from the consumed editor.")
+    model.setEditorText(lateText, owner: owner)
+    model.setEditorReason("Late exact reason", owner: owner)
+    #expect(model.isRetainingConsumedInput)
+    #expect(model.editorText == lateText)
+    #expect(model.editorReason == "Late exact reason")
+    #expect(model.isDiscardEnabled)
+    #expect(model.autosaveTask == nil)
+    await model.discard()
+    #expect(!model.isInputDirty)
+    #expect(try fixture.main() == commit)
+  }
+  if isNewerRetained {
+    #expect(model.isDiscardEnabled)
+    await model.discard()
+    #expect(!model.isInputDirty)
+    #expect(model.editorText.isEmpty)
+    #expect(model.editorReason.isEmpty)
+    #expect(try fixture.main() == commit)
+  }
+  try await model.shutdown()
+}
+
+@Test @MainActor func nativeConsumedSaveRetainsNewerInputUntilLocalDiscard() async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let retained = try await retainedNativeReviewSave(fixture)
+  let model = AppModel(configURL: retained.url, autosaveDelay: .seconds(3600))
+  await model.load()
+  await model.pauseQueue()
+  await model.startIndependentManualBatch()
+  await model.add()
+  let owner = try #require(model.editorOwner)
+  let submittedText = fact("Only this submitted input is published.")
+  model.setEditorText(submittedText, owner: owner)
+  model.setEditorReason("Submitted reason", owner: owner)
+  await model.workspace.failNativePublicationBookkeeping(isFailing: true)
+  await model.save()
+  try #require(model.isSaveUnresolved)
+  let submitted = try #require(model.submittedInput)
+  let published = try fixture.main()
+  let newerText = fact("Retain this exact unsubmitted input.\nKeep this second line.")
+  let newerReason = "Retain this exact unsubmitted reason"
+  model.setEditorText(newerText, owner: owner)
+  model.setEditorReason(newerReason, owner: owner)
+  await model.workspace.failNativePublicationBookkeeping(isFailing: false)
+  await model.recoverSave()
+  try #require(!model.isSaveUnresolved)
+  #expect(model.submittedInput?.revision == submitted.revision)
+  #expect(model.submittedInput?.text == submittedText)
+  #expect(model.message == "Saved changes in one commit")
+  #expect(model.draftFailure == nil)
+  #expect(model.isRetainingConsumedInput)
+  #expect(model.isInputDirty)
+  #expect(model.editorText == newerText)
+  #expect(model.editorReason == newerReason)
+  let revision = model.inputRevision
+  model.setEditorText(submittedText, owner: owner)
+  model.setEditorReason("Submitted reason", owner: owner)
+  #expect(model.inputRevision == revision)
+  #expect(model.editorText == newerText)
+  #expect(model.editorReason == newerReason)
+  #expect(model.editorPath == "MEMORY.md")
+  #expect(model.isEditing)
+  #expect(model.isDiscardEnabled)
+  #expect(!model.isSaveEnabled)
+  #expect(model.autosaveTask == nil)
+  #expect(await !model.workspace.isNativeBatchOpen)
+  let manifest = try MemoryBatchReplay.read(
+    published, git: Git(repo: fixture.memory, environment: [:]))
+  guard case .manual(let intent) = manifest.draft.batch?.items.first?.intent else {
+    throw MemoryError("Expected the submitted manual publication")
+  }
+  #expect(intent.request.replacement == submittedText)
+  #expect(intent.request.reason == "Submitted reason")
+  let journal = URL(fileURLWithPath: model.configuration.journal)
+  let before = try fixture.snapshot(journal)
+  let selection = model.selection
+  await model.selectMemory(nil)
+  #expect(model.selection == selection)
+  await model.add()
+  await model.startIndependentManualBatch()
+  await model.restore(retained.draft)
+  #expect(model.retainedDraft == nil)
+  await model.stageEditor()
+  await model.saveSettings()
+  await #expect(throws: NativeBatchLifecycleError.self) { try await model.shutdown() }
+  await #expect(throws: NativeBatchLifecycleError.self) {
+    _ = try await model.workspace.batch(.path("MEMORY.md"), expectedDraftID: owner.draft.draftID)
+  }
+  await #expect(throws: NativeBatchLifecycleError.self) {
+    _ = try await model.workspace.persistBatch(expectedDraftID: owner.draft.draftID)
+  }
+  await #expect(throws: NativeBatchLifecycleError.self) {
+    _ = try await model.workspace.saveBatch(expectedDraftID: owner.draft.draftID)
+  }
+  await model.refresh()
+  await model.pauseQueue()
+  await model.loadCandidates()
+  #expect(model.editorText == newerText)
+  #expect(model.editorReason == newerReason)
+  #expect(model.selection == selection)
+  #expect(model.batchProjection == nil)
+  #expect(await !model.workspace.isNativeBatchOpen)
+  #expect(await model.workspace.currentDraft == nil)
+  #expect(await model.workspace.pendingPersistence == nil)
+  #expect(try fixture.snapshot(journal) == before)
+  #expect(try fixture.main() == published)
+  await model.discard()
+  #expect(!model.isInputDirty)
+  #expect(!model.isEditing)
+  #expect(model.editorText.isEmpty)
+  #expect(model.editorReason.isEmpty)
+  #expect(!model.isDiscardEnabled)
+  #expect(try fixture.snapshot(journal) == before)
+  #expect(model.draftRecoveries.count == 1)
+  await model.startIndependentManualBatch()
+  let replacement = try #require(model.draft)
+  #expect(replacement.draftID != owner.draft.draftID)
+  await #expect(throws: NativeBatchLifecycleError.self) {
+    _ = try await model.workspace.batch(.path("MEMORY.md"), expectedDraftID: owner.draft.draftID)
+  }
+  await #expect(throws: NativeBatchLifecycleError.self) {
+    _ = try await model.workspace.persistBatch(expectedDraftID: owner.draft.draftID)
+  }
+  #expect(await model.workspace.currentDraft?.draftID == replacement.draftID)
+  #expect(await model.workspace.pendingPersistence == nil)
+  model.setEditorText("Stale delivery must not mutate the new draft", owner: owner)
+  #expect(model.editorText.isEmpty)
+  await model.add()
+  #expect(model.isEditing)
+  try await model.shutdown()
+}
+
+@Test(arguments: [false, true])
+@MainActor func nativeAutosaveFailureAfterSimulatedSaveKeepsSettledFeedback(isAfterInstall: Bool)
+  async throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let retained = try await retainedNativeReviewSave(fixture)
+  let control = NativePersistenceControl()
+  let model = AppModel(
+    configURL: retained.url, autosaveDelay: .zero,
+    persistence: NativeBatchPersistence(write: control.write))
+  await model.load()
+  await model.pauseQueue()
+  let journal = URL(fileURLWithPath: model.configuration.journal)
+  let recoveryBefore = try fixture.snapshot(journal)
+  let base = try fixture.main()
+  await model.startIndependentManualBatch()
+  await model.add()
+  let initialRequestCount = await control.requests.count
+  await control.pauseWrites()
+  model.editorText = fact("Autosave owned by the retiring manual batch.")
+  model.editorReason = "Retain the original request"
+  model.editorChanged()
+  let autosave = try #require(model.autosaveTask)
+  let deadline = ContinuousClock.now + .seconds(5)
+  while await control.requests.count == initialRequestCount && ContinuousClock.now < deadline {
+    await Task.yield()
+  }
+  try #require(await control.requests.count == initialRequestCount + 1)
+  let pending = try #require(await model.workspace.pendingPersistence)
+  let generation = model.workspaceGeneration
+  let saveID = try memoryBatchDigest(pending.request.draft)
+  let receipt = MemoryBatchReceipt(
+    saveID: saveID, draftID: pending.request.draft.draftID,
+    revision: pending.request.draft.revision, base: pending.request.draft.baseCommit,
+    commit: nil, auditRef: nil)
+  await model.handleSave(.saved(receipt))
+  try #require(model.workspaceGeneration != generation)
+  try #require(model.message == "Saved changes in one commit")
+  try #require(model.draftFailure == nil)
+  await control.resumeWrites(
+    isFailing: !isAfterInstall, isFailingAfterInstall: isAfterInstall)
+  await autosave.value
+  #expect(
+    model.message == "Saved changes in one commit",
+    "A retired autosave must not repaint successful Save feedback")
+  #expect(model.draftFailure == nil, "A retired autosave must not attach a stale draft failure")
+  #expect(model.failure == nil)
+  #expect(model.batchProjection == nil)
+  #expect(model.isWaitingForIndependentManualWork)
+  #expect(model.draftRecoveries.map(\.failure.saveID) == [try memoryBatchDigest(retained.draft)])
+  #expect(await model.workspace.currentDraft?.draftID == pending.request.draft.draftID)
+  let failed = try #require(await model.workspace.pendingPersistence)
+  #expect(failed.id == pending.id)
+  #expect(failed.task == nil)
+  #expect(failed.request.sessionID == pending.request.sessionID)
+  #expect(failed.request.expectedDigest == pending.request.expectedDigest)
+  #expect(try memoryBatchDigest(failed.request.draft) == saveID)
+  await control.resumeWrites()
+  _ = try await model.workspace.persistBatch()
+  let requests = Array(await control.requests.dropFirst(initialRequestCount))
+  try #require(requests.count == 2)
+  #expect(try memoryBatchDigest(requests[0]) == memoryBatchDigest(requests[1]))
+  #expect(await model.workspace.pendingPersistence == nil)
+  #expect(await model.workspace.currentDraft?.draftID == pending.request.draft.draftID)
+  #expect(try fixture.main() == base, "The simulated Save must not claim core publication")
+  let after = try fixture.snapshot(journal)
+  for (path, bytes) in recoveryBefore { #expect(after[path] == bytes) }
+  try await model.shutdown()
+}
+
+@Test(arguments: [false, true])
+@MainActor
+func nativeAutosaveCurrentOwnerFailureRetainsNewerInputAndExactRetry(isAfterInstall: Bool)
+  async throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let retained = try await retainedNativeReviewSave(fixture)
+  let control = NativePersistenceControl()
+  let model = AppModel(
+    configURL: retained.url, autosaveDelay: .zero,
+    persistence: NativeBatchPersistence(write: control.write))
+  await model.load()
+  await model.pauseQueue()
+  let journal = URL(fileURLWithPath: model.configuration.journal)
+  let recoveryBefore = try fixture.snapshot(journal)
+  await model.startIndependentManualBatch()
+  await model.add()
+  let initialRequestCount = await control.requests.count
+  await control.pauseWrites()
+  model.editorText = fact("First unacknowledged autosave request.")
+  model.editorReason = "First reason"
+  model.editorChanged()
+  let autosave = try #require(model.autosaveTask)
+  let deadline = ContinuousClock.now + .seconds(5)
+  while await control.requests.count == initialRequestCount && ContinuousClock.now < deadline {
+    await Task.yield()
+  }
+  try #require(await control.requests.count == initialRequestCount + 1)
+  let pending = try #require(await model.workspace.pendingPersistence)
+  model.editorText = fact("Newer exact text while the first request is held.")
+  model.editorReason = "Newer exact reason"
+  model.editorChanged()
+  let newerAutosave = try #require(model.autosaveTask)
+  newerAutosave.cancel()
+  await control.resumeWrites(
+    isFailing: !isAfterInstall, isFailingAfterInstall: isAfterInstall)
+  await autosave.value
+  await newerAutosave.value
+  #expect(model.draftFailure != nil, "Cancellation does not acknowledge a current owner's failure")
+  #expect(model.message == "Draft not yet persisted")
+  #expect(model.failure == nil)
+  #expect(model.isInputDirty)
+  #expect(model.isDraftDirty)
+  #expect(model.editorText == fact("Newer exact text while the first request is held."))
+  #expect(model.editorReason == "Newer exact reason")
+  let failed = try #require(await model.workspace.pendingPersistence)
+  #expect(failed.id == pending.id)
+  #expect(failed.task == nil)
+  #expect(failed.request.sessionID == pending.request.sessionID)
+  #expect(failed.request.expectedDigest == pending.request.expectedDigest)
+  #expect(try memoryBatchDigest(failed.request.draft) == memoryBatchDigest(pending.request.draft))
+  await control.resumeWrites()
+  try await model.flushInputAndPersistence()
+  let requests = Array(await control.requests.dropFirst(initialRequestCount))
+  try #require(requests.count == 3)
+  #expect(try memoryBatchDigest(requests[0]) == memoryBatchDigest(requests[1]))
+  #expect(requests[2].revision > requests[1].revision)
+  #expect(Set(requests.map(\.draftID)) == [pending.request.draft.draftID])
+  guard case .manual(let latest) = requests[2].batch?.items.first?.intent else {
+    throw MemoryError("Expected retained newer manual input")
+  }
+  #expect(latest.request.replacement == model.editorText)
+  #expect(latest.request.reason == model.editorReason)
+  #expect(await control.maximumInFlight == 1)
+  #expect(await model.workspace.pendingPersistence == nil)
+  #expect(!model.isDraftDirty)
+  #expect(model.draftFailure == nil)
+  #expect(model.draftRecoveries.map(\.failure.saveID) == [try memoryBatchDigest(retained.draft)])
+  let after = try fixture.snapshot(journal)
+  for (path, bytes) in recoveryBefore { #expect(after[path] == bytes) }
+  try await model.shutdown()
+}
+
 @Test(arguments: ["unloaded", "missing", "corrupt", "changed"])
 @MainActor func nativeIndependentManualCreationFailsClosedBeforeCachedInputPersists(variant: String)
   async throws

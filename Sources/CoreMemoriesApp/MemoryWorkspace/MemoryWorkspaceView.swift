@@ -106,7 +106,7 @@ struct MemoryWorkspaceView: View {
         Button("Undo Staged Change") { Task { await model.undoStaging() } }
           .disabled(model.batchProjection == nil || model.isSaveUnresolved)
         Button("Discard Draft…", role: .destructive) { model.isConfirmingDiscard = true }
-          .disabled(model.draft == nil || model.isSaveUnresolved)
+          .disabled(!model.isDiscardEnabled)
         Spacer()
         Text(model.isDraftDirty ? "Draft not yet persisted" : "Draft saved locally").font(.caption)
         Button("Save Changes (\(model.stagedItems.count))") { Task { await model.save() } }
@@ -152,6 +152,7 @@ struct MemoryWorkspaceView: View {
   }
 
   @ViewBuilder private var editorInspector: some View {
+    let owner = model.editorOwner
     HStack {
       Text(model.isAmendingSuggestion ? "Edit Suggestion" : model.selectedItem?.title ?? "Memory")
         .font(.title2.bold())
@@ -169,26 +170,16 @@ struct MemoryWorkspaceView: View {
         TextEditor(
           text: Binding(
             get: { model.editorText },
-            set: {
-              model.editorText = $0
-              model.editorChanged()
-            })
+            set: { model.setEditorText($0, owner: owner) })
         ).font(.system(.body, design: .monospaced)).border(Color.secondary.opacity(0.2))
         TextField(
           "Change reason",
           text: Binding(
             get: { model.editorReason },
-            set: {
-              model.editorReason = $0
-              model.editorChanged()
-            }))
+            set: { model.setEditorReason($0, owner: owner) }))
         HStack {
           Button(model.isAmendingSuggestion ? "Preview Amendment" : "Stage Edit") {
-            Task {
-              do { try await model.flushInputAndPersistence() } catch {
-                model.failure = String(describing: error)
-              }
-            }
+            Task { await model.stageEditor() }
           }
           if model.isExistingEntry {
             Button("Stage Deletion", role: .destructive) { Task { await model.deleteEntry() } }

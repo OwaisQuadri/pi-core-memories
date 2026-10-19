@@ -15,6 +15,7 @@ import Foundation
   @Published var inspection: DreamInspection?
   @Published var dreamInspectionFailure: String?
   @Published var batchProjection: MemoryBatchProjection?
+  @Published var postSaveCandidates: [MemoryReviewCandidate] = []
   @Published var presentation: MemoryBatchPresentation?
   @Published var selection: NativeMemorySelection?
   @Published var retainedDraft: MemoryDraft?
@@ -54,6 +55,9 @@ import Foundation
   var persistedBatchRevision: UInt64?
   var workspaceGeneration: UInt64 = 0
   var autosaveTask: Task<Void, Never>?
+  var autosaveID: UUID?
+  var submittedInput: NativeSubmittedInput?
+  var isSubmittingSave = false
   var isWorkspaceLoaded = false
   var isLoaded = false
   private var shutdownTask: Task<Void, Error>?
@@ -93,19 +97,23 @@ import Foundation
     isBusy = true
     defer { isBusy = false }
     do {
-      try await flushInputAndPersistence()
+      if !isRetainingConsumedInput { try await flushInputAndPersistence() }
       await refreshSnapshot()
     } catch { failure = String(describing: error) }
   }
 
-  func refreshSnapshot() async {
+  func refreshSnapshot(isRepreparingBatch: Bool = true) async {
+    postSaveCandidates = []
     await pauseQueue()
     savedRecovery = nil
     apply(await workspace.refresh())
-    if isWaitingForIndependentManualWork {
+    if !isRepreparingBatch || isWaitingForIndependentManualWork || isRetainingConsumedInput
+      || isSubmittingSave
+    {
       isWorkspaceLoaded = false
       reviewFailure = await workspace.reviewPreparationFailure
     } else if isWorkspaceLoaded || section == "Memories" {
+      if isSubmittedOwnerConsumed { submittedInput = nil }
       workspaceGeneration &+= 1
       do {
         let prepared = try await workspace.reprepareBatch()
@@ -116,6 +124,12 @@ import Foundation
       } catch {
         failure = String(describing: error)
       }
+    }
+    if batchProjection == nil {
+      let readback = await workspace.reviewCandidatePage()
+      postSaveCandidates = readback.candidates
+      reviewFailure = readback.failure
+      isWorkspaceLoaded = false
     }
     reloadQueue()
   }
@@ -223,7 +237,9 @@ import Foundation
     draftRecoveries = snapshot.draftRecoveries
     draftRecoveryDetails = nil
     if case .recovery = selection { selection = nil }
-    if batchProjection == nil, !isInputDirty, draftRecoveries.isEmpty, let recovered = drafts.last {
+    if batchProjection == nil, !isInputDirty, !isSubmittedOwnerConsumed, draftRecoveries.isEmpty,
+      let recovered = drafts.last
+    {
       retainedDraft = recovered
       message = "Recovered draft"
     }
@@ -427,6 +443,7 @@ import Foundation
       coverageObservedAt = nil
       dreamPhase = "Idle"
       dreamDetail = ""
+      postSaveCandidates = []
       message = "Settings saved"
       await refreshSnapshot()
     } catch { failure = String(describing: error) }
@@ -458,6 +475,7 @@ import Foundation
       presentation = nil
       draftRecoveryDetails = nil
       isWorkspaceLoaded = false
+      postSaveCandidates = []
     }
     shutdownTask = task
     defer {

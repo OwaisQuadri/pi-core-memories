@@ -28,6 +28,22 @@ struct NativePendingPersistence {
   var attemptID: UUID?
 }
 
+enum NativeBatchLifecycleError: Error {
+  case draftOwnerChanged
+  case inputOwnerUnavailable
+  case retainedInputRequiresDiscard
+}
+
+extension NativeBatchLifecycleError: CustomStringConvertible {
+  var description: String {
+    switch self {
+    case .draftOwnerChanged: "The native draft owner is no longer active"
+    case .inputOwnerUnavailable: "Open a native draft before staging input"
+    case .retainedInputRequiresDiscard: "Discard retained unsaved input before continuing"
+    }
+  }
+}
+
 enum NativeBatchCommand: Sendable {
   case select(UUID?)
   case manual(MemoryManagementRequest, UUID?)
@@ -69,6 +85,17 @@ extension Workspace {
       reviewPreparationFailure = String(describing: error)
       return (nil, [])
     }
+  }
+
+  func reviewCandidatePage() -> (candidates: [MemoryReviewCandidate], failure: String?) {
+    let catalog = optionalReviewCatalog()
+    let page = catalog.candidates.sorted { left, right in
+      let leftOrder = left.disposition == .approved || left.disposition == .rejected ? 1 : 0
+      let rightOrder = right.disposition == .approved || right.disposition == .rejected ? 1 : 0
+      return leftOrder == rightOrder
+        ? left.change.id.rawValue < right.change.id.rawValue : leftOrder < rightOrder
+    }.prefix(64).sorted { $0.change.id.rawValue < $1.change.id.rawValue }
+    return (page, reviewPreparationFailure)
   }
 
   func openBatch(catalogLimit: Int = 64) throws -> MemoryBatchProjection {
@@ -142,9 +169,21 @@ extension Workspace {
     }
   }
 
-  func batch(_ command: NativeBatchCommand) throws -> NativeBatchUpdate {
+  private func admitBatch(expectedDraftID: UUID?) throws {
     guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
-    _ = try openBatch()
+    if let expectedDraftID {
+      guard session?.projection.draft.draftID == expectedDraftID else {
+        throw NativeBatchLifecycleError.draftOwnerChanged
+      }
+    } else {
+      _ = try openBatch()
+    }
+  }
+
+  func batch(_ command: NativeBatchCommand, expectedDraftID: UUID? = nil) throws
+    -> NativeBatchUpdate
+  {
+    try admitBatch(expectedDraftID: expectedDraftID)
     let session = session!
     if !draftRecoveries.isEmpty {
       switch command {
@@ -175,8 +214,8 @@ extension Workspace {
     return NativeBatchUpdate(projection: session.projection, presentation: presentation)
   }
 
-  func persistBatch() async throws -> MemoryBatchProjection {
-    _ = try openBatch()
+  func persistBatch(expectedDraftID: UUID? = nil) async throws -> MemoryBatchProjection {
+    try admitBatch(expectedDraftID: expectedDraftID)
     while let session {
       if pendingPersistence == nil {
         if durableRevision == session.projection.draft.revision { return session.projection }
@@ -212,9 +251,10 @@ extension Workspace {
     throw WorkspaceError("The active session changed during persistence")
   }
 
-  func saveBatch() async throws -> MemoryBatchSaveResult {
-    guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
-    _ = try await persistBatch()
+  func saveBatch(expectedDraftID: UUID? = nil) async throws -> MemoryBatchSaveResult {
+    try admitBatch(expectedDraftID: expectedDraftID)
+    _ = try await persistBatch(expectedDraftID: expectedDraftID)
+    try admitBatch(expectedDraftID: expectedDraftID)
     if session!.projection.draft.batch?.isManualOnly == false {
       let inspection = try editorStore().inspectDrafts(review: availableReviewController())
       draftRecoveries = inspection.recoveryRequired

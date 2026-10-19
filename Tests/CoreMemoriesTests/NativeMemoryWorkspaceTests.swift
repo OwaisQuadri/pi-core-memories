@@ -16,9 +16,9 @@ actor NativePersistenceControl {
   func failWrites() { isFailing = true }
   func failInstalledWrite() { isFailingAfterInstall = true }
   func pauseWrites() { isPaused = true }
-  func resumeWrites() {
-    isFailing = false
-    isFailingAfterInstall = false
+  func resumeWrites(isFailing: Bool = false, isFailingAfterInstall: Bool = false) {
+    self.isFailing = isFailing
+    self.isFailingAfterInstall = isFailingAfterInstall
     isPaused = false
     release?.resume()
     release = nil
@@ -47,6 +47,8 @@ actor NativePersistenceControl {
 }
 
 extension Workspace {
+  var isNativeBatchOpen: Bool { session != nil }
+
   func observeNativeHistory(_ counter: MemoryBatchInteractionCount) {
     review?.batchHistoryObserver = { counter.increment() }
   }
@@ -66,6 +68,158 @@ extension Workspace {
   await model.load()
   #expect(model.failure == nil)
   return model
+}
+
+@Test @MainActor func nativeConsumedInputKeepsParkedDraftHistoryIsolated() async throws {
+  let fixture = try ReviewFlowFixture()
+  defer { fixture.transaction.clean() }
+  let model = try await nativeReviewModel(fixture)
+  await model.add()
+  let owner = try #require(model.editorOwner)
+  let journal = URL(fileURLWithPath: model.configuration.journal)
+  let store = try MemoryDraftStore(repository: fixture.transaction.memory, journal: journal)
+  let parkedSession = try MemoryBatchSession(
+    repository: fixture.transaction.memory, drafts: store,
+    configurationURL: fixture.configurationURL,
+    allowedPaths: try #require(model.draft?.batch?.binding.allowedPaths))
+  try parkedSession.stageManual(
+    MemoryManagementRequest(
+      operation: .add, base: parkedSession.persistenceSnapshot.baseCommit, path: "MEMORY.md",
+      replacement: fact("Parked draft B must remain available history."),
+      reason: "Parked B reason"))
+  _ = try store.persistBatch(parkedSession.persistenceRequest)
+  let parked = parkedSession.persistenceSnapshot
+  let parkedDigest = try memoryBatchDigest(parked)
+  let parkedCurrent = journal.appendingPathComponent("\(parked.draftID)-current.json")
+  let parkedBytes = try Data(contentsOf: parkedCurrent)
+  let available = await model.workspace.refresh()
+  try #require(available.draftRecoveries.isEmpty)
+  try #require(available.drafts.contains { $0.draftID == parked.draftID })
+  try #require(parked.schemaVersion == 2 && parked.batch?.isManualOnly == true)
+  try #require(parked.draftID != owner.draft.draftID)
+  let base = try fixture.transaction.main()
+  let submittedText = fact("Submitted draft A.")
+  model.setEditorText(submittedText, owner: owner)
+  model.setEditorReason("Submitted A reason", owner: owner)
+  await model.save()
+  guard case .saved(let receipt) = model.saveOutcome else {
+    throw MemoryError("Expected a completed Save for A")
+  }
+  let published = try fixture.transaction.main()
+  #expect(published != base)
+  #expect(receipt.commit == published)
+  #expect(receipt.draftID == owner.draft.draftID)
+  #expect(model.failure == nil)
+  #expect(model.draftRecoveries.isEmpty)
+  #expect(!model.isInputDirty)
+  #expect(model.isSubmittedOwnerConsumed)
+  #expect(model.retainedDraft == nil, "Clean consumed input must not adopt parked B")
+  #expect(!model.isRetainedSaveRecoverable)
+  #expect(model.drafts.contains { $0.draftID == parked.draftID })
+  #expect(await model.workspace.currentDraft?.draftID == parked.draftID)
+  let submitted = try #require(model.submittedInput)
+  let laterText = fact("Exact later A input.\nKeep this second line.")
+  let laterReason = "Exact later A reason"
+  model.setEditorText(laterText, owner: owner)
+  model.setEditorReason(laterReason, owner: owner)
+  #expect(model.editorText == laterText)
+  #expect(model.editorReason == laterReason)
+  #expect(model.editorOwner == owner)
+  #expect(model.selection == nil)
+  #expect(model.isEditing)
+  #expect(model.isInputDirty)
+  #expect(model.isRetainingConsumedInput)
+  #expect(!model.isSaveUnresolved && !model.isRetainedSaveRecoverable)
+  #expect(!model.isSaveEnabled)
+  #expect(model.isDiscardEnabled)
+  #expect(model.batchProjection == nil)
+  #expect(model.nativeDraftOwner == nil)
+  #expect(model.autosaveTask == nil)
+  let before = try fixture.transaction.snapshot(journal)
+  await model.recoverSave()
+  #expect(model.submittedInput?.owner == submitted.owner)
+  #expect(model.submittedInput?.revision == submitted.revision)
+  #expect(model.submittedInput?.text == submittedText)
+  #expect(model.submittedInput?.reason == "Submitted A reason")
+  #expect(model.isRetainingConsumedInput)
+  #expect(model.message == "Saved changes in one commit")
+  #expect(model.editorText == laterText)
+  #expect(model.editorReason == laterReason)
+  #expect(try fixture.transaction.snapshot(journal) == before)
+  await model.discard()
+  #expect(!model.isInputDirty)
+  #expect(!model.isEditing)
+  #expect(model.editorText.isEmpty)
+  #expect(model.editorReason.isEmpty)
+  #expect(model.submittedInput == nil)
+  let after = try fixture.transaction.snapshot(journal)
+  #expect(after == before, "Confirmed local Discard must leave B's journal unchanged")
+  #expect(after[parkedCurrent.path]?.bytes == parkedBytes)
+  let remaining = await model.workspace.refresh()
+  #expect(remaining.draftRecoveries.isEmpty)
+  #expect(
+    try remaining.drafts.first { $0.draftID == parked.draftID }.map(memoryBatchDigest)
+      == parkedDigest)
+  #expect(try fixture.transaction.main() == published)
+  try await model.shutdown()
+}
+
+@Test(arguments: [false, true])
+@MainActor func nativePostSaveCandidateReloadKeepsTheConsumedOwnerClosed(isDecisionOnly: Bool)
+  async throws
+{
+  let fixture = try ReviewFlowFixture()
+  defer { fixture.transaction.clean() }
+  let model = try await nativeReviewModel(fixture)
+  let candidate = try #require(model.actionableCandidates.first)
+  let reviewedCount = model.reviewedCandidates.count
+  let base = try fixture.transaction.main()
+  if isDecisionOnly {
+    await model.disposition(candidate, isRejected: true)
+  } else {
+    await model.selectMemory(.candidate(candidate.change.id.rawValue))
+    await model.stageShown()
+  }
+  let consumedDraftID = try #require(model.draft).draftID
+  await model.save()
+  switch model.saveOutcome {
+  case .decisionsSaved: #expect(isDecisionOnly)
+  case .saved: #expect(!isDecisionOnly)
+  default: throw MemoryError("Expected a consuming Save outcome")
+  }
+  #expect(model.message == (isDecisionOnly ? "Decisions saved" : "Saved changes in one commit"))
+  #expect(model.failure == nil)
+  #expect(model.reviewFailure == nil)
+  #expect(model.actionableCandidates.count == 7)
+  #expect(model.reviewedCandidates.count == reviewedCount + 1)
+  #expect(
+    model.reviewedCandidates.first { $0.change.id == candidate.change.id }?.disposition
+      == (isDecisionOnly ? .rejected : .approved))
+  #expect(model.batchProjection == nil)
+  #expect(model.presentation == nil)
+  #expect(model.nativeDraftOwner == nil)
+  #expect(model.stagedItems.isEmpty)
+  #expect(!model.isWorkspaceLoaded)
+  #expect(!model.isSaveEnabled)
+  #expect(await !model.workspace.isNativeBatchOpen)
+  #expect(await model.workspace.currentDraft == nil)
+  #expect(await model.workspace.pendingPersistence == nil)
+  let savedMain = try fixture.transaction.main()
+  #expect(isDecisionOnly ? savedMain == base : savedMain != base)
+  await model.stageShown()
+  #expect(model.stagedItems.isEmpty)
+  #expect(await !model.workspace.isNativeBatchOpen)
+  let remaining = try #require(model.actionableCandidates.first)
+  await model.selectMemory(.candidate(remaining.change.id.rawValue))
+  #expect(model.draft?.draftID != consumedDraftID)
+  #expect(model.nativeDraftOwner != nil)
+  #expect(model.postSaveCandidates.isEmpty)
+  #expect(model.presentation != nil)
+  #expect(model.stagedItems.isEmpty)
+  await model.stageShown()
+  #expect(model.stagedItems.count == 1)
+  #expect(try fixture.transaction.main() == savedMain)
+  try await model.shutdown()
 }
 
 @Test(arguments: ["project", "deviceProject"])
@@ -293,6 +447,53 @@ extension Workspace {
       == MemoryDocument.sourceAnnotations(in: candidate.change.after))
   await model.stageShown()
   #expect(model.batchProjection?.needsReview.isEmpty == true)
+  try await model.shutdown()
+}
+
+@Test @MainActor func nativeFlushDrainsNewerAutosaveAdmittedWhileAwaitingPredecessor() async throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let control = NativePersistenceControl()
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try queueConfiguration(fixture).save(to: url)
+  let model = AppModel(
+    configURL: url, autosaveDelay: .zero,
+    persistence: NativeBatchPersistence(write: control.write))
+  await model.load()
+  await model.pauseQueue()
+  await model.add()
+  await control.pauseWrites()
+  let owner = try #require(model.editorOwner)
+  model.setEditorText(fact("First autosave held while the flush starts."), owner: owner)
+  model.setEditorReason("First reason", owner: owner)
+  let previous = try #require(model.autosaveTask)
+  let deadline = ContinuousClock.now + .seconds(5)
+  while await control.requests.isEmpty && ContinuousClock.now < deadline { await Task.yield() }
+  if await control.requests.isEmpty { await control.resumeWrites() }
+  try #require(await control.requests.count == 1)
+  let flush = Task { try await model.flushInputAndPersistence() }
+  while !previous.isCancelled && ContinuousClock.now < deadline { await Task.yield() }
+  if !previous.isCancelled { await control.resumeWrites() }
+  try #require(previous.isCancelled)
+  let latestText = fact("Latest exact input admitted while the flush awaits its predecessor.")
+  model.setEditorText(latestText, owner: owner)
+  model.setEditorReason("Latest exact reason", owner: owner)
+  await control.resumeWrites()
+  try await flush.value
+  #expect(!model.isDraftDirty)
+  #expect(model.autosaveTask == nil)
+  #expect(model.autosaveID == nil)
+  #expect(await control.maximumInFlight == 1)
+  let requests = await control.requests
+  try #require(requests.count == 2)
+  #expect(requests[1].revision > requests[0].revision)
+  guard case .manual(let intent) = requests[1].batch?.items.first?.intent else {
+    throw MemoryError("Expected the latest drained manual input")
+  }
+  #expect(intent.request.replacement == latestText)
+  #expect(intent.request.reason == "Latest exact reason")
+  #expect(await model.workspace.pendingPersistence == nil)
   try await model.shutdown()
 }
 

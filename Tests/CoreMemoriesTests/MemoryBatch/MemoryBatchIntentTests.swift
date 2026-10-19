@@ -99,3 +99,45 @@ func memoryBatchTestJournal(_ root: URL) throws -> URL {
     try FileManager.default.contentsOfDirectory(
       atPath: fixture.root.appendingPathComponent("drafts").path) == before)
 }
+
+@Test func batchCompleteScopeGrowthPreservesItemWindowAndExactBindingLimits() throws {
+  let fixture = try Fixture()
+  defer { fixture.clean() }
+  let drafts = try MemoryDraftStore(
+    repository: fixture.repo, journal: memoryBatchTestJournal(fixture.root))
+  let paths =
+    ["MEMORY.md"]
+    + (0..<256).map {
+      "devices/" + String(format: "%064x", $0) + "/MEMORY.md"
+    }
+  let session = try MemoryBatchSession(
+    repository: fixture.repo, drafts: drafts, allowedPaths: paths)
+  let extra = "devices/" + String(repeating: "f", count: 64) + "/MEMORY.md"
+  try session.preparePath(extra)
+  for index in 0..<256 {
+    try session.stageManual(
+      MemoryManagementRequest(
+        operation: .add, base: session.persistenceSnapshot.baseCommit, path: "MEMORY.md",
+        replacement: fact("Staged preference \(index)."), reason: "Requested addition"))
+  }
+  let draft = session.persistenceSnapshot
+  #expect(draft.batch?.items.count == 256)
+  #expect(draft.batch?.binding.allowedPaths == (paths + [extra]).sorted())
+  #expect(throws: (any Error).self) {
+    try session.stageManual(
+      MemoryManagementRequest(
+        operation: .add, base: draft.baseCommit, path: "MEMORY.md",
+        replacement: fact("Over the staged limit."), reason: "Requested addition"))
+  }
+  #expect(try memoryBatchDigest(session.persistenceSnapshot) == memoryBatchDigest(draft))
+  _ = try drafts.persistBatch(session.persistenceRequest)
+  let durable = try #require(try drafts.list().first)
+  #expect(try memoryBatchDigest(durable) == memoryBatchDigest(draft))
+  #expect(throws: (any Error).self) {
+    try MemoryBatchSession(
+      repository: fixture.repo, drafts: drafts, restoring: durable, allowedPaths: ["MEMORY.md"])
+  }
+  #expect(throws: (any Error).self) {
+    try MemoryBatchSession(repository: fixture.repo, drafts: drafts, catalogLimit: 257)
+  }
+}

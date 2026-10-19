@@ -129,6 +129,7 @@ extension AppModel {
     let update = try await workspace.batch(command)
     guard generation == workspaceGeneration else { throw CancellationError() }
     applyBatch(update.projection)
+    reviewFailure = await workspace.reviewPreparationFailure
     return update
   }
 
@@ -143,7 +144,7 @@ extension AppModel {
     do {
       await pauseQueue()
       applyBatch(try await workspace.openBatch())
-      reviewFailure = nil
+      reviewFailure = await workspace.reviewPreparationFailure
     } catch {
       reviewFailure = String(describing: error)
       failure = reviewFailure

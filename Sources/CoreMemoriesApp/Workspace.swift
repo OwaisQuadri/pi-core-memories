@@ -29,6 +29,7 @@ actor Workspace {
   var draftStore: MemoryDraftStore?
   var currentDraft: MemoryDraft?
   var review: MemoryReviewController?
+  var reviewPreparationFailure: String?
   var session: MemoryBatchSession?
   var durableRevision: UInt64?
   var pendingPersistence: NativePendingPersistence?
@@ -62,7 +63,7 @@ actor Workspace {
     if FileManager.default.fileExists(atPath: configuration.journal) {
       do {
         let store = try editorStore()
-        drafts = try store.list(review: availableReviewController())
+        drafts = try store.list(review: optionalReviewCatalog().controller)
         if currentDraft == nil { currentDraft = drafts.last }
       } catch { failures.append(String(describing: error)) }
     }

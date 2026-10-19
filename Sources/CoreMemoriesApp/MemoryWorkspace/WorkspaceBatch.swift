@@ -56,28 +56,55 @@ extension Workspace {
     return try reviewController()
   }
 
+  func optionalReviewCatalog() -> (
+    controller: MemoryReviewController?, candidates: [MemoryReviewCandidate]
+  ) {
+    do {
+      let controller = try availableReviewController()
+      let candidates = try controller?.list() ?? []
+      reviewPreparationFailure = nil
+      return (controller, candidates)
+    } catch {
+      review = nil
+      reviewPreparationFailure = String(describing: error)
+      return (nil, [])
+    }
+  }
+
   func openBatch(catalogLimit: Int = 64) throws -> MemoryBatchProjection {
     if let session { return session.projection }
     guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
     let store = try editorStore()
-    let controller = try availableReviewController()
-    let restored = try currentDraft ?? store.list(review: controller).last
-    let opened = try prepareBatch(restoring: restored, catalogLimit: catalogLimit)
+    let suggestions = optionalReviewCatalog()
+    var restored = try currentDraft ?? store.list(review: suggestions.controller).last
+    if let legacy = restored, legacy.batch == nil, !legacy.operations.isEmpty,
+      try store.recoverSave(
+        draftID: legacy.draftID, expectedRevision: legacy.revision,
+        idempotencyKey: "native-save-\(legacy.revision)") != nil
+    {
+      try store.discard(draftID: legacy.draftID, expectedRevision: legacy.revision)
+      restored = nil
+      currentDraft = nil
+    }
+    let opened = try prepareBatch(
+      restoring: restored, suggestions: suggestions, catalogLimit: catalogLimit)
     session = opened
     currentDraft = opened.projection.draft
     durableRevision = restored?.revision ?? 0
     return opened.projection
   }
 
-  private func prepareBatch(restoring: MemoryDraft?, catalogLimit: Int = 64) throws
-    -> MemoryBatchSession
-  {
+  private func prepareBatch(
+    restoring: MemoryDraft?,
+    suggestions: (controller: MemoryReviewController?, candidates: [MemoryReviewCandidate]),
+    catalogLimit: Int = 64
+  ) throws -> MemoryBatchSession {
     let store = try editorStore()
-    let controller = try availableReviewController()
+    let controller = suggestions.controller
     let catalog = try MemoryManagement(repository: configuration.memoryURL).execute(
       .init(operation: .list))
     var paths = Set(catalog.entries.map(\.path) + ["MEMORY.md"])
-    for candidate in try controller?.list() ?? [] { paths.insert(candidate.change.path) }
+    for candidate in suggestions.candidates { paths.insert(candidate.change.path) }
     for key in configuration.projectBindings.values { paths.insert("projects/\(key).md") }
     if let device = configuration.deviceKey {
       paths.insert("devices/\(device)/MEMORY.md")
@@ -182,7 +209,8 @@ extension Workspace {
     else { throw WorkspaceError("Select the retained draft before recovering its Save") }
     currentDraft = draft
     let result = try editorStore().recoverBatch(
-      draftID: draft.draftID, revision: draft.revision, review: availableReviewController())
+      draftID: draft.draftID, revision: draft.revision,
+      review: draft.batch?.isManualOnly == true ? nil : availableReviewController())
     if let result { retainBatchOutcome(result) } else { unresolvedSave = nil }
     return result
   }
@@ -203,7 +231,7 @@ extension Workspace {
     guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
     if session != nil { _ = try await persistBatch() }
     guard
-      let latest = try editorStore().list(review: availableReviewController()).first(where: {
+      let latest = try editorStore().list(review: optionalReviewCatalog().controller).first(where: {
         $0.draftID == draft.draftID && $0.revision == draft.revision
       })
     else { throw WorkspaceError("Draft changed; refresh recovery") }
@@ -245,7 +273,8 @@ extension Workspace {
     if session != nil { _ = try await persistBatch() }
     let previous = session?.projection.draft ?? currentDraft
     let isEmpty = previous.map { $0.batch?.items.isEmpty ?? $0.operations.isEmpty } ?? false
-    let opened = try prepareBatch(restoring: isEmpty ? nil : previous)
+    let opened = try prepareBatch(
+      restoring: isEmpty ? nil : previous, suggestions: optionalReviewCatalog())
     if isEmpty, let previous {
       do {
         try editorStore().discard(

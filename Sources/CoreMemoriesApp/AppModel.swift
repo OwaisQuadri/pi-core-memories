@@ -104,6 +104,7 @@ import Foundation
         let prepared = try await workspace.reprepareBatch()
         clearEditor()
         applyBatch(prepared)
+        reviewFailure = await workspace.reviewPreparationFailure
       } catch {
         failure = String(describing: error)
       }

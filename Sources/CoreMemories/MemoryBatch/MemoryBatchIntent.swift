@@ -48,6 +48,8 @@ package struct MemoryBatchItem: Codable, Sendable {
 }
 
 package struct MemoryBatchBinding: Codable, Sendable {
+  static let maximumAllowedPaths = try! DreamDecisionLimits().maximumLayoutEntries
+
   package let configurationPath: String?
   package let configurationDigest: String?
   package let allowedPaths: [String]
@@ -69,6 +71,13 @@ package struct MemoryBatchBinding: Codable, Sendable {
 package struct MemoryBatchContents: Codable, Sendable {
   package let binding: MemoryBatchBinding
   package let items: [MemoryBatchItem]
+
+  package var isManualOnly: Bool {
+    items.allSatisfy {
+      if case .manual = $0.intent { return true }
+      return false
+    }
+  }
 }
 
 package struct MemoryBatchPersistenceRequest: Sendable {

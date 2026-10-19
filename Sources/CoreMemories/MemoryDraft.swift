@@ -125,6 +125,18 @@ package final class MemoryDraftStore {
     }
   }
 
+  package func recoverSave(draftID: UUID, expectedRevision: UInt64, idempotencyKey: String)
+    throws -> MemoryDraftReceipt?
+  {
+    try locked {
+      let draft = try current(draftID, revision: expectedRevision)
+      guard draft.batch == nil else {
+        throw MemoryError("typed batches require the proof-aware batch recovery")
+      }
+      return try recover(draft: draft, idempotencyKey: idempotencyKey)
+    }
+  }
+
   package func save(draftID: UUID, expectedRevision: UInt64, idempotencyKey: String) throws
     -> MemoryDraftReceipt
   {
@@ -135,20 +147,11 @@ package final class MemoryDraftStore {
       }
       try root.installReviewFile(
         DreamRunEncoding.encode(draft), name: "\(draftID.uuidString)-\(expectedRevision).json")
-      guard !idempotencyKey.isEmpty, idempotencyKey.utf8.count <= 256,
-        !idempotencyKey.contains("\0"), !draft.operations.isEmpty
-      else { throw MemoryError("Save requires changes and a bounded idempotency key") }
-      let digest = SourceDigest(bytes: try DreamRunEncoding.encode(draft)).rawValue
-      let auditRef =
-        "refs/memory-management/drafts/"
-        + SourceDigest(
-          bytes: Data("\(binding)\0\(draftID)\0\(idempotencyKey)".utf8)
-        ).rawValue
-      if let receipt = try recover(
-        draft: draft, digest: digest, auditRef: auditRef, idempotencyKey: idempotencyKey)
-      {
+      if let receipt = try recover(draft: draft, idempotencyKey: idempotencyKey) {
         return receipt
       }
+      let digest = SourceDigest(bytes: try DreamRunEncoding.encode(draft)).rawValue
+      let auditRef = saveAuditRef(draftID: draftID, idempotencyKey: idempotencyKey)
       _ = try current(draftID, revision: expectedRevision)
       guard try store.approvedCommit() == draft.baseCommit else {
         throw MemoryError(
@@ -243,14 +246,25 @@ package final class MemoryDraftStore {
     return (replacements, changes)
   }
 
-  private func recover(draft: MemoryDraft, digest: String, auditRef: String, idempotencyKey: String)
-    throws -> MemoryDraftReceipt?
-  {
+  private func saveAuditRef(draftID: UUID, idempotencyKey: String) -> String {
+    "refs/memory-management/drafts/"
+      + SourceDigest(bytes: Data("\(binding)\0\(draftID)\0\(idempotencyKey)".utf8)).rawValue
+  }
+
+  private func recover(draft: MemoryDraft, idempotencyKey: String) throws -> MemoryDraftReceipt? {
+    guard !idempotencyKey.isEmpty, idempotencyKey.utf8.count <= 256,
+      !idempotencyKey.contains("\0"), !draft.operations.isEmpty
+    else { throw MemoryError("Save requires changes and a bounded idempotency key") }
+    let digest = SourceDigest(bytes: try DreamRunEncoding.encode(draft)).rawValue
+    let auditRef = saveAuditRef(draftID: draft.draftID, idempotencyKey: idempotencyKey)
     let refs = try git.text([
       "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", auditRef,
     ])
     let exact = refs.split(separator: "\n").filter { $0.hasPrefix(auditRef + "\0") }
-    if exact.isEmpty { return nil }
+    if exact.isEmpty {
+      guard refs.isEmpty else { throw MemoryError("Save receipt must be an exact direct ref") }
+      return nil
+    }
     guard exact.count == 1 else { throw DreamRunError.corruption }
     let fields = exact[0].split(separator: "\0", omittingEmptySubsequences: false)
     guard fields.count == 3, fields[2].isEmpty, MemoryStore.isFullOID(String(fields[1])) else {
@@ -290,6 +304,9 @@ package final class MemoryDraftStore {
         layout[entry.path].map { $0.0 == entry.mode && $0.1 == entry.blob } ?? false
       })
     else { throw MemoryError("Save receipt tree differs from the saved draft") }
+    guard try MemoryBatchReplay.isAncestor(commit, of: store.approvedCommit(), git: git) else {
+      throw MemoryError("Save receipt is absent from approved history")
+    }
     return MemoryDraftReceipt(
       draftID: draft.draftID, revision: draft.revision, contentDigest: digest,
       base: draft.baseCommit, commit: commit, auditRef: auditRef)
@@ -327,7 +344,7 @@ package final class MemoryDraftStore {
     guard draft.schemaVersion == 2, draft.operations.isEmpty, let batch = draft.batch,
       batch.items.count <= 256,
       Set(batch.items.map(\.itemID)).count == batch.items.count,
-      batch.binding.allowedPaths.count <= 256,
+      batch.binding.allowedPaths.count <= MemoryBatchBinding.maximumAllowedPaths,
       batch.binding.allowedPaths.allSatisfy(MemoryDocument.isAllowedPath)
     else { return false }
     return true

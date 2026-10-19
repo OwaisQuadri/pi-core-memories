@@ -70,7 +70,8 @@ package final class MemoryBatchSession {
     let preparedPaths = original.batch?.binding.preparedPaths
     let scopePaths = allowedPaths ?? snapshot.documents.map(\.path)
     let paths = Array(Set(scopePaths + (preparedPaths ?? []))).sorted()
-    guard scopePaths.count <= 256, paths.count <= 256,
+    guard scopePaths.count <= MemoryBatchBinding.maximumAllowedPaths,
+      paths.count <= MemoryBatchBinding.maximumAllowedPaths,
       paths.allSatisfy(MemoryDocument.isAllowedPath),
       preparedPaths == nil || preparedPaths == Array(Set(preparedPaths!)).sorted()
     else {
@@ -79,7 +80,9 @@ package final class MemoryBatchSession {
     let binding = MemoryBatchBinding(
       configurationPath: configurationURL?.path,
       configurationDigest: try configuration.map { try memoryBatchDigest($0) },
-      allowedPaths: paths, reviewBinding: try review.map { try memoryBatchDigest($0.binding) },
+      allowedPaths: paths,
+      reviewBinding: try review.map { try memoryBatchDigest($0.binding) }
+        ?? (original.batch?.isManualOnly == true ? original.batch?.binding.reviewBinding : nil),
       preparedPaths: preparedPaths)
     if let previous = original.batch {
       guard try memoryBatchDigest(previous.binding) == memoryBatchDigest(binding) else {
@@ -160,7 +163,8 @@ package final class MemoryBatchSession {
 
   package func save() throws -> MemoryBatchSaveResult {
     try drafts.saveBatch(
-      persistenceSnapshot, expectedDigest: expectedDurableDigest, review: review,
+      persistenceSnapshot, expectedDigest: expectedDurableDigest,
+      review: draft.batch!.isManualOnly ? nil : review,
       checkout: checkout,
       authorized: Set(items.filter(isAuthorized).map(\.itemID)),
       didPersist: { self.expectedDurableDigest = $0 })
@@ -191,7 +195,9 @@ package final class MemoryBatchSession {
     if binding.allowedPaths.contains(path) {
       return try prepareCatalog(offset: catalogOffset)
     }
-    guard binding.allowedPaths.count < 256, draft.revision < UInt64.max else {
+    guard binding.allowedPaths.count < MemoryBatchBinding.maximumAllowedPaths,
+      draft.revision < UInt64.max
+    else {
       throw DreamRunError.limitExceeded
     }
     let extended = MemoryBatchBinding(
@@ -250,7 +256,9 @@ package final class MemoryBatchSession {
     }
     guard try store.approvedCommit() == snapshot.base,
       try store.reviewGit.reviewCheckout().witness() == checkout,
-      try review.map({ try memoryBatchDigest($0.binding) }) == binding.reviewBinding
+      try
+        (review == nil && draft.batch!.isManualOnly
+        || review.map { try memoryBatchDigest($0.binding) } == binding.reviewBinding)
     else { throw MemoryError("prepared context changed; preserve and reconcile the batch") }
   }
 

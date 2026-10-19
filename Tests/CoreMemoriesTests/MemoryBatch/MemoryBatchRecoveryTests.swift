@@ -3,6 +3,60 @@ import Testing
 
 @testable import CoreMemories
 
+@Test(arguments: [false, true])
+func batchInspectionKeepsMissingAuditReadOnlyUntilExplicitRecovery(isReceiptConflicting: Bool)
+  throws
+{
+  let fixture = try Fixture()
+  defer { fixture.clean() }
+  let manager = try MemoryManagement(repository: fixture.repo)
+  try manager.confirmDetach(manager.checkoutPreview())
+  let drafts = try MemoryDraftStore(
+    repository: fixture.repo, journal: memoryBatchTestJournal(fixture.root))
+  let session = try MemoryBatchSession(repository: fixture.repo, drafts: drafts)
+  try session.stageManual(
+    MemoryManagementRequest(
+      operation: .add, base: session.draft.baseCommit, path: "MEMORY.md",
+      replacement: fact("Explicit manual Save."), reason: "Requested addition"))
+  let draft = session.draft
+  guard case .saved(let receipt) = try session.save() else {
+    throw MemoryError("Expected a checked synthetic Save")
+  }
+  let commit = try #require(receipt.commit)
+  let auditRef = try #require(receipt.auditRef)
+  let receiptName = "batch-receipt-\(receipt.saveID).json"
+  if isReceiptConflicting {
+    let conflicting = MemoryBatchReceipt(
+      saveID: receipt.saveID, draftID: receipt.draftID, revision: receipt.revision,
+      base: receipt.base, commit: receipt.base, auditRef: receipt.auditRef)
+    try drafts.root.installReviewFile(
+      MemoryReviewEncoding.encode(conflicting), name: receiptName, isReplacing: true)
+  }
+  _ = try fixture.git(["update-ref", "-d", auditRef, commit])
+  let before = try fixture.snapshot(drafts.journal)
+  let refs = try fixture.git(["for-each-ref", "--format=%(refname) %(objectname) %(symref)"])
+  let inspection = try drafts.inspectDrafts()
+  #expect(
+    try fixture.git(["for-each-ref", "--format=%(refname) %(objectname) %(symref)"]) == refs)
+  #expect(try fixture.snapshot(drafts.journal) == before)
+  #expect(try fixture.store.approvedCommit() == commit)
+  #expect(inspection.drafts.isEmpty)
+  #expect(inspection.recoveryRequired.map(\.failure.saveID) == [receipt.saveID])
+  if isReceiptConflicting {
+    try drafts.root.installReviewFile(
+      MemoryReviewEncoding.encode(receipt), name: receiptName, isReplacing: true)
+  }
+  guard
+    case .saved(let recovered) = try drafts.recoverBatch(
+      draftID: draft.draftID, revision: draft.revision)
+  else { throw MemoryError("Explicit recovery must repair verified missing bookkeeping") }
+  #expect(try memoryBatchDigest(recovered) == memoryBatchDigest(receipt))
+  #expect(try fixture.git(["rev-parse", auditRef]) == commit)
+  #expect(try fixture.store.approvedCommit() == commit)
+  #expect(try drafts.inspectDrafts().recoveryRequired.isEmpty)
+  #expect(try drafts.list().isEmpty)
+}
+
 @Test(arguments: [
   "before-write", "file-sync", "install", "after-install", "directory-sync", "before-publication",
   "after-publication", "receipt",

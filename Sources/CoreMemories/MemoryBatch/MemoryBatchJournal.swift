@@ -121,11 +121,13 @@ extension MemoryDraftStore {
   }
 
   func verifyBatchConsumption(
-    _ draft: MemoryDraft, receipt: MemoryBatchReceipt, review: MemoryReviewController?
+    _ draft: MemoryDraft, receipt: MemoryBatchReceipt, review: MemoryReviewController?,
+    isReadOnly: Bool
   ) throws {
     let outcome: MemoryBatchSaveResult?
     do {
-      outcome = try MemoryBatchPublisher(root: root, store: store, review: review).recover(draft)
+      let publisher = MemoryBatchPublisher(root: root, store: store, review: review)
+      outcome = try isReadOnly ? publisher.inspect(draft) : publisher.recover(draft)
     } catch {
       throw MemoryBatchRecoveryRequired(saveID: receipt.saveID, details: "\(error)")
     }

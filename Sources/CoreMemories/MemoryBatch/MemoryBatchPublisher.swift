@@ -1,6 +1,12 @@
 import Foundation
 
 final class MemoryBatchPublisher {
+  private enum VerifiedOutcome {
+    case completed(MemoryBatchReceipt)
+    case missingAudit(MemoryBatchAttempt, main: String)
+    case unknown(saveID: String, details: String)
+  }
+
   let root: DreamStateDirectory
   let store: MemoryStore
   let review: MemoryReviewController?
@@ -31,7 +37,38 @@ final class MemoryBatchPublisher {
     }
   }
 
+  func inspect(_ draft: MemoryDraft) throws -> MemoryBatchSaveResult? {
+    switch try verifiedOutcome(draft) {
+    case .completed(let receipt):
+      return receipt.commit == nil ? .decisionsSaved(receipt) : .saved(receipt)
+    case .missingAudit(let attempt, _):
+      return .savedNeedsRecovery(
+        MemoryBatchReplay.receipt(attempt.manifest, commit: attempt.commit),
+        details: "saved attempt needs explicit audit-ref recovery")
+    case .unknown(let saveID, let details):
+      return .outcomeUnknown(saveID: saveID, details: details)
+    case nil: return nil
+    }
+  }
+
   func recover(_ draft: MemoryDraft) throws -> MemoryBatchSaveResult? {
+    switch try verifiedOutcome(draft) {
+    case .completed(let receipt): return finishRecovered(receipt)
+    case .missingAudit(let attempt, let main):
+      let git = store.reviewGit
+      let auditRef = "refs/memory-batches/\(attempt.manifest.saveID)"
+      let result = try git.directRefTransaction(
+        "verify refs/heads/main \(main)\ncreate \(auditRef) \(attempt.commit)\n",
+        refs: ["refs/heads/main", auditRef], isolatedHead: main)
+      guard result.status == 0 else { throw DreamRunError.persistenceFailure }
+      return finishRecovered(MemoryBatchReplay.receipt(attempt.manifest, commit: attempt.commit))
+    case .unknown(let saveID, let details):
+      return .outcomeUnknown(saveID: saveID, details: details)
+    case nil: return nil
+    }
+  }
+
+  private func verifiedOutcome(_ draft: MemoryDraft) throws -> VerifiedOutcome? {
     try verifyMemoryBatchRepository(store, review: review)
     let saveID = try memoryBatchDigest(draft)
     let git = store.reviewGit
@@ -55,7 +92,7 @@ final class MemoryBatchPublisher {
       else { throw DreamRunError.corruption }
       let composed = try composition(draft)
       try MemoryBatchReplay.validate(manifest, composition: composed, commit: commit, store: store)
-      return finishRecovered(MemoryBatchReplay.receipt(manifest, commit: commit))
+      return .completed(MemoryBatchReplay.receipt(manifest, commit: commit))
     }
     let decisionsName = "batch-decisions-\(saveID).json"
     if let review, try review.root.isPresent(decisionsName) {
@@ -67,7 +104,7 @@ final class MemoryBatchPublisher {
       }
       try MemoryBatchReplay.validate(
         manifest, composition: composition(draft), commit: nil, store: store)
-      return finishRecovered(MemoryBatchReplay.receipt(manifest, commit: nil))
+      return .completed(MemoryBatchReplay.receipt(manifest, commit: nil))
     }
     if let attempt {
       let main = try store.approvedCommit()
@@ -75,14 +112,10 @@ final class MemoryBatchPublisher {
         let composed = try composition(draft)
         try MemoryBatchReplay.validate(
           attempt.manifest, composition: composed, commit: attempt.commit, store: store)
-        let result = try git.directRefTransaction(
-          "verify refs/heads/main \(main)\ncreate \(auditRef) \(attempt.commit)\n",
-          refs: ["refs/heads/main", auditRef], isolatedHead: main)
-        guard result.status == 0 else { throw DreamRunError.persistenceFailure }
-        return finishRecovered(MemoryBatchReplay.receipt(attempt.manifest, commit: attempt.commit))
+        return .missingAudit(attempt, main: main)
       }
       if main != draft.baseCommit {
-        return .outcomeUnknown(
+        return .unknown(
           saveID: saveID,
           details: "saved attempt is absent from current approved ancestry; recovery is required")
       }

@@ -443,7 +443,8 @@ package final class MemoryDraftStore {
             receipt.revision == draft.revision, receipt.base == draft.baseCommit
           else { throw DreamRunError.corruption }
           do {
-            try verifyBatchConsumption(draft, receipt: receipt, review: review)
+            try verifyBatchConsumption(
+              draft, receipt: receipt, review: review, isReadOnly: recoveryRequired != nil)
           } catch let failure as MemoryBatchRecoveryRequired {
             guard let recoveryRequired else { throw failure }
             recoveryRequired(draft, failure)

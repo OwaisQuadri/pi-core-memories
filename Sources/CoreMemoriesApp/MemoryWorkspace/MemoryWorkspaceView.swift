@@ -40,6 +40,9 @@ struct MemoryWorkspaceView: View {
               ForEach(model.stagedItems, id: \.itemID) { item in
                 VStack(alignment: .leading, spacing: 4) {
                   Text(item.title)
+                  if let path = model.memoryPath(for: item) {
+                    Text(model.scopeLabel(path: path)).font(.caption).foregroundStyle(.secondary)
+                  }
                   Text(model.summary(for: item)).lineLimit(2).foregroundStyle(.secondary)
                   if model.batchProjection?.needsReview.contains(item.itemID) == true {
                     Text("Needs Review").foregroundStyle(.orange)
@@ -54,8 +57,11 @@ struct MemoryWorkspaceView: View {
             }
             Section("Saved Memories") {
               ForEach(model.visibleEntries, id: \.nativeID) { entry in
-                Text(MemoryDocument.reviewText(Data(entry.expected.utf8))).lineLimit(3)
-                  .tag(NativeMemorySelection.entry(entry.path, entry.locator.start))
+                VStack(alignment: .leading, spacing: 4) {
+                  Text(MemoryDocument.reviewText(Data(entry.expected.utf8))).lineLimit(3)
+                  Text(model.scopeLabel(path: entry.path)).font(.caption).foregroundStyle(
+                    .secondary)
+                }.tag(NativeMemorySelection.entry(entry.path, entry.locator.start))
                   .disabled(!model.draftRecoveries.isEmpty && model.batchProjection == nil)
               }
             }
@@ -131,6 +137,7 @@ struct MemoryWorkspaceView: View {
   private func candidateRow(_ candidate: MemoryReviewCandidate) -> some View {
     VStack(alignment: .leading, spacing: 4) {
       Text(MemoryDocument.reviewText(candidate.change.after)).lineLimit(3)
+      Text(model.scopeLabel(path: candidate.change.path)).font(.caption).foregroundStyle(.secondary)
       if candidate.disposition == .approved { Text("Saved").foregroundStyle(.secondary) }
       if candidate.disposition == .rejected { Text("Dismissed").foregroundStyle(.secondary) }
     }.tag(NativeMemorySelection.candidate(candidate.change.id.rawValue))
@@ -160,6 +167,9 @@ struct MemoryWorkspaceView: View {
       if let item = model.selectedItem {
         Button("Remove", role: .destructive) { Task { await model.removeItem(item.itemID) } }
       }
+    }
+    if let path = model.selectedMemoryPath {
+      Text(model.scopeLabel(path: path)).font(.callout).foregroundStyle(.secondary)
     }
     if model.isEditing {
       Picker("View", selection: $model.isShowingDiff) {
@@ -205,8 +215,16 @@ struct MemoryWorkspaceView: View {
           height: 140)
       }
       Button(model.selectedCandidate == nil ? "Stage Confirm Reviewed" : "Stage Acceptance") {
-        Task { await model.stageShown() }
-      }.disabled(model.isInputDirty || !model.isReviewTransitionEnabled)
+        if model.selectedCandidate == nil {
+          Task { await model.stageShown() }
+        } else {
+          model.submitReviewAction(.accept)
+        }
+      }.disabled(
+        model.selectedCandidate == nil
+          ? !model.isStageShownEnabled : !model.isReviewActionEnabled(.accept)
+      )
+      .help(model.selectedCandidate == nil ? "Stage Confirm Reviewed" : "Stage Acceptance (⌘↩)")
     }
     if let candidate = model.selectedCandidate,
       [.pending, .deferred].contains(candidate.disposition)
@@ -214,11 +232,13 @@ struct MemoryWorkspaceView: View {
       HStack {
         Button("Edit Suggestion") { Task { await model.editSuggestion() } }
           .disabled(model.presentation == nil || !model.isReviewTransitionEnabled)
-        Button("Decide Later") { Task { await model.disposition(candidate, isRejected: false) } }
-          .disabled(!model.isReviewTransitionEnabled)
+        Button("Decide Later") { model.submitReviewAction(.decideLater) }
+          .disabled(!model.isReviewActionEnabled(.decideLater))
+          .help("Decide Later (⌘⇧D)")
         Button("Dismiss", role: .destructive) {
-          Task { await model.disposition(candidate, isRejected: true) }
-        }.disabled(!model.isReviewTransitionEnabled)
+          model.submitReviewAction(.dismiss)
+        }.disabled(!model.isReviewActionEnabled(.dismiss))
+          .help("Dismiss (⌘⇧X)")
       }
     }
     if case .entry(let path, let start) = model.selection,
@@ -255,12 +275,21 @@ struct MemoryWorkspaceView: View {
       VStack(alignment: .leading, spacing: 8) {
         if let failure = model.failure { Text(failure).textSelection(.enabled) }
         if let failure = model.draftFailure { Text(failure).textSelection(.enabled) }
+        if let path = model.selectedMemoryPath {
+          Text(path).textSelection(.enabled)
+          ForEach(model.configuredProjectDirectories(path: path), id: \.self) { directory in
+            Text(directory).textSelection(.enabled)
+          }
+        }
         if let candidate = model.selectedCandidate {
           Text(candidate.limitation ?? "")
           PlainTextView(
             text: String(decoding: candidate.change.after, as: UTF8.self)
               + "\n\nREASON\n" + candidate.change.reason
               + "\n\nSOURCES\n" + candidate.change.sources.map(\.exactText).joined(separator: "\n")
+              + "\n\nRECORDED DIRECTORIES\n"
+              + Set(candidate.change.sources.compactMap(\.projectScope)).sorted().joined(
+                separator: "\n")
               + "\n\nCONTRADICTIONS\n" + String(describing: candidate.change.contradictions)
           ).frame(height: 140)
         }

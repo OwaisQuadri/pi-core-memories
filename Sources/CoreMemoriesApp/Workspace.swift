@@ -32,6 +32,8 @@ actor Workspace {
   var currentDraft: MemoryDraft?
   var review: MemoryReviewController?
   var reviewPreparationFailure: String?
+  var memoryScopeNames = NativeMemoryScopeNames()
+  var catalogPageSize = 64
   var session: MemoryBatchSession?
   var durableRevision: UInt64?
   var pendingPersistence: NativePendingPersistence?

@@ -72,6 +72,17 @@ import SwiftUI
           (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.redo()
         }.keyboardShortcut("z", modifiers: [.command, .shift])
       }
+      CommandMenu("Review") {
+        Button("Stage Acceptance") { model.submitReviewAction(.accept) }
+          .keyboardShortcut(.return, modifiers: .command)
+          .disabled(!model.isReviewActionEnabled(.accept))
+        Button("Decide Later") { model.submitReviewAction(.decideLater) }
+          .keyboardShortcut("d", modifiers: [.command, .shift])
+          .disabled(!model.isReviewActionEnabled(.decideLater))
+        Button("Dismiss") { model.submitReviewAction(.dismiss) }
+          .keyboardShortcut("x", modifiers: [.command, .shift])
+          .disabled(!model.isReviewActionEnabled(.dismiss))
+      }
       CommandGroup(after: .toolbar) {
         Button("Refresh") { Task { await model.refresh() } }.keyboardShortcut("r")
         Button("Cancel Dream") { model.cancelDream() }.keyboardShortcut(".").disabled(

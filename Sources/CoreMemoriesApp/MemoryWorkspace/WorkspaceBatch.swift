@@ -95,6 +95,7 @@ extension Workspace {
       return leftOrder == rightOrder
         ? left.change.id.rawValue < right.change.id.rawValue : leftOrder < rightOrder
     }.prefix(64).sorted { $0.change.id.rawValue < $1.change.id.rawValue }
+    memoryScopeNames = .prepare(configuration: configuration, candidates: catalog.candidates)
     return (page, reviewPreparationFailure)
   }
 
@@ -160,6 +161,8 @@ extension Workspace {
       where !opened.projection.draft.batch!.binding.allowedPaths.contains(path) {
         try opened.preparePath(path)
       }
+      memoryScopeNames = .prepare(configuration: configuration, candidates: suggestions.candidates)
+      catalogPageSize = catalogLimit
       return opened
     } catch {
       if let created {

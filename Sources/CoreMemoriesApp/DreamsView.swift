@@ -123,6 +123,7 @@ struct DreamsView: View {
 
   private var statusTitle: String {
     if model.isDreamRunning { return model.dreamPhase }
+    if model.dreamInspectionFailure != nil { return "Saved dream details unavailable" }
     if let status = model.invocationStatus {
       switch status.status {
       case "completed": return "Conversation processing finished"
@@ -143,6 +144,9 @@ struct DreamsView: View {
 
   private var details: some View {
     VStack(alignment: .leading, spacing: 12) {
+      if let unavailable = model.dreamInspectionFailure {
+        Text(unavailable).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+      }
       if model.invocationStatus?.isPublicationBlocked == true
         || model.dreamPhase == "Status unavailable"
       {

@@ -165,6 +165,15 @@ func nativeRecoverySelectionIsReadOnlyAndAcknowledgedManualCreationReleasesDetai
   let model = AppModel(configURL: retained.url, autosaveDelay: .seconds(3600))
   await model.load()
   await model.pauseQueue()
+  #expect(
+    model.failure == nil, "Unavailable dream details must not report a failed memory operation")
+  #expect(model.dreamInspectionFailure != nil)
+  #expect(model.catalog != nil)
+  model.section = "Memories"
+  await model.loadCandidates()
+  #expect(model.failure == nil, "Pending recovery requires explicit selection, not a failure sheet")
+  #expect(model.isWaitingForIndependentManualWork)
+  #expect(!model.isWorkspaceLoaded)
   let descriptor = try #require(model.draftRecoveries.first)
   #expect(model.batchProjection == nil)
   #expect(model.retainedDraft == nil)
@@ -187,6 +196,7 @@ func nativeRecoverySelectionIsReadOnlyAndAcknowledgedManualCreationReleasesDetai
   await model.selectMemory(.recovery(descriptor.failure.saveID))
   await model.refresh()
   await model.pauseQueue()
+  #expect(model.failure == nil, "Refreshing recovery history must remain a read-only waiting state")
   #expect(model.draftRecoveryDetails == nil)
   #expect(model.selection == nil)
   #expect(try fixture.snapshot(journal) == before)
@@ -205,6 +215,13 @@ func nativeRecoverySelectionIsReadOnlyAndAcknowledgedManualCreationReleasesDetai
   await model.save()
   #expect(try fixture.main() != base)
   #expect(model.stagedItems.isEmpty)
+  #expect(
+    model.failure == nil,
+    "A successful independent Save must not report post-save waiting as failure")
+  #expect(model.message == "Saved changes in one commit")
+  #expect(model.isWaitingForIndependentManualWork)
+  #expect(!model.isWorkspaceLoaded)
+  #expect(await model.workspace.currentDraft == nil)
   let after = try fixture.snapshot(journal)
   for (path, bytes) in before { #expect(after[path] == bytes) }
   try await model.shutdown()

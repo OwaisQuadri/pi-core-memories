@@ -7,6 +7,7 @@ struct WorkspaceSnapshot: Sendable {
   let drafts: [MemoryDraft]
   let draftRecoveries: [MemoryDraftRecovery]
   let inspection: DreamInspection?
+  let dreamInspectionFailure: String?
   let invocationStatus: DreamInvocationStatus?
   let invocationStatusFailure: String?
   let failures: [String]
@@ -57,13 +58,14 @@ actor Workspace {
     var failures: [String] = []
     var catalog: MemoryManagementResult?
     var inspection: DreamInspection?
+    var dreamInspectionFailure: String?
     var drafts: [MemoryDraft] = []
     do {
       catalog = try MemoryManagement(repository: configuration.memoryURL).execute(
         .init(operation: .list))
     } catch { failures.append(String(describing: error)) }
     do { inspection = try DreamInspection.read(stateRoot: configuration.stateURL) } catch {
-      failures.append(String(describing: error))
+      dreamInspectionFailure = String(describing: error)
     }
     if FileManager.default.fileExists(atPath: configuration.journal) {
       do {
@@ -85,7 +87,7 @@ actor Workspace {
     return WorkspaceSnapshot(
       configuration: configuration, catalog: catalog,
       drafts: drafts, draftRecoveries: draftRecoveries, inspection: inspection,
-      invocationStatus: invocationStatus,
+      dreamInspectionFailure: dreamInspectionFailure, invocationStatus: invocationStatus,
       invocationStatusFailure: invocationStatusFailure, failures: failures)
   }
 

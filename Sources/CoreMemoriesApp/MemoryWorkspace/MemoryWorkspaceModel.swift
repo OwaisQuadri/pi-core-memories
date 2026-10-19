@@ -97,6 +97,9 @@ extension AppModel {
   }
   var isRetainedSaveRecoverable: Bool { batchProjection == nil && draft?.batch != nil }
   var isReviewTransitionEnabled: Bool { draftRecoveries.isEmpty && !isSaveUnresolved }
+  var isWaitingForIndependentManualWork: Bool {
+    !draftRecoveries.isEmpty && batchProjection == nil
+  }
   var isIndependentManualEnabled: Bool {
     isLoaded && !isBusy && !isDreamRunning && !isSaveUnresolved
       && !isInputDirty && stagedItems.isEmpty
@@ -153,6 +156,11 @@ extension AppModel {
 
   func loadCandidates() async {
     guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    if isWaitingForIndependentManualWork {
+      isWorkspaceLoaded = false
+      reviewFailure = await workspace.reviewPreparationFailure
+      return
+    }
     isReviewLoading = true
     isBusy = true
     defer {

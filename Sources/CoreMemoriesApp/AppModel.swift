@@ -13,6 +13,7 @@ import Foundation
   @Published var draftRecoveryDetails: MemoryDraft?
   @Published var isConfirmingIndependentManual = false
   @Published var inspection: DreamInspection?
+  @Published var dreamInspectionFailure: String?
   @Published var batchProjection: MemoryBatchProjection?
   @Published var presentation: MemoryBatchPresentation?
   @Published var selection: NativeMemorySelection?
@@ -101,7 +102,10 @@ import Foundation
     await pauseQueue()
     savedRecovery = nil
     apply(await workspace.refresh())
-    if isWorkspaceLoaded || section == "Memories" {
+    if isWaitingForIndependentManualWork {
+      isWorkspaceLoaded = false
+      reviewFailure = await workspace.reviewPreparationFailure
+    } else if isWorkspaceLoaded || section == "Memories" {
       workspaceGeneration &+= 1
       do {
         let prepared = try await workspace.reprepareBatch()
@@ -201,6 +205,7 @@ import Foundation
     configuration = snapshot.configuration
     catalog = snapshot.catalog
     inspection = snapshot.inspection
+    dreamInspectionFailure = snapshot.dreamInspectionFailure
     if !isDreamRunning {
       if let unavailable = snapshot.invocationStatusFailure {
         invocationStatus = nil

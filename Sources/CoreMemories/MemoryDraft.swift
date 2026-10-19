@@ -21,6 +21,18 @@ package struct MemoryDraftReceipt: Codable, Sendable {
   package let auditRef: String
 }
 
+package struct MemoryDraftRecovery: Sendable {
+  package let draftID: UUID
+  package let revision: UInt64
+  package let created: Date
+  package let failure: MemoryBatchRecoveryRequired
+}
+
+package struct MemoryDraftInspection: Sendable {
+  package let drafts: [MemoryDraft]
+  package let recoveryRequired: [MemoryDraftRecovery]
+}
+
 private struct DraftPublication: Codable {
   let schemaVersion: Int
   let draft: MemoryDraft
@@ -75,16 +87,31 @@ package final class MemoryDraftStore {
     -> MemoryDraft
   {
     try locked {
-      let acceptedBase = try base ?? store.approvedCommit()
-      guard operations.count <= 256, operations.allSatisfy({ $0.base == acceptedBase }) else {
-        throw MemoryError("draft operations must use the selected base")
-      }
-      _ = try store.reviewSnapshot(base: acceptedBase)
-      let draft = MemoryDraft(
-        schemaVersion: 1, draftID: UUID(), revision: 0, repositoryBinding: binding,
-        baseCommit: acceptedBase, created: Date(), operations: operations, batch: nil)
+      let draft = try prepareDraft(base: base, operations: operations)
       try persist(draft)
       return draft
+    }
+  }
+
+  func prepareDraft(base: String? = nil, operations: [MemoryManagementRequest] = []) throws
+    -> MemoryDraft
+  {
+    let acceptedBase = try base ?? store.approvedCommit()
+    guard operations.count <= 256, operations.allSatisfy({ $0.base == acceptedBase }) else {
+      throw MemoryError("draft operations must use the selected base")
+    }
+    _ = try store.reviewSnapshot(base: acceptedBase)
+    return MemoryDraft(
+      schemaVersion: 1, draftID: UUID(), revision: 0, repositoryBinding: binding,
+      baseCommit: acceptedBase, created: Date(), operations: operations, batch: nil)
+  }
+
+  func persistPreparedDraft(_ draft: MemoryDraft) throws {
+    try locked {
+      guard draft.schemaVersion == 1, draft.repositoryBinding == binding, Self.isValid(draft) else {
+        throw DreamRunError.corruption
+      }
+      try persist(draft)
     }
   }
 
@@ -93,6 +120,36 @@ package final class MemoryDraftStore {
       return try withBatchJournal(review) { _ in try drafts(review: review) }
     }
     return try locked { try drafts() }
+  }
+
+  package func inspectDrafts(review: MemoryReviewController? = nil) throws -> MemoryDraftInspection
+  {
+    func inspect() throws -> MemoryDraftInspection {
+      var recoveryRequired: [MemoryDraftRecovery] = []
+      let available = try drafts(review: review) { draft, failure in
+        recoveryRequired.append(
+          MemoryDraftRecovery(
+            draftID: draft.draftID, revision: draft.revision, created: draft.created,
+            failure: failure))
+      }
+      return MemoryDraftInspection(
+        drafts: available,
+        recoveryRequired: recoveryRequired.sorted { $0.created < $1.created })
+    }
+    if let review {
+      return try withBatchJournal(review) { _ in try inspect() }
+    }
+    return try locked { try inspect() }
+  }
+
+  package func recoveryDetails(_ recovery: MemoryDraftRecovery) throws -> MemoryDraft {
+    try locked {
+      let draft = try read(recovery.draftID, revision: recovery.revision)
+      guard try memoryBatchDigest(draft) == recovery.failure.saveID else {
+        throw MemoryError("recovery record changed; refresh the workspace")
+      }
+      return draft
+    }
   }
 
   package func update(
@@ -356,9 +413,10 @@ package final class MemoryDraftStore {
       isReplacing: true, fault: batchPersistenceFault)
   }
 
-  func drafts(only draftID: UUID? = nil, review: MemoryReviewController? = nil) throws
-    -> [MemoryDraft]
-  {
+  func drafts(
+    only draftID: UUID? = nil, review: MemoryReviewController? = nil,
+    recoveryRequired: ((MemoryDraft, MemoryBatchRecoveryRequired) -> Void)? = nil
+  ) throws -> [MemoryDraft] {
     let names = try root.names()
     var latest: [UUID: MemoryDraft] = [:]
     for name in names where name.hasSuffix("-current.json") {
@@ -384,7 +442,12 @@ package final class MemoryDraftStore {
           guard receipt.saveID == saveID, receipt.draftID == draft.draftID,
             receipt.revision == draft.revision, receipt.base == draft.baseCommit
           else { throw DreamRunError.corruption }
-          try verifyBatchConsumption(draft, receipt: receipt, review: review)
+          do {
+            try verifyBatchConsumption(draft, receipt: receipt, review: review)
+          } catch let failure as MemoryBatchRecoveryRequired {
+            guard let recoveryRequired else { throw failure }
+            recoveryRequired(draft, failure)
+          }
           continue
         }
       }

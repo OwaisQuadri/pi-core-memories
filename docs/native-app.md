@@ -89,6 +89,8 @@ Supported additions, updates, deletions, and Confirm Reviewed also stage in this
 
 Draft persistence runs separately from prepared interaction. A crash can lose input that has not received a persistence acknowledgment. Restoring a draft restores intent, not approval authority. Each restored publishing suggestion and Confirm Reviewed row requires fresh inspection and staging. Details contains exact sources, diagnostics, paths, and receipts. Recovery-required or unknown Save outcomes block another publication until exact recovery resolves them.
 
+Recovery Required lists retained Saves whose consumption cannot currently be verified. Select a row for read-only Details. To continue separate manual work, explicitly open a distinct manual draft from Details, or choose Start Manual Batch… and confirm. These actions leave recovery pending and unchanged. Review actions remain blocked until Refresh verifies the history. Refresh preserves the selected independent manual draft and its prepared scope.
+
 Terminal review remains explicitly confirmed one item at a time. It uses the shared transaction owner, not the native batch's Save action. Memory management commands remain create, read, update, and delete operations. They cannot approve suggestions or save a review-bearing batch.
 
 Reveal Checkout in Finder opens the selected working-file location, or the repository folder when that file is not checked out. The editor reads committed approved bytes, not dirty working files. Existing Pi sessions keep their saved memory snapshot; start a new session to load changed memory.

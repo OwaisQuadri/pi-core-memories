@@ -7,6 +7,7 @@ enum NativeMemorySelection: Hashable {
   case candidate(String)
   case entry(String, Int)
   case newMemory(UUID)
+  case recovery(String)
 }
 
 struct NativeManualTarget {
@@ -95,11 +96,25 @@ extension AppModel {
     isInputDirty || (batchProjection.map { $0.draft.revision != persistedBatchRevision } ?? false)
   }
   var isRetainedSaveRecoverable: Bool { batchProjection == nil && draft?.batch != nil }
+  var isReviewTransitionEnabled: Bool { draftRecoveries.isEmpty && !isSaveUnresolved }
+  var isIndependentManualEnabled: Bool {
+    isLoaded && !isBusy && !isDreamRunning && !isSaveUnresolved
+      && !isInputDirty && stagedItems.isEmpty
+      && !(drafts.contains { $0.batch?.isManualOnly == false })
+  }
+  func isDraftRestorationEnabled(_ value: MemoryDraft) -> Bool {
+    guard !isBusy, !isSaveUnresolved else { return false }
+    if draftRecoveries.isEmpty { return true }
+    return value.batch?.isManualOnly != false
+      && (draft?.draftID == value.draftID || (stagedItems.isEmpty && !isInputDirty))
+      && !drafts.contains { $0.draftID != value.draftID && $0.batch?.isManualOnly == false }
+  }
   var isSaveEnabled: Bool {
     isLoaded && batchProjection != nil && !isBusy && !isDreamRunning && !isSaveUnresolved
       && (!stagedItems.isEmpty || isInputDirty)
       && (batchProjection?.needsReview.isEmpty ?? true)
       && !(isAmendingSuggestion && isInputDirty)
+      && (draftRecoveries.isEmpty || draft?.batch?.isManualOnly == true)
   }
   var reviewActionTitle: String {
     isWorkspaceLoaded && reviewFailure == nil
@@ -117,7 +132,10 @@ extension AppModel {
     {
       return
     }
-    if batchProjection?.draft.draftID != projection.draft.draftID { persistedBatchRevision = nil }
+    if batchProjection?.draft.draftID != projection.draft.draftID {
+      persistedBatchRevision = nil
+      draftRecoveryDetails = nil
+    }
     batchProjection = projection
     retainedDraft = nil
     isWorkspaceLoaded = true
@@ -144,6 +162,7 @@ extension AppModel {
     do {
       await pauseQueue()
       applyBatch(try await workspace.openBatch())
+      draftRecoveries = await workspace.draftRecoveries
       reviewFailure = await workspace.reviewPreparationFailure
     } catch {
       reviewFailure = String(describing: error)
@@ -160,6 +179,7 @@ extension AppModel {
       try await flushInputAndPersistence()
       _ = try await perform(.path(path))
       selection = .newMemory(UUID())
+      draftRecoveryDetails = nil
       editorTarget = .manual(entry: nil, itemID: UUID())
       editorPath = path
       editorText = ""
@@ -215,9 +235,15 @@ extension AppModel {
       selection = value
       editorTarget = nil
       presentation = nil
+      draftRecoveryDetails = nil
       editorText = ""
       editorReason = ""
       switch value {
+      case .recovery(let saveID):
+        guard let descriptor = draftRecoveries.first(where: { $0.failure.saveID == saveID }) else {
+          throw WorkspaceError("Refresh Save recovery")
+        }
+        draftRecoveryDetails = try await workspace.draftRecoveryDetails(descriptor)
       case .staged(let id):
         _ = try await perform(.select(id))
         guard let item = stagedItems.first(where: { $0.itemID == id }) else { return }
@@ -249,7 +275,7 @@ extension AppModel {
       case .candidate(let id):
         _ = try await perform(.select(nil))
         if let candidate = candidates.first(where: { $0.change.id.rawValue == id }),
-          [.pending, .deferred].contains(candidate.disposition)
+          [.pending, .deferred].contains(candidate.disposition), isReviewTransitionEnabled
         {
           presentation = try await perform(.acceptance(candidate.change.id)).presentation
         }
@@ -271,7 +297,9 @@ extension AppModel {
   }
 
   func editSuggestion() async {
-    guard !isBusy, let candidate = selectedCandidate, presentation != nil else { return }
+    guard !isBusy, isReviewTransitionEnabled, let candidate = selectedCandidate,
+      presentation != nil
+    else { return }
     do {
       let amendment: MemoryBatchAmendment?
       if case .candidate(let intent) = stagedItems.first(where: {
@@ -381,7 +409,9 @@ extension AppModel {
   }
 
   func stageShown() async {
-    guard !isBusy, !isSaveUnresolved, !isInputDirty, let shown = presentation else { return }
+    guard !isBusy, isReviewTransitionEnabled, !isInputDirty, let shown = presentation else {
+      return
+    }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -393,7 +423,7 @@ extension AppModel {
   }
 
   func disposition(_ candidate: MemoryReviewCandidate, isRejected: Bool) async {
-    guard !isBusy, !isSaveUnresolved else { return }
+    guard !isBusy, isReviewTransitionEnabled else { return }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -407,7 +437,7 @@ extension AppModel {
   }
 
   func confirmReviewed(_ entry: ManagedMemoryEntry) async {
-    guard !isBusy, !isSaveUnresolved else { return }
+    guard !isBusy, isReviewTransitionEnabled else { return }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -547,6 +577,24 @@ extension AppModel {
     } catch { failure = String(describing: error) }
   }
 
+  func startIndependentManualBatch() async {
+    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    isConfirmingIndependentManual = false
+    isBusy = true
+    defer { isBusy = false }
+    do {
+      try await workspace.verifyIndependentManualProfile(configuration)
+      await pauseQueue()
+      try await flushInputAndPersistence()
+      let opened = try await workspace.startIndependentManualBatch()
+      workspaceGeneration &+= 1
+      clearEditor()
+      applyBatch(opened)
+      draftRecoveries = await workspace.draftRecoveries
+      message = "Manual batch started; recovery pending"
+    } catch { failure = String(describing: error) }
+  }
+
   func restore(_ value: MemoryDraft) async {
     guard !isBusy, !isSaveUnresolved else { return }
     isBusy = true
@@ -555,6 +603,7 @@ extension AppModel {
       try await flushInputAndPersistence()
       workspaceGeneration &+= 1
       applyBatch(try await workspace.restoreBatch(value))
+      draftRecoveries = await workspace.draftRecoveries
       clearEditor()
       message = "Recovered draft. Publishing suggestions need review."
     } catch {
@@ -565,6 +614,7 @@ extension AppModel {
 
   func clearEditor() {
     selection = nil
+    draftRecoveryDetails = nil
     editorTarget = nil
     presentation = nil
     isInputDirty = false

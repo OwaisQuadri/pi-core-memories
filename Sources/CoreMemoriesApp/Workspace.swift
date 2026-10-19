@@ -5,6 +5,7 @@ struct WorkspaceSnapshot: Sendable {
   let configuration: MemoryConfiguration
   let catalog: MemoryManagementResult?
   let drafts: [MemoryDraft]
+  let draftRecoveries: [MemoryDraftRecovery]
   let inspection: DreamInspection?
   let invocationStatus: DreamInvocationStatus?
   let invocationStatusFailure: String?
@@ -34,6 +35,8 @@ actor Workspace {
   var durableRevision: UInt64?
   var pendingPersistence: NativePendingPersistence?
   var unresolvedSave: MemoryDraft?
+  var draftRecoveries: [MemoryDraftRecovery] = []
+  private(set) var isLoaded = false
   let persistence: NativeBatchPersistence
   private var recovery: (DreamRunStore, SavedDreamRecoveryPreview, Data, String)?
 
@@ -43,7 +46,9 @@ actor Workspace {
   }
 
   func load() throws -> WorkspaceSnapshot {
+    isLoaded = false
     configuration = try MemoryConfiguration.load(from: configURL)
+    isLoaded = true
     return refresh()
   }
 
@@ -63,8 +68,10 @@ actor Workspace {
     if FileManager.default.fileExists(atPath: configuration.journal) {
       do {
         let store = try editorStore()
-        drafts = try store.list(review: optionalReviewCatalog().controller)
-        if currentDraft == nil { currentDraft = drafts.last }
+        let result = try store.inspectDrafts(review: optionalReviewCatalog().controller)
+        drafts = result.drafts
+        draftRecoveries = result.recoveryRequired
+        if currentDraft == nil, draftRecoveries.isEmpty { currentDraft = drafts.last }
       } catch { failures.append(String(describing: error)) }
     }
     var invocationStatus: DreamInvocationStatus?
@@ -77,7 +84,8 @@ actor Workspace {
     }
     return WorkspaceSnapshot(
       configuration: configuration, catalog: catalog,
-      drafts: drafts, inspection: inspection, invocationStatus: invocationStatus,
+      drafts: drafts, draftRecoveries: draftRecoveries, inspection: inspection,
+      invocationStatus: invocationStatus,
       invocationStatusFailure: invocationStatusFailure, failures: failures)
   }
 
@@ -100,6 +108,7 @@ actor Workspace {
     configuration = value
     draftStore = nil
     review = nil
+    draftRecoveries = []
     recovery = nil
   }
 

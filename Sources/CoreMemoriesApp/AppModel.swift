@@ -9,6 +9,9 @@ import Foundation
   }
   @Published var catalog: MemoryManagementResult?
   @Published var drafts: [MemoryDraft] = []
+  @Published var draftRecoveries: [MemoryDraftRecovery] = []
+  @Published var draftRecoveryDetails: MemoryDraft?
+  @Published var isConfirmingIndependentManual = false
   @Published var inspection: DreamInspection?
   @Published var batchProjection: MemoryBatchProjection?
   @Published var presentation: MemoryBatchPresentation?
@@ -104,6 +107,7 @@ import Foundation
         let prepared = try await workspace.reprepareBatch()
         clearEditor()
         applyBatch(prepared)
+        draftRecoveries = await workspace.draftRecoveries
         reviewFailure = await workspace.reviewPreparationFailure
       } catch {
         failure = String(describing: error)
@@ -211,7 +215,10 @@ import Foundation
       }
     }
     drafts = snapshot.drafts
-    if batchProjection == nil, !isInputDirty, let recovered = drafts.last {
+    draftRecoveries = snapshot.draftRecoveries
+    draftRecoveryDetails = nil
+    if case .recovery = selection { selection = nil }
+    if batchProjection == nil, !isInputDirty, draftRecoveries.isEmpty, let recovered = drafts.last {
       retainedDraft = recovered
       message = "Recovered draft"
     }
@@ -444,6 +451,7 @@ import Foundation
       workspaceGeneration &+= 1
       batchProjection = nil
       presentation = nil
+      draftRecoveryDetails = nil
       isWorkspaceLoaded = false
     }
     shutdownTask = task

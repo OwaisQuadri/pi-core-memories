@@ -76,7 +76,16 @@ extension Workspace {
     guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
     let store = try editorStore()
     let suggestions = optionalReviewCatalog()
-    var restored = try currentDraft ?? store.list(review: suggestions.controller).last
+    let inspection = try store.inspectDrafts(review: suggestions.controller)
+    draftRecoveries = inspection.recoveryRequired
+    var restored = currentDraft
+    if restored == nil {
+      guard inspection.recoveryRequired.isEmpty else {
+        throw WorkspaceError(
+          "Choose or start independent manual work explicitly; Save recovery remains pending")
+      }
+      restored = inspection.drafts.last
+    }
     if let legacy = restored, legacy.batch == nil, !legacy.operations.isEmpty,
       try store.recoverSave(
         draftID: legacy.draftID, expectedRevision: legacy.revision,
@@ -112,21 +121,22 @@ extension Workspace {
         paths.insert("devices/\(device)/projects/\(key).md")
       }
     }
-    let original = try restoring ?? store.create()
+    var created: MemoryBatchSession?
     do {
       let opened = try MemoryBatchSession(
         repository: configuration.memoryURL, drafts: store, review: controller,
-        restoring: original, configurationURL: configURL,
+        restoring: restoring, configurationURL: configURL,
         allowedPaths: restoring?.batch?.binding.allowedPaths ?? paths.sorted(),
         catalogLimit: catalogLimit)
+      if restoring == nil { created = opened }
       for path in paths.sorted()
       where !opened.projection.draft.batch!.binding.allowedPaths.contains(path) {
         try opened.preparePath(path)
       }
       return opened
     } catch {
-      if restoring == nil {
-        try store.discard(draftID: original.draftID, expectedRevision: original.revision)
+      if let created {
+        try store.discard(draftID: created.projection.draft.draftID, expectedRevision: 0)
       }
       throw error
     }
@@ -136,6 +146,13 @@ extension Workspace {
     guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
     _ = try openBatch()
     let session = session!
+    if !draftRecoveries.isEmpty {
+      switch command {
+      case .acceptance, .amendment, .stage, .decision, .reviewed:
+        throw WorkspaceError("Resolve Save recovery before staging review-bearing changes")
+      default: break
+      }
+    }
     var presentation: MemoryBatchPresentation?
     switch command {
     case .select(let id): session.select(id)
@@ -198,6 +215,13 @@ extension Workspace {
   func saveBatch() async throws -> MemoryBatchSaveResult {
     guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
     _ = try await persistBatch()
+    if session!.projection.draft.batch?.isManualOnly == false {
+      let inspection = try editorStore().inspectDrafts(review: availableReviewController())
+      draftRecoveries = inspection.recoveryRequired
+      guard inspection.recoveryRequired.isEmpty else {
+        throw WorkspaceError("Resolve Save recovery before saving review-bearing changes")
+      }
+    }
     let result = try session!.save()
     retainBatchOutcome(result)
     return result
@@ -230,11 +254,18 @@ extension Workspace {
   func restoreBatch(_ draft: MemoryDraft) async throws -> MemoryBatchProjection {
     guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
     if session != nil { _ = try await persistBatch() }
+    let inspection = try editorStore().inspectDrafts(review: optionalReviewCatalog().controller)
     guard
-      let latest = try editorStore().list(review: optionalReviewCatalog().controller).first(where: {
+      let latest = inspection.drafts.first(where: {
         $0.draftID == draft.draftID && $0.revision == draft.revision
       })
     else { throw WorkspaceError("Draft changed; refresh recovery") }
+    if !inspection.recoveryRequired.isEmpty {
+      guard latest.batch?.isManualOnly != false else {
+        throw WorkspaceError("Review-bearing drafts require verified Save history")
+      }
+      try verifyIndependentManualSelection(inspection, selecting: latest.draftID)
+    }
     let previousSession = session
     let previousDraft = currentDraft
     let previousRevision = durableRevision
@@ -247,6 +278,52 @@ extension Workspace {
       durableRevision = previousRevision
       throw error
     }
+  }
+
+  private func verifyIndependentManualSelection(
+    _ inspection: MemoryDraftInspection, selecting draftID: UUID? = nil
+  ) throws {
+    guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
+    let active = session?.projection.draft ?? currentDraft
+    let isOtherActive =
+      active.map {
+        $0.draftID != draftID && !($0.batch?.items.isEmpty ?? $0.operations.isEmpty)
+      } ?? false
+    let isOtherMixed = inspection.drafts.contains {
+      $0.draftID != draftID && $0.batch?.isManualOnly == false
+    }
+    guard !isOtherActive, !isOtherMixed else {
+      throw WorkspaceError("Resolve the active draft before starting independent manual work")
+    }
+  }
+
+  func verifyIndependentManualProfile(_ profile: MemoryConfiguration) throws {
+    guard isLoaded, FileManager.default.fileExists(atPath: configURL.path),
+      try configurationIdentity(profile) == configurationIdentity(configuration),
+      try configurationIdentity(MemoryConfiguration.load(from: configURL))
+        == configurationIdentity(configuration)
+    else { throw WorkspaceError("Load the matching profile before starting manual work") }
+  }
+
+  func startIndependentManualBatch() async throws -> MemoryBatchProjection {
+    try verifyIndependentManualProfile(configuration)
+    guard unresolvedSave == nil else { throw WorkspaceError("Resolve the previous Save first") }
+    if session != nil { _ = try await persistBatch() }
+    let inspection = try editorStore().inspectDrafts(review: optionalReviewCatalog().controller)
+    guard !inspection.recoveryRequired.isEmpty else {
+      throw WorkspaceError("Refresh the workspace before starting independent manual work")
+    }
+    try verifyIndependentManualSelection(inspection)
+    let opened = try prepareBatch(restoring: nil, suggestions: (nil, []))
+    session = opened
+    currentDraft = opened.projection.draft
+    durableRevision = 0
+    draftRecoveries = inspection.recoveryRequired
+    return opened.projection
+  }
+
+  func draftRecoveryDetails(_ recovery: MemoryDraftRecovery) throws -> MemoryDraft {
+    try editorStore().recoveryDetails(recovery)
   }
 
   func discardBatch() async throws {
@@ -273,9 +350,16 @@ extension Workspace {
     if session != nil { _ = try await persistBatch() }
     let previous = session?.projection.draft ?? currentDraft
     let isEmpty = previous.map { $0.batch?.items.isEmpty ?? $0.operations.isEmpty } ?? false
+    let suggestions = optionalReviewCatalog()
+    let inspection = try editorStore().inspectDrafts(review: suggestions.controller)
+    draftRecoveries = inspection.recoveryRequired
+    guard previous != nil || inspection.recoveryRequired.isEmpty else {
+      throw WorkspaceError("Choose or start independent manual work explicitly")
+    }
+    let isReplacingEmpty = isEmpty && inspection.recoveryRequired.isEmpty
     let opened = try prepareBatch(
-      restoring: isEmpty ? nil : previous, suggestions: optionalReviewCatalog())
-    if isEmpty, let previous {
+      restoring: isReplacingEmpty ? nil : previous, suggestions: suggestions)
+    if isReplacingEmpty, let previous {
       do {
         try editorStore().discard(
           draftID: previous.draftID, expectedRevision: durableRevision ?? previous.revision)
@@ -286,7 +370,7 @@ extension Workspace {
     }
     session = opened
     currentDraft = opened.projection.draft
-    durableRevision = isEmpty || previous == nil ? 0 : previous?.revision
+    durableRevision = isReplacingEmpty || previous == nil ? 0 : previous?.revision
     return opened.projection
   }
 }

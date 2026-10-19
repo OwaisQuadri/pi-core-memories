@@ -27,6 +27,7 @@ struct MemoryWorkspaceView: View {
             } label: {
               Image(systemName: "plus")
             }.help("New Memory")
+              .disabled(!model.draftRecoveries.isEmpty && model.batchProjection == nil)
           }.padding(12)
           List(
             selection: Binding(
@@ -55,11 +56,22 @@ struct MemoryWorkspaceView: View {
               ForEach(model.visibleEntries, id: \.nativeID) { entry in
                 Text(MemoryDocument.reviewText(Data(entry.expected.utf8))).lineLimit(3)
                   .tag(NativeMemorySelection.entry(entry.path, entry.locator.start))
+                  .disabled(!model.draftRecoveries.isEmpty && model.batchProjection == nil)
               }
             }
             Section("Blocked") {
               ForEach(model.blockedCandidates, id: \.change.id) { candidate in
                 candidateRow(candidate)
+              }
+            }
+            if !model.draftRecoveries.isEmpty {
+              Section("Recovery Required") {
+                ForEach(model.draftRecoveries, id: \.failure.saveID) { recovery in
+                  Text("Unverified Save").tag(
+                    NativeMemorySelection.recovery(recovery.failure.saveID))
+                }
+                Button("Start Manual Batch…") { model.isConfirmingIndependentManual = true }
+                  .disabled(!model.isIndependentManualEnabled)
               }
             }
             Section("Saved History") {
@@ -102,6 +114,12 @@ struct MemoryWorkspaceView: View {
       }.padding(12)
     }
     .task { await model.loadCandidates() }
+    .alert("Start Independent Manual Batch?", isPresented: $model.isConfirmingIndependentManual) {
+      Button("Start Manual Batch") { Task { await model.startIndependentManualBatch() } }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text("Existing Save recovery remains pending.")
+    }
     .alert("Discard Draft?", isPresented: $model.isConfirmingDiscard) {
       Button("Cancel", role: .cancel) {}
       Button("Discard", role: .destructive) { Task { await model.discard() } }
@@ -120,7 +138,9 @@ struct MemoryWorkspaceView: View {
 
   private var inspector: some View {
     VStack(alignment: .leading, spacing: 12) {
-      if model.isSaveUnresolved || model.isRetainedSaveRecoverable {
+      if case .recovery = model.selection {
+        Text("Recovery Required").font(.headline)
+      } else if model.isSaveUnresolved || model.isRetainedSaveRecoverable {
         Text(model.isSaveUnresolved ? model.message : "Draft requires reconciliation").font(
           .headline)
         Button("Recover Save") { Task { await model.recoverSave() } }
@@ -195,18 +215,19 @@ struct MemoryWorkspaceView: View {
       }
       Button(model.selectedCandidate == nil ? "Stage Confirm Reviewed" : "Stage Acceptance") {
         Task { await model.stageShown() }
-      }.disabled(model.isInputDirty || model.isSaveUnresolved)
+      }.disabled(model.isInputDirty || !model.isReviewTransitionEnabled)
     }
     if let candidate = model.selectedCandidate,
       [.pending, .deferred].contains(candidate.disposition)
     {
       HStack {
         Button("Edit Suggestion") { Task { await model.editSuggestion() } }
-          .disabled(model.presentation == nil)
+          .disabled(model.presentation == nil || !model.isReviewTransitionEnabled)
         Button("Decide Later") { Task { await model.disposition(candidate, isRejected: false) } }
+          .disabled(!model.isReviewTransitionEnabled)
         Button("Dismiss", role: .destructive) {
           Task { await model.disposition(candidate, isRejected: true) }
-        }
+        }.disabled(!model.isReviewTransitionEnabled)
       }
     }
     if case .entry(let path, let start) = model.selection,
@@ -214,6 +235,7 @@ struct MemoryWorkspaceView: View {
       ), entry.isMutable
     {
       Button("Confirm Reviewed…") { Task { await model.confirmReviewed(entry) } }
+        .disabled(!model.isReviewTransitionEnabled)
     }
   }
 
@@ -277,10 +299,25 @@ struct MemoryWorkspaceView: View {
         }
         Text(model.editorPath).textSelection(.enabled)
         Button("Reveal Checkout in Finder") { Task { await model.revealMemory() } }
-        ForEach(model.drafts, id: \.draftID) { draft in
-          Button("Recover \(draft.draftID) · revision \(draft.revision)") {
-            Task { await model.restore(draft) }
+        if case .recovery(let saveID) = model.selection,
+          let recovery = model.draftRecoveries.first(where: { $0.failure.saveID == saveID })
+        {
+          Text(recovery.failure.description).textSelection(.enabled)
+          Text("\(recovery.draftID) · revision \(recovery.revision)").textSelection(.enabled)
+          if let draft = model.draftRecoveryDetails {
+            PlainTextView(
+              text: String(decoding: (try? JSONEncoder().encode(draft)) ?? Data(), as: UTF8.self)
+            ).frame(height: 160)
           }
+        }
+        ForEach(model.drafts, id: \.draftID) { draft in
+          Text("\(draft.draftID) · revision \(draft.revision)").textSelection(.enabled)
+          Button(
+            model.draftRecoveries.isEmpty
+              ? "Recover Draft" : "Open Manual Draft; Keep Recovery Pending"
+          ) {
+            Task { await model.restore(draft) }
+          }.disabled(!model.isDraftRestorationEnabled(draft))
         }
       }.font(.system(.caption, design: .monospaced))
     }

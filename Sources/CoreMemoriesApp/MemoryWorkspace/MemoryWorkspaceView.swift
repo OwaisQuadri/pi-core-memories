@@ -5,6 +5,34 @@ struct MemoryWorkspaceView: View {
   @ObservedObject var model: AppModel
 
   var body: some View {
+    Group {
+      if model.isReviewLoading && model.batchProjection == nil {
+        ProgressView("Loading memories…")
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if !model.isLoaded {
+        Text("Memories unavailable").font(.headline)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else {
+        workspace
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    .task { await model.loadCandidates() }
+    .alert("Start Independent Manual Batch?", isPresented: $model.isConfirmingIndependentManual) {
+      Button("Start Manual Batch") { Task { await model.startIndependentManualBatch() } }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text("Existing Save recovery remains pending.")
+    }
+    .alert("Discard Draft?", isPresented: $model.isConfirmingDiscard) {
+      Button("Cancel", role: .cancel) {}
+      Button("Discard", role: .destructive) { Task { await model.discard() } }
+    } message: {
+      Text("Approved memory will not change.")
+    }
+  }
+
+  private var workspace: some View {
     VStack(spacing: 0) {
       HSplitView {
         VStack(spacing: 0) {
@@ -105,8 +133,8 @@ struct MemoryWorkspaceView: View {
             }.padding(12)
           }
         }.frame(minWidth: 260, idealWidth: 320)
-        inspector.frame(minWidth: 400)
-      }
+        inspector.frame(minWidth: 400, maxHeight: .infinity, alignment: .topLeading)
+      }.frame(maxHeight: .infinity)
       Divider()
       HStack {
         Button("Undo Staged Change") { Task { await model.undoStaging() } }
@@ -114,23 +142,16 @@ struct MemoryWorkspaceView: View {
         Button("Discard Draft…", role: .destructive) { model.isConfirmingDiscard = true }
           .disabled(!model.isDiscardEnabled)
         Spacer()
-        Text(model.isDraftDirty ? "Draft not yet persisted" : "Draft saved locally").font(.caption)
-        Button("Save Changes (\(model.stagedItems.count))") { Task { await model.save() } }
-          .disabled(!model.isSaveEnabled)
+        if model.draft != nil {
+          Text(model.isDraftDirty ? "Draft not yet persisted" : "Draft saved locally").font(
+            .caption)
+        }
+        Button(
+          model.batchProjection == nil
+            ? "Save Changes" : "Save Changes (\(model.stagedItems.count))"
+        ) { Task { await model.save() } }
+        .disabled(!model.isSaveEnabled)
       }.padding(12)
-    }
-    .task { await model.loadCandidates() }
-    .alert("Start Independent Manual Batch?", isPresented: $model.isConfirmingIndependentManual) {
-      Button("Start Manual Batch") { Task { await model.startIndependentManualBatch() } }
-      Button("Cancel", role: .cancel) {}
-    } message: {
-      Text("Existing Save recovery remains pending.")
-    }
-    .alert("Discard Draft?", isPresented: $model.isConfirmingDiscard) {
-      Button("Cancel", role: .cancel) {}
-      Button("Discard", role: .destructive) { Task { await model.discard() } }
-    } message: {
-      Text("Approved memory will not change.")
     }
   }
 
@@ -207,7 +228,7 @@ struct MemoryWorkspaceView: View {
       PlainTextView(text: model.editorText)
     } else {
       Text(model.reviewEmptyMessage).foregroundStyle(.secondary).frame(
-        maxWidth: .infinity, maxHeight: .infinity)
+        maxWidth: .infinity, alignment: .topLeading)
     }
     if let shown = model.presentation {
       if model.isAmendingSuggestion && !model.isShowingDiff {

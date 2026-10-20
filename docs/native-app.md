@@ -85,6 +85,16 @@ Use Prepare Checkout before the first publication from an attached initializatio
 
 Select a suggestion to inspect its original proposal, approved-before text, and final result. Choose Stage Acceptance, Decide Later, or Dismiss to stage its disposition. To correct a suggestion, choose Edit Suggestion, retain its sources, enter a reason, and choose Preview Amendment. Inspect the amended result before choosing Stage Acceptance. The original proposal and provenance remain intact.
 
+Staged suggestions appear only in Changes, not To Review. Successful triage of the selected To Review item selects and prepares the next unstaged suggestion, continuing across catalog pages and wrapping to remaining earlier items. The last item clears the selection. A failed action keeps the current review. Removing or undoing a staged choice makes its suggestion available again. Restored publishing choices stay in Changes with Needs Review until freshly inspected and staged.
+
+The Review menu owns these shortcuts on macOS 13 and later:
+
+- Command-Return stages acceptance of the displayed result.
+- Command-Shift-D stages Decide Later.
+- Command-Shift-X stages Dismiss.
+
+Inspector buttons use the same guarded actions and show the keys in tooltips. Held-key repeats are rejected before an action starts. Shortcuts are disabled outside Memories, for incompatible selections, dirty or unreviewed amendments, pending recovery, or busy or unresolved Saves. Preview Amendment still requires explicit Stage Acceptance. Changing selection, draft ownership, or input invalidates a captured action rather than applying it to another suggestion.
+
 Supported additions, updates, deletions, and Confirm Reviewed also stage in this workspace. Confirm Reviewed requires inspection of its exact result before Stage Confirm Reviewed. Save Changes, the toolbar, and Command-S use the same final Save action. Command-Z uses text undo in an active editor and staged undo elsewhere.
 
 Draft persistence runs separately from prepared interaction. A crash can lose input that has not received a persistence acknowledgment. Restoring a draft restores intent, not approval authority. Each restored publishing suggestion and Confirm Reviewed row requires fresh inspection and staging. Details contains exact sources, diagnostics, paths, and receipts. Recovery-required or unknown Save outcomes block another publication until exact recovery resolves them.
@@ -100,6 +110,8 @@ Reveal Checkout in Finder opens the selected working-file location, or the repos
 Set Up This Device creates a random, machine-local key. Reads do not create a device identity. The key is not a hostname or hardware identifier. Do not sync the local configuration as if it were shared memory.
 
 The New Memory menu offers global, this-device, project, and project-on-this-device targets. Other devices stay hidden by default. All devices shows them for explicit editing.
+
+Memory rows and the review inspector label the actual target as Global, a project name, This device, or Another device. Project names come from configured Git-directory bindings or matching recorded source working directories, not from the memory text. Names are prepared with the catalog outside interactive triage. Missing context shows Project (name unavailable). Conflicting names show Project (ambiguous name). Details retains exact target paths, keys, and recorded or configured directories. These labels do not change target scope or approval authority.
 
 A project's default key follows its local canonical Git directory. To share a project across devices, reuse the first device's project key through an explicit binding on each other device:
 

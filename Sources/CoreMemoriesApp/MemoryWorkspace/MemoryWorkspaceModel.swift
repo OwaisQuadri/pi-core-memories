@@ -62,7 +62,14 @@ extension AppModel {
   var stagedItems: [MemoryBatchItem] { draft?.batch?.items ?? [] }
   var candidates: [MemoryReviewCandidate] { batchProjection?.candidates ?? postSaveCandidates }
   var actionableCandidates: [MemoryReviewCandidate] {
-    candidates.filter { [.pending, .deferred].contains($0.disposition) }
+    let stagedIDs = Set(
+      stagedItems.compactMap { item -> String? in
+        guard case .candidate(let intent) = item.intent else { return nil }
+        return intent.candidateID
+      })
+    return candidates.filter {
+      [.pending, .deferred].contains($0.disposition) && !stagedIDs.contains($0.change.id.rawValue)
+    }
   }
   var blockedCandidates: [MemoryReviewCandidate] {
     candidates.filter { $0.disposition == .blocked }
@@ -186,6 +193,19 @@ extension AppModel {
       && !(isAmendingSuggestion && isInputDirty)
       && (draftRecoveries.isEmpty || draft?.batch?.isManualOnly == true)
   }
+  var isStageShownEnabled: Bool {
+    isLoaded && !isBusy && !isDreamRunning && !isSubmittingSave && isReviewTransitionEnabled
+      && !isInputDirty && presentation != nil
+  }
+  var isStageAcceptanceEnabled: Bool { isStageShownEnabled && selectedCandidate != nil }
+  func isDecisionEnabled(for candidate: MemoryReviewCandidate) -> Bool {
+    isLoaded && !isBusy && !isDreamRunning && !isSubmittingSave && isReviewTransitionEnabled
+      && !isInputDirty && !isAmendingSuggestion
+      && [.pending, .deferred].contains(candidate.disposition)
+  }
+  var isSelectedDecisionEnabled: Bool {
+    selectedCandidate.map { isDecisionEnabled(for: $0) } ?? false
+  }
   var reviewActionTitle: String {
     isWorkspaceLoaded && reviewFailure == nil
       ? "Review Suggestions (\(actionableCandidates.count))" : "Review Suggestions"
@@ -220,11 +240,13 @@ extension AppModel {
     if let owner { _ = try requireNativeOwner(owner) }
     let update = try await workspace.batch(command, expectedDraftID: owner?.draftID)
     let preparationFailure = await workspace.reviewPreparationFailure
+    let scopeNames = await workspace.memoryScopeNames
     guard generation == workspaceGeneration else {
       throw NativeBatchLifecycleError.draftOwnerChanged
     }
     if let owner { _ = try requireNativeOwner(owner) }
     applyBatch(update.projection)
+    memoryScopeNames = scopeNames
     reviewFailure = preparationFailure
     return update
   }
@@ -248,6 +270,7 @@ extension AppModel {
       if isRetainingConsumedInput { throw NativeBatchLifecycleError.retainedInputRequiresDiscard }
       if isSubmittedOwnerConsumed { submittedInput = nil }
       applyBatch(try await workspace.openBatch())
+      memoryScopeNames = await workspace.memoryScopeNames
       draftRecoveries = await workspace.draftRecoveries
       reviewFailure = await workspace.reviewPreparationFailure
     } catch {
@@ -561,32 +584,115 @@ extension AppModel {
     do { try await flushInputAndPersistence() } catch { failure = String(describing: error) }
   }
 
-  func stageShown() async {
-    guard !isBusy, isReviewTransitionEnabled, !isInputDirty, let shown = presentation else {
-      return
-    }
+  func stageShown(request: NativeReviewRequest? = nil) async {
+    guard isStageShownEnabled,
+      let request = request
+        ?? reviewRequest(
+          action: .accept, candidateID: selectedCandidate?.change.id.rawValue,
+          presentation: presentation),
+      request.action == .accept, let shown = request.presentation,
+      isReviewRequestCurrent(request)
+    else { return }
     isBusy = true
     defer { isBusy = false }
     do {
-      _ = try await perform(.stage(shown))
-      selection = .staged(shown.itemID)
+      _ = try await perform(.stage(shown), owner: request.owner)
+      let candidateID: String? = {
+        guard
+          case .candidate(let intent) = stagedItems.first(where: {
+            $0.itemID == shown.itemID
+          })?.intent
+        else { return nil }
+        return intent.candidateID
+      }()
       queueAutosave()
-      message = selectedCandidate == nil ? "Review confirmation staged" : "Acceptance staged"
+      message = candidateID == nil ? "Review confirmation staged" : "Acceptance staged"
+      if isReviewRequestCurrent(request) {
+        if let candidateID, request.selection == .candidate(candidateID) {
+          try await advanceReview(after: candidateID, request: request)
+        } else {
+          selection = .staged(shown.itemID)
+        }
+      }
     } catch { failure = String(describing: error) }
   }
 
-  func disposition(_ candidate: MemoryReviewCandidate, isRejected: Bool) async {
-    guard !isBusy, isReviewTransitionEnabled else { return }
+  func disposition(
+    _ candidate: MemoryReviewCandidate, isRejected: Bool, request: NativeReviewRequest? = nil
+  ) async {
+    let action: NativeReviewAction = isRejected ? .dismiss : .decideLater
+    guard isDecisionEnabled(for: candidate),
+      let request = request
+        ?? reviewRequest(action: action, candidateID: candidate.change.id.rawValue),
+      request.action == action, request.candidateID == candidate.change.id.rawValue,
+      isReviewRequestCurrent(request)
+    else { return }
     isBusy = true
     defer { isBusy = false }
     do {
-      try await flushEditor()
-      _ = try await perform(.decision(candidate.change.id, isRejected ? .reject : .deferCandidate))
-      editorTarget = nil
-      presentation = nil
+      _ = try await perform(
+        .decision(candidate.change.id, isRejected ? .reject : .deferCandidate), owner: request.owner
+      )
       queueAutosave()
       message = isRejected ? "Dismissal staged" : "Decide later staged"
+      if isReviewRequestCurrent(request) {
+        if request.selection == .candidate(candidate.change.id.rawValue) {
+          try await advanceReview(after: candidate.change.id.rawValue, request: request)
+        } else if selectedCandidate?.change.id == candidate.change.id {
+          editorTarget = nil
+          presentation = nil
+        }
+      }
     } catch { failure = String(describing: error) }
+  }
+
+  private func advanceReview(after candidateID: String, request: NativeReviewRequest) async throws {
+    guard isReviewRequestCurrent(request) else { return }
+    if let next = actionableCandidates.first(where: { $0.change.id.rawValue > candidateID }) {
+      try await presentNextReview(next, request: request)
+      return
+    }
+    let pageSize = await workspace.catalogPageSize
+    guard isReviewRequestCurrent(request) else { return }
+    let originalOffset = batchProjection?.catalogOffset ?? 0
+    var offset = originalOffset + pageSize
+    while offset < (batchProjection?.candidateCount ?? 0) {
+      _ = try await perform(.page(offset), owner: request.owner)
+      guard isReviewRequestCurrent(request) else { return }
+      if let next = actionableCandidates.first {
+        try await presentNextReview(next, request: request)
+        return
+      }
+      offset += pageSize
+    }
+    offset = 0
+    while offset <= originalOffset {
+      if batchProjection?.catalogOffset != offset {
+        _ = try await perform(.page(offset), owner: request.owner)
+      }
+      guard isReviewRequestCurrent(request) else { return }
+      if let next = actionableCandidates.first {
+        try await presentNextReview(next, request: request)
+        return
+      }
+      offset += pageSize
+    }
+    _ = try await perform(.select(nil), owner: request.owner)
+    guard isReviewRequestCurrent(request) else { return }
+    clearEditor()
+  }
+
+  private func presentNextReview(
+    _ candidate: MemoryReviewCandidate, request: NativeReviewRequest
+  ) async throws {
+    let shown = try await perform(.acceptance(candidate.change.id), owner: request.owner)
+      .presentation
+    guard isReviewRequestCurrent(request) else { return }
+    _ = try await perform(.select(nil), owner: request.owner)
+    guard isReviewRequestCurrent(request) else { return }
+    clearEditor()
+    selection = .candidate(candidate.change.id.rawValue)
+    presentation = shown
   }
 
   func confirmReviewed(_ entry: ManagedMemoryEntry) async {
@@ -595,8 +701,11 @@ extension AppModel {
     defer { isBusy = false }
     do {
       try await flushEditor()
+      let shown = try await perform(.reviewed(entry)).presentation
       editorTarget = nil
-      presentation = try await perform(.reviewed(entry)).presentation
+      selection = .entry(entry.path, entry.locator.start)
+      editorPath = entry.path
+      presentation = shown
     } catch { failure = String(describing: error) }
   }
 
@@ -780,6 +889,7 @@ extension AppModel {
       workspaceGeneration &+= 1
       clearEditor()
       applyBatch(opened)
+      memoryScopeNames = await workspace.memoryScopeNames
       draftRecoveries = await workspace.draftRecoveries
       message = "Manual batch started; recovery pending"
     } catch { failure = String(describing: error) }
@@ -797,6 +907,7 @@ extension AppModel {
       try await flushInputAndPersistence()
       workspaceGeneration &+= 1
       applyBatch(try await workspace.restoreBatch(value))
+      memoryScopeNames = await workspace.memoryScopeNames
       draftRecoveries = await workspace.draftRecoveries
       clearEditor()
       message = "Recovered draft. Publishing suggestions need review."

@@ -226,7 +226,7 @@ extension Workspace {
 @MainActor func nativeAbsentUnboundSuggestionTargetsRemainDiscoverable(scope: String) async throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
-  let project = fixture.root.appendingPathComponent("project")
+  let project = fixture.root.appendingPathComponent("Yoink")
   try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
   _ = try Git(repo: project, environment: [:]).data(["init", "--template="])
   let key = try #require(try MemoryStore.projectKey(cwd: project))
@@ -257,7 +257,7 @@ extension Workspace {
   let url = fixture.root.appendingPathComponent("profile/config.json")
   try configuration.save(to: url)
   let base = try fixture.main()
-  let model = AppModel(configURL: url)
+  let model = AppModel(configURL: url, autosaveDelay: .seconds(3600))
   model.section = "Memories"
   await model.load()
   await model.pauseQueue()
@@ -271,8 +271,21 @@ extension Workspace {
   #expect(
     !FileManager.default.fileExists(
       atPath: fixture.memory.appendingPathComponent(expectedPath).path))
-  await model.selectMemory(.candidate(candidate.change.id.rawValue))
-  await model.stageShown()
+  let label = scope == "project" ? "Yoink" : "Yoink · This device"
+  #expect(model.scopeLabel(path: expectedPath) == label)
+  #expect(model.scopeLabel(path: "MEMORY.md") == "Global")
+  let commands = MemoryBatchInteractionCount()
+  await Git.$memoryBatchCommandObserver.withValue(
+    { commands.increment() },
+    operation: {
+      await model.selectMemory(.candidate(candidate.change.id.rawValue))
+      #expect(model.selectedMemoryPath == expectedPath)
+      await model.stageShown()
+    })
+  #expect(commands.count == 0)
+  let item = try #require(model.stagedItems.first)
+  #expect(model.memoryPath(for: item) == expectedPath)
+  #expect(model.scopeLabel(path: try #require(model.memoryPath(for: item))) == label)
   #expect(model.stagedItems.count == 1)
   #expect(try fixture.main() == base)
   try await model.shutdown()
@@ -421,6 +434,7 @@ extension Workspace {
   let candidate = try #require(model.actionableCandidates.first)
   await model.selectMemory(.candidate(candidate.change.id.rawValue))
   await model.stageShown()
+  await model.selectMemory(.staged(try #require(model.stagedItems.first).itemID))
   await model.editSuggestion()
   let originalText = model.editorText
   model.editorText = fact("Missing the original exact sources.")

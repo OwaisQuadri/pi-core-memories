@@ -16,6 +16,7 @@ import Foundation
   @Published var dreamInspectionFailure: String?
   @Published var batchProjection: MemoryBatchProjection?
   @Published var postSaveCandidates: [MemoryReviewCandidate] = []
+  @Published var memoryScopeNames = NativeMemoryScopeNames()
   @Published var presentation: MemoryBatchPresentation?
   @Published var selection: NativeMemorySelection?
   @Published var retainedDraft: MemoryDraft?
@@ -119,6 +120,7 @@ import Foundation
         let prepared = try await workspace.reprepareBatch()
         clearEditor()
         applyBatch(prepared)
+        memoryScopeNames = await workspace.memoryScopeNames
         draftRecoveries = await workspace.draftRecoveries
         reviewFailure = await workspace.reviewPreparationFailure
       } catch {
@@ -128,6 +130,7 @@ import Foundation
     if batchProjection == nil {
       let readback = await workspace.reviewCandidatePage()
       postSaveCandidates = readback.candidates
+      memoryScopeNames = await workspace.memoryScopeNames
       reviewFailure = readback.failure
       isWorkspaceLoaded = false
     }
@@ -271,6 +274,7 @@ import Foundation
         let prepared = try await workspace.reprepareBatch()
         clearEditor()
         applyBatch(prepared)
+        memoryScopeNames = await workspace.memoryScopeNames
       }
       presentation = nil
       message = "Checkout prepared; no memory was approved"

@@ -250,12 +250,13 @@ func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPre
       call: { try transactionAdd($0) }))
   model.run(.start)
   let deadline = ContinuousClock.now + .seconds(10)
-  while (model.isDreamRunning || model.actionableCandidates.count != 2)
+  while (model.isDreamRunning || model.isBusy || model.actionableCandidates.count != 2)
     && ContinuousClock.now < deadline
   {
     try await Task.sleep(for: .milliseconds(10))
   }
   #expect(!model.isDreamRunning)
+  try #require(!model.isBusy)
   #expect(model.failure == nil)
   #expect(model.actionableCandidates.count == 2)
   #expect(model.presentation == nil)
@@ -276,7 +277,7 @@ func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPre
   let second = model.actionableCandidates[1]
   await model.disposition(first, isRejected: true)
   await model.disposition(second, isRejected: false)
-  #expect(model.actionableCandidates.count == 3)
+  #expect(model.actionableCandidates.count == 1)
   #expect(model.reviewedCandidates.isEmpty)
   #expect(model.stagedItems.count == 2)
   await model.save()

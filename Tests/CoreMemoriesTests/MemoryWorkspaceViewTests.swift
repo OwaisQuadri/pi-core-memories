@@ -21,7 +21,6 @@ import Testing
   host.frame = NSRect(x: 0, y: 0, width: 1000, height: 680)
   host.layoutSubtreeIfNeeded()
   #expect(!memoryWorkspaceDescendants(host).contains { $0 is NSSplitView })
-  model.isBusy = false
   model.isReviewLoading = false
   host.layoutSubtreeIfNeeded()
   let split = try #require(memoryWorkspaceDescendants(host).compactMap { $0 as? NSSplitView }.first)
@@ -29,6 +28,7 @@ import Testing
   print("MemoryWorkspaceView retained recovery host=\(host.frame) split=\(frame)")
   #expect(frame.minY <= 1)
   #expect(frame.height >= 600)
+  model.isBusy = false
   try await model.shutdown()
 }
 

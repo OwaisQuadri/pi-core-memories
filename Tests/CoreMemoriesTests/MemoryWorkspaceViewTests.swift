@@ -21,6 +21,7 @@ import Testing
   host.frame = NSRect(x: 0, y: 0, width: 1000, height: 680)
   host.layoutSubtreeIfNeeded()
   #expect(!memoryWorkspaceDescendants(host).contains { $0 is NSSplitView })
+  #expect(memoryWorkspaceDescendants(host).contains { $0 is NSProgressIndicator })
   model.isReviewLoading = false
   host.layoutSubtreeIfNeeded()
   let split = try #require(memoryWorkspaceDescendants(host).compactMap { $0 as? NSSplitView }.first)
@@ -30,6 +31,34 @@ import Testing
   #expect(frame.height >= 600)
   model.isBusy = false
   try await model.shutdown()
+}
+
+@Test(arguments: ["missing", "corrupt"])
+@MainActor func memoryWorkspaceViewDoesNotResumeLoadingAfterStartupFailureDismissal(
+  _ variant: String
+)
+  async throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let url = fixture.root.appendingPathComponent("profile/selected.json")
+  if variant == "corrupt" { try fixture.write("{", file: url) }
+  let model = AppModel(configURL: url)
+  let host = NSHostingView(rootView: MemoryWorkspaceView(model: model))
+  host.frame = NSRect(x: 0, y: 0, width: 1000, height: 680)
+  host.layoutSubtreeIfNeeded()
+  #expect(!memoryWorkspaceDescendants(host).contains { $0 is NSProgressIndicator })
+  #expect(!memoryWorkspaceDescendants(host).contains { $0 is NSSplitView })
+  await model.load()
+  try #require(model.failure != nil)
+  host.layoutSubtreeIfNeeded()
+  #expect(!memoryWorkspaceDescendants(host).contains { $0 is NSProgressIndicator })
+  #expect(!memoryWorkspaceDescendants(host).contains { $0 is NSSplitView })
+  model.failure = nil
+  host.layoutSubtreeIfNeeded()
+  #expect(!memoryWorkspaceDescendants(host).contains { $0 is NSProgressIndicator })
+  #expect(!memoryWorkspaceDescendants(host).contains { $0 is NSSplitView })
+  #expect(!model.isLoaded)
 }
 
 @MainActor private func memoryWorkspaceDescendants(_ view: NSView) -> [NSView] {

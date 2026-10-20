@@ -6,11 +6,14 @@ struct MemoryWorkspaceView: View {
 
   var body: some View {
     Group {
-      if !model.isLoaded && model.failure == nil
-        || (model.isReviewLoading && model.batchProjection == nil)
-      {
+      if model.isReviewLoading && model.batchProjection == nil {
         ProgressView("Loading memories…")
           .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if !model.isLoaded {
+        VStack(spacing: 12) {
+          Text("Memories unavailable").font(.headline)
+          Button("Open Settings") { model.section = "Settings" }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
         workspace
       }

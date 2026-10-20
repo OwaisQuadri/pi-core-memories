@@ -10,10 +10,8 @@ struct MemoryWorkspaceView: View {
         ProgressView("Loading memories…")
           .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else if !model.isLoaded {
-        VStack(spacing: 12) {
-          Text("Memories unavailable").font(.headline)
-          Button("Open Settings") { model.section = "Settings" }
-        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        Text("Memories unavailable").font(.headline)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
       } else {
         workspace
       }

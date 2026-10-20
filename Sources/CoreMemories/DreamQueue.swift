@@ -82,8 +82,9 @@ package struct DreamQueueSnapshot: Sendable {
       let sources = try configuration.reviewSources(
         stateRoot: configuration.stateURL, memoryRepository: configuration.memoryURL,
         isReadOnly: true)
+      let historical = try sources.historicalSourceIdentities
       let roles = try configuration.queueSourceRoles(
-        sessions: sources.acceptedSources.sessions, stripping: sources.acceptedSources.stripping)
+        sessions: historical.sessions, stripping: historical.stripping)
       return Self(
         coverage: try sources.inspectQueue(
           isSnippetsPresent: roles.isSnippetsPresent, isPromptsPresent: roles.isPromptsPresent,
@@ -99,10 +100,11 @@ package struct DreamQueueSnapshot: Sendable {
 }
 
 extension MemoryConfiguration {
-  package func queueSourceRoles(sessions: URL, stripping: [URL]) throws -> (
-    isSnippetsPresent: Bool, isPromptsPresent: Bool
-  ) {
-    if let roots { return (roots.snippets != nil, roots.prompts != nil) }
+  package func queueSourceRoles(sessions: URL, stripping: [URL]) throws -> DreamSourceRoles {
+    if let roots {
+      return DreamSourceRoles(
+        isSnippetsPresent: roots.snippets != nil, isPromptsPresent: roots.prompts != nil)
+    }
     let agent = URL(fileURLWithPath: settings.agentDirectory)
     guard sessions.path == agent.appendingPathComponent("sessions").path else {
       throw MemoryError(
@@ -119,6 +121,7 @@ extension MemoryConfiguration {
     guard stripping.map(\.path) == expected.map(\.path) else {
       throw MemoryError("Named queue sources are unavailable for this profile")
     }
-    return (isSnippetsPresent, isPromptsPresent)
+    return DreamSourceRoles(
+      isSnippetsPresent: isSnippetsPresent, isPromptsPresent: isPromptsPresent)
   }
 }

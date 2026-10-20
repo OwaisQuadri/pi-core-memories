@@ -397,6 +397,17 @@ public final class DreamRunStore {
 
   package var reviewStateRoot: URL { reviewStateURL }
 
+  package var historicalSourceIdentities: (sessions: URL, stripping: [URL]) {
+    get throws {
+      let binding = try DreamRunEncoding.decode(RootBinding.self, bytes: bindingBytes)
+      let original =
+        binding.originalRoots ?? ([binding.sessions, binding.memory] + binding.stripping)
+      return (
+        URL(fileURLWithPath: original[0]), original.dropFirst(2).map { URL(fileURLWithPath: $0) }
+      )
+    }
+  }
+
   package func reviewSourceBinding(isLegacy: Bool = false) throws -> SourceDigest {
     var held = stat()
     var named = stat()
@@ -435,13 +446,13 @@ public final class DreamRunStore {
     var bundles: [VerifiedDreamReviewCandidates] = []
     do {
       try root.verifyLock(lock)
-      _ = try root.retainedBytes(maximum: limits.maximumStateBytes)
+      _ = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
       guard
         try root.read("root.json", maximum: DreamRunEncoding.maximumMetadataBytes) == bindingBytes
       else {
         throw DreamRunError.unsafeState
       }
-      _ = try loadChain { bundles.append($0) }
+      _ = try loadChain(completed: { bundles.append($0) })
     } catch DreamRunError.busy { throw DreamRunError.busy } catch {
       throw DreamRunError.nativeReviewLimitation("saved completion verification failed: \(error)")
     }
@@ -490,7 +501,7 @@ public final class DreamRunStore {
     }
     guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
     try root.verifyLock(lock)
-    _ = try root.retainedBytes(maximum: limits.maximumStateBytes)
+    _ = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
     _ = try reviewSourceBinding()
     return try body()
   }
@@ -508,7 +519,8 @@ public final class DreamRunStore {
   private func snapshotHash(_ snapshot: ApprovedDecisionSnapshot) -> String {
     var bytes = Data((snapshot.base + "\0" + snapshot.layoutHash.rawValue).utf8)
     for document in snapshot.documents {
-      bytes.append(Data(("\0" + document.path + "\0" + (document.digest?.rawValue ?? "absent")).utf8))
+      bytes.append(
+        Data(("\0" + document.path + "\0" + (document.digest?.rawValue ?? "absent")).utf8))
     }
     return SourceDigest(bytes: bytes).rawValue
   }
@@ -541,7 +553,9 @@ public final class DreamRunStore {
       frozenProofHash: SourceDigest(bytes: bounded(artifacts)).rawValue,
       decisionsHash: SourceDigest(bytes: bounded(outcome.record)).rawValue,
       candidateIDs: outcome.atomicChanges.map { $0.id.rawValue },
-      planHashes: outcome.plans.map { SourceDigest(bytes: try bounded(DreamRunEncoding.Plan($0))).rawValue },
+      planHashes: outcome.plans.map {
+        SourceDigest(bytes: try bounded(DreamRunEncoding.Plan($0))).rawValue
+      },
       confirmedMain: main, snapshotHash: snapshotHash(memory.reviewSnapshot(base: main)))
   }
 
@@ -550,9 +564,13 @@ public final class DreamRunStore {
   {
     guard try sealed.directory.isPresent("recovery.json") else { return nil }
     let bytes = try sealed.directory.read("recovery.json", maximum: limits.maximumFrozenBytes)
-    let checkpoint = try DreamRunEncoding.decode(DreamRunEncoding.RecoveryCheckpoint.self, bytes: bytes)
-    guard checkpoint == (try recoveryCheckpoint(sealed, outcome: outcome, main: checkpoint.confirmedMain)),
-      bytes == (try bounded(checkpoint)) else { throw DreamRunError.corruption }
+    let checkpoint = try DreamRunEncoding.decode(
+      DreamRunEncoding.RecoveryCheckpoint.self, bytes: bytes)
+    guard
+      checkpoint
+        == (try recoveryCheckpoint(sealed, outcome: outcome, main: checkpoint.confirmedMain)),
+      bytes == (try bounded(checkpoint))
+    else { throw DreamRunError.corruption }
     return checkpoint
   }
 
@@ -566,7 +584,9 @@ public final class DreamRunStore {
     let outcome = try validatedOutcome(sealed)
     guard !outcome.plans.isEmpty else { throw MemoryError("saved run has no suggestions") }
     let decisions = try bounded(outcome.record)
-    guard try sealed.directory.read("decisions.json", maximum: limits.maximumFrozenBytes) == decisions else {
+    guard
+      try sealed.directory.read("decisions.json", maximum: limits.maximumFrozenBytes) == decisions
+    else {
       throw DreamRunError.corruption
     }
     let receipts = try savedReceipts(sealed, plans: outcome.plans, decisionsBytes: decisions)
@@ -598,15 +618,321 @@ public final class DreamRunStore {
         return SavedSuggestionSummary(change: change, blocker: error.description)
       }
     }
-    let fingerprint = SourceDigest(bytes: try bounded([
-      SourceDigest(bytes: bounded(checkpoint)).rawValue, main, snapshotHash(snapshot),
-      SourceDigest(bytes: bounded(receipts)).rawValue,
-      SourceDigest(bytes: bounded(published)).rawValue,
-      SourceDigest(bytes: bounded(suggestions.map { [$0.change.id.rawValue, $0.blocker ?? "compatible"] })).rawValue,
-    ]))
+    let fingerprint = SourceDigest(
+      bytes: try bounded([
+        SourceDigest(bytes: bounded(checkpoint)).rawValue, main, snapshotHash(snapshot),
+        SourceDigest(bytes: bounded(receipts)).rawValue,
+        SourceDigest(bytes: bounded(published)).rawValue,
+        SourceDigest(
+          bytes: bounded(suggestions.map { [$0.change.id.rawValue, $0.blocker ?? "compatible"] })
+        ).rawValue,
+      ]))
     return SavedRecoveryProof(
       sealed: sealed, chain: chain, outcome: outcome, main: main, checkpoint: checkpoint,
       fingerprint: fingerprint, suggestions: suggestions)
+  }
+
+  package func previewPromptRelocation(
+    baselineRunID: String, replacement: URL, sourceRoles: DreamSourceRoles
+  ) throws -> PromptRelocationPreview {
+    try withPromptRelocationLock(isConfirming: false) { _ in
+      let comparison = try promptRelocationComparison(
+        baselineRunID: baselineRunID, replacement: replacement, roles: sourceRoles)
+      return try PromptRelocationPreview(
+        payload: comparison.payload,
+        target: comparison.target, mismatches: comparison.mismatches)
+    }
+  }
+
+  package func confirmPromptRelocation(
+    baselineRunID: String, replacement: URL, sourceRoles: DreamSourceRoles,
+    expectedPreviewHash: String, authorization: PromptRelocationAuthorization
+  ) throws -> PromptRelocationReceipt {
+    try withPromptRelocationLock(isConfirming: true) { lock in
+      _ = try SourceDigest(expectedPreviewHash)
+      let comparison = try promptRelocationComparison(
+        baselineRunID: baselineRunID, replacement: replacement, roles: sourceRoles)
+      guard comparison.mismatches.isEmpty,
+        try comparison.payload.fingerprint.rawValue == expectedPreviewHash
+      else { throw MemoryError("prompt relocation preview changed; preview again") }
+      let record = PromptRelocationRecord(
+        payload: comparison.payload,
+        previewHash: expectedPreviewHash, authorization: authorization)
+      try persist(
+        try record.encoded(), name: PromptRelocationRecord.name, directory: root,
+        isReplacing: false, isPromptRelocation: true,
+        beforeInstall: {
+          try self.root.verifyLock(lock)
+          guard try self.promptRelocationStoreIdentity() == comparison.payload.store,
+            !(try self.root.isPresent(PromptRelocationRecord.name))
+          else { throw MemoryError("prompt relocation store changed") }
+        })
+      return PromptRelocationReceipt(
+        previewHash: expectedPreviewHash,
+        replacement: MemoryStore.safeReviewDisplay(comparison.payload.replacement),
+        recordName: PromptRelocationRecord.name)
+    }
+  }
+
+  private func withPromptRelocationLock<T>(
+    isConfirming: Bool, _ body: (Int32) throws -> T
+  ) throws -> T {
+    guard operationLock.try() else { throw DreamRunError.busy }
+    defer { operationLock.unlock() }
+    let lock = try root.openReadLock()
+    defer {
+      _ = flock(lock, LOCK_UN)
+      _ = close(lock)
+    }
+    guard flock(lock, (isConfirming ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0 else {
+      throw DreamRunError.busy
+    }
+    try root.verifyLock(lock)
+    _ = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
+    _ = try reviewSourceBinding()
+    if try root.isPresent(PromptRelocationRecord.name) {
+      _ = try PromptRelocationRecord.decode(
+        root.read(
+          PromptRelocationRecord.name,
+          maximum: PromptRelocationRecord.maximumBytes))
+      throw MemoryError("a prompt relocation record already exists")
+    }
+    return try body(lock)
+  }
+
+  private func promptRelocationStoreIdentity() throws -> PromptRelocationPayload.Store {
+    let sourceBinding = try reviewSourceBinding()
+    var state = stat()
+    var repository = stat()
+    guard fstat(root.descriptor, &state) == 0,
+      try Self.canonicalExisting(memoryRepository).path == memoryRepository.path,
+      lstat(memoryRepository.path, &repository) == 0, repository.st_mode & S_IFMT == S_IFDIR
+    else { throw DreamRunError.unsafeState }
+    return try .init(
+      statePath: reviewStateURL.path,
+      stateVolume: MemoryReviewEncoding.volumeUUID(at: reviewStateURL),
+      stateInode: UInt64(state.st_ino), sourceBinding: sourceBinding.rawValue,
+      rootHash: bindingHash.rawValue, repositoryPath: memoryRepository.path,
+      repositoryVolume: MemoryReviewEncoding.volumeUUID(at: memoryRepository),
+      repositoryInode: UInt64(repository.st_ino))
+  }
+
+  private func promptBaselineProof(
+    _ sealed: SealedRun, chain: SuccessfulChain,
+    isCompleted: Bool
+  ) throws -> PromptRelocationPayload.Baseline {
+    let generation = sealed.admission.generation
+    var completedHash: String?
+    var completionHash: String?
+    if isCompleted {
+      guard generation < chain.record.progress.generation else { throw DreamRunError.corruption }
+      let bytes = try root.child("generations").read(
+        "\(generation + 1).json",
+        maximum: limits.maximumFrozenBytes)
+      let record = try DreamRunEncoding.decode(DreamRunEncoding.Generation.self, bytes: bytes)
+      guard chain.hashes[generation + 1] == SourceDigest(bytes: bytes).rawValue,
+        record.runID == sealed.run.runID, record.admissionHash == sealed.admissionHash.rawValue
+      else { throw DreamRunError.corruption }
+      completedHash = SourceDigest(bytes: bytes).rawValue
+      completionHash = record.completionHash
+    }
+    return .init(
+      runID: sealed.run.runID, generation: generation,
+      admissionHash: sealed.admissionHash.rawValue,
+      predecessorHash: sealed.admission.predecessorHash,
+      inputHash: sealed.run.inputHash.rawValue, contextHash: sealed.context.contextHash.rawValue,
+      requestHash: sealed.request.requestHash.rawValue,
+      completedGenerationHash: completedHash, completionHash: completionHash)
+  }
+
+  private func promptInventory(_ sealed: SealedRun) throws -> PromptTemplateInventory {
+    guard let provenance = sealed.run.batch.provenance else { throw DreamRunError.corruption }
+    return try PromptTemplateInventory(
+      inputs: provenance.stripping.filter { $0.kind == "templates" },
+      maximumBytes: limits.maximumFrozenBytes)
+  }
+
+  private func promptRelocationComparison(
+    baselineRunID: String, replacement: URL,
+    roles: DreamSourceRoles
+  ) throws -> (
+    payload: PromptRelocationPayload, target: PromptTemplateInventory, mismatches: [String]
+  ) {
+    guard DreamRunEncoding.isRunID(baselineRunID), roles.isPromptsPresent else {
+      throw MemoryError("prompt relocation requires a named baseline and registered prompts")
+    }
+    _ = try roles.sources(configuredRoots)
+    var selected: SealedRun?
+    var encountered: [PromptRelocationPayload.Coverage.OtherInventory] = []
+    let chain = try loadChain(capture: { sealed, _, _ in
+      let inventory = try self.promptInventory(sealed)
+      encountered.append(.init(runID: sealed.run.runID, templateDigest: inventory.digest))
+      if sealed.run.runID == baselineRunID { selected = sealed }
+    })
+    let head = chain.record.progress.generation
+    var current: SealedRun?
+    if try root.child("admissions").isPresent("\(head).json") {
+      current = try loadAdmission(generation: head, chain: chain)
+      if current?.run.runID == baselineRunID { selected = current }
+      if let current {
+        encountered.append(
+          .init(
+            runID: current.run.runID,
+            templateDigest: try promptInventory(current).digest))
+      }
+    }
+    guard let selected else { throw MemoryError("baseline is not an authoritative admitted input") }
+    let inventory = try promptInventory(selected)
+    guard inventory.entryCount > 0 else {
+      throw MemoryError("baseline has no complete prompt inventory")
+    }
+    let binding = try DreamRunEncoding.decode(RootBinding.self, bytes: bindingBytes)
+    let canonical = binding.stripping[roles.promptsOffset]
+    let original = (binding.originalRoots.map { Array($0.dropFirst(2)) } ?? binding.stripping)[
+      roles.promptsOffset]
+    try Self.requireMissingSource(original: original, canonical: canonical)
+    try validatePromptReplacement(replacement)
+    let captured = try PreparationDirectory(url: replacement).checkedTemplates(
+      maximumBytes: limits.maximumFrozenBytes)
+    let target = try PromptTemplateInventory(
+      inputs: captured, maximumBytes: limits.maximumFrozenBytes)
+    let baselineInputs = selected.run.batch.provenance!.stripping.filter { $0.kind == "templates" }
+    var mismatches: [String] = []
+    let oldNames = Set(baselineInputs.map { Data($0.name.utf8) })
+    let newNames = Set(captured.map { Data($0.name.utf8) })
+    let targetBytes = Dictionary(
+      uniqueKeysWithValues: captured.map { (Data($0.name.utf8), $0.bytes) })
+    for input in baselineInputs {
+      if !newNames.contains(Data(input.name.utf8)) {
+        mismatches.append("missing template: \(input.name)")
+      } else if input.bytes != targetBytes[Data(input.name.utf8)] {
+        mismatches.append("changed template bytes: \(input.name)")
+      }
+    }
+    for input in captured where !oldNames.contains(Data(input.name.utf8)) {
+      mismatches.append("extra template: \(input.name)")
+    }
+    let isCompleted = selected.admission.generation < head
+    let payload = try PromptRelocationPayload(
+      schemaVersion: 1, policyVersion: 1,
+      kind: "prompt-source-relocation", store: promptRelocationStoreIdentity(), role: "prompts",
+      roles: roles, strippingOffset: roles.promptsOffset, registeredOriginal: original,
+      registeredCanonical: canonical, replacement: replacement.path,
+      baseline: promptBaselineProof(selected, chain: chain, isCompleted: isCompleted),
+      anchor: .init(
+        generation: head, generationHash: chain.hash.rawValue,
+        currentAdmissionHash: current?.admissionHash.rawValue),
+      inventory: inventory,
+      coverage: .init(
+        claim: "complete-template-subset-of-selected-input-only",
+        isCompleted: isCompleted,
+        isNewerCompletedCapturePresent: selected.admission.generation < head
+          && head - selected.admission.generation > 1,
+        differingInventories: encountered.filter { $0.templateDigest != inventory.digest },
+        limitations: [
+          "Equality covers only the selected frozen input's complete template subset.",
+          "Other versions and outstanding expansions are not universally proven equivalent.",
+        ]),
+      isRecordAbsent: true)
+    _ = try PromptRelocationRecord(
+      payload: payload, previewHash: payload.fingerprint.rawValue,
+      authorization: .explicitCaller
+    ).encoded()
+    return (payload, target, mismatches)
+  }
+
+  private static func requireMissingSource(original: String, canonical: String) throws {
+    for path in Set([original, canonical]) {
+      var status = stat()
+      guard lstat(path, &status) != 0, errno == ENOENT else {
+        throw MemoryError("registered prompt source is present or unsafe")
+      }
+      if let resolved = realpath(path, nil) {
+        free(resolved)
+        throw MemoryError("registered prompt source is not missing")
+      }
+      guard errno == ENOENT else { throw DreamRunError.unsafeState }
+    }
+    var ancestor = URL(fileURLWithPath: original)
+    var suffix: [String] = []
+    var status = stat()
+    while lstat(ancestor.path, &status) != 0 {
+      guard errno == ENOENT, ancestor.path != "/" else { throw DreamRunError.unsafeState }
+      suffix.insert(ancestor.lastPathComponent, at: 0)
+      ancestor.deleteLastPathComponent()
+    }
+    let resolved = try canonicalExisting(ancestor)
+    let expected = suffix.reduce(resolved) { $0.appendingPathComponent($1) }
+    guard Data(expected.path.utf8) == Data(canonical.utf8) else { throw DreamRunError.unsafeState }
+  }
+
+  private func validatePromptReplacement(_ replacement: URL) throws {
+    guard replacement.isFileURL, replacement.path.hasPrefix("/"),
+      replacement.path.utf8.count <= 4096, !replacement.path.contains("\0"),
+      !replacement.path.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }),
+      Data(try Self.canonicalExisting(replacement).path.utf8) == Data(replacement.path.utf8)
+    else { throw MemoryError("replacement prompts require an exact canonical directory") }
+    for source in configuredRoots + [reviewStateURL] {
+      guard !Self.isWithin(replacement, source), !Self.isWithin(source, replacement) else {
+        throw MemoryError("replacement prompts overlap a registered source or dream state")
+      }
+    }
+    try PreparationDirectory(url: replacement).verifyPromptRoot()
+  }
+
+  private func freshSources(roles: DreamSourceRoles, chain: SuccessfulChain) throws
+    -> DreamFreshSources
+  {
+    _ = try roles.sources(configuredRoots)
+    guard try root.isPresent(PromptRelocationRecord.name) else {
+      return try roles.sources(
+        configuredRoots.indices.map {
+          let source = try acceptedCanonicalRoot(at: $0)
+          _ = try PreparationDirectory(url: source)
+          return source
+        })
+    }
+    let record = try PromptRelocationRecord.decode(
+      root.read(
+        PromptRelocationRecord.name,
+        maximum: PromptRelocationRecord.maximumBytes))
+    let payload = record.payload
+    let binding = try DreamRunEncoding.decode(RootBinding.self, bytes: bindingBytes)
+    guard roles.isPromptsPresent, payload.roles == roles,
+      payload.strippingOffset == roles.promptsOffset,
+      payload.store == (try promptRelocationStoreIdentity()),
+      Data(payload.registeredCanonical.utf8) == Data(binding.stripping[roles.promptsOffset].utf8),
+      Data(payload.registeredOriginal.utf8)
+        == Data(
+          (binding.originalRoots.map { Array($0.dropFirst(2)) }
+            ?? binding.stripping)[roles.promptsOffset].utf8),
+      chain.hashes[payload.anchor.generation] == payload.anchor.generationHash
+    else { throw MemoryError("prompt relocation does not belong to this store and role") }
+    if let admissionHash = payload.anchor.currentAdmissionHash {
+      let anchor = try loadAdmission(generation: payload.anchor.generation, chain: chain)
+      guard anchor.admissionHash.rawValue == admissionHash else { throw DreamRunError.corruption }
+    }
+    let baseline = try loadAdmission(generation: payload.baseline.generation, chain: chain)
+    guard
+      payload.baseline
+        == (try promptBaselineProof(
+          baseline, chain: chain,
+          isCompleted: payload.baseline.completedGenerationHash != nil)),
+      payload.inventory == (try promptInventory(baseline)),
+      payload.baseline.generation <= payload.anchor.generation
+    else { throw MemoryError("prompt relocation baseline authority changed") }
+    try Self.requireMissingSource(
+      original: payload.registeredOriginal, canonical: payload.registeredCanonical)
+    let replacement = URL(fileURLWithPath: payload.replacement)
+    try validatePromptReplacement(replacement)
+    var roots: [URL] = []
+    for index in configuredRoots.indices {
+      let source =
+        try index == 2 + roles.promptsOffset ? replacement : acceptedCanonicalRoot(at: index)
+      _ = try PreparationDirectory(url: source)
+      roots.append(source)
+    }
+    return try roles.sources(roots)
   }
 
   package func inspectQueue(
@@ -621,16 +947,34 @@ public final class DreamRunStore {
     }
     guard flock(lock, LOCK_SH | LOCK_NB) == 0 else { throw DreamRunError.busy }
     try root.verifyLock(lock)
-    _ = try root.retainedBytes(maximum: limits.maximumStateBytes)
+    _ = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
     _ = try reviewSourceBinding()
-    let progress = try loadChain().record.progress.domain()
-    let sources = acceptedSources
-    guard sources.stripping.count == (isSnippetsPresent ? 1 : 0) + (isPromptsPresent ? 1 : 0)
-    else { throw DreamRunError.unsafeState }
+    let chain = try loadChain()
+    let progress = try chain.record.progress.domain()
+    let roles = DreamSourceRoles(
+      isSnippetsPresent: isSnippetsPresent, isPromptsPresent: isPromptsPresent)
+    let sources: DreamFreshSources
+    do {
+      sources = try freshSources(roles: roles, chain: chain)
+    } catch DreamRunError.unsafeState {
+      if !(try root.isPresent(PromptRelocationRecord.name)) {
+        let historical = try roles.sources(configuredRoots)
+        if let prompts = historical.prompts,
+          (try? Self.requireMissingSource(original: prompts.path, canonical: prompts.path)) != nil
+        {
+          throw MemoryError("no prompt templates in --prompts")
+        }
+        if let snippets = historical.snippets,
+          (try? Self.requireMissingSource(original: snippets.path, canonical: snippets.path)) != nil
+        {
+          throw MemoryError("no snippet bodies in --snippets")
+        }
+      }
+      throw DreamRunError.unsafeState
+    }
     var backlog: DreamBacklog?
     let batch = try SessionReader(
-      sessions: sources.sessions, snippets: isSnippetsPresent ? sources.stripping[0] : nil,
-      prompts: isPromptsPresent ? sources.stripping[isSnippetsPresent ? 1 : 0] : nil
+      sessions: sources.sessions, snippets: sources.snippets, prompts: sources.prompts
     ).prepare(
       progress: progress, limits: DreamInputLimits(),
       modifiedAfter: date.addingTimeInterval(-SessionReader.dreamWindow),
@@ -647,6 +991,32 @@ public final class DreamRunStore {
     prepare: (DreamProgress) throws -> PreparedSessionBatch,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void = { _, _, _, _ in }
+  ) throws -> DreamTransactionResult {
+    try performRun(
+      selection: selection, resume: resume, sourceRoles: nil,
+      prepare: { progress, _ in try prepare(progress) }, call: call, observe: observe)
+  }
+
+  package func run(
+    selection: DreamSelectedCall, resume: DreamResumeAction = .inspectOrContinue,
+    sourceRoles: DreamSourceRoles,
+    prepare: (DreamProgress, DreamFreshSources) throws -> PreparedSessionBatch,
+    call: (DreamModelRequest) throws -> DreamCompletedResponse,
+    observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void = { _, _, _, _ in }
+  ) throws -> DreamTransactionResult {
+    try performRun(
+      selection: selection, resume: resume, sourceRoles: sourceRoles,
+      prepare: { progress, sources in
+        guard let sources else { throw DreamRunError.unsafeState }
+        return try prepare(progress, sources)
+      }, call: call, observe: observe)
+  }
+
+  private func performRun(
+    selection: DreamSelectedCall, resume: DreamResumeAction, sourceRoles: DreamSourceRoles?,
+    prepare: (DreamProgress, DreamFreshSources?) throws -> PreparedSessionBatch,
+    call: (DreamModelRequest) throws -> DreamCompletedResponse,
+    observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void
   ) throws -> DreamTransactionResult {
     guard operationLock.try() else { throw DreamRunError.busy }
     defer { operationLock.unlock() }
@@ -671,7 +1041,7 @@ public final class DreamRunStore {
     var observedInputBytes = 0
     let result = try runLocked(
       selection: selection, resume: resume, isLockCreated: ownership.isCreated,
-      prepare: prepare,
+      sourceRoles: sourceRoles, prepare: prepare,
       call: { request in
         let started = ContinuousClock.now
         let response = try call(request)
@@ -715,11 +1085,12 @@ public final class DreamRunStore {
 
   private func runLocked(
     selection: DreamSelectedCall, resume: DreamResumeAction, isLockCreated: Bool,
-    prepare: (DreamProgress) throws -> PreparedSessionBatch,
+    sourceRoles: DreamSourceRoles?,
+    prepare: (DreamProgress, DreamFreshSources?) throws -> PreparedSessionBatch,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool) throws -> Void
   ) throws -> DreamTransactionResult {
-    _ = try root.retainedBytes(maximum: limits.maximumStateBytes)
+    _ = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
     if try root.names() == ["writer.lock"] {
       guard isLockCreated else { throw DreamRunError.missingPayload }
       try persist(bindingBytes, name: "root.json", directory: root, isReplacing: false)
@@ -789,11 +1160,19 @@ public final class DreamRunStore {
       isRecovered = true
     } else {
       guard cached?.runID == nil else { throw DreamRunError.missingPayload }
-      let sources = try configuredRoots.indices.map { try acceptedCanonicalRoot(at: $0) }
-      for source in sources {
-        _ = try PreparationDirectory(url: source)
+      let sources: DreamFreshSources?
+      if let sourceRoles {
+        sources = try freshSources(roles: sourceRoles, chain: chain)
+      } else {
+        guard !(try root.isPresent(PromptRelocationRecord.name)) else {
+          throw MemoryError("fresh prompt relocation requires named source roles")
+        }
+        for index in configuredRoots.indices {
+          _ = try PreparationDirectory(url: acceptedCanonicalRoot(at: index))
+        }
+        sources = nil
       }
-      let batch = try prepare(progress)
+      let batch = try prepare(progress, sources)
       do {
         try DreamRunEncoding.validate(progress: progress, batch: batch, limits: limits)
       } catch let error as DreamRunError { throw error } catch { throw DreamRunError.corruption }
@@ -1256,7 +1635,8 @@ public final class DreamRunStore {
   }
 
   private func loadChain(
-    completed: ((VerifiedDreamReviewCandidates) -> Void)? = nil
+    completed: ((VerifiedDreamReviewCandidates) -> Void)? = nil,
+    capture: ((SealedRun, DreamRunEncoding.Generation, SourceDigest) throws -> Void)? = nil
   ) throws -> SuccessfulChain {
     let generations = try root.child("generations")
     let installed = Set(try generations.names().filter { !$0.hasPrefix(".pending-") })
@@ -1306,6 +1686,7 @@ public final class DreamRunStore {
           SourceDigest(bytes: completionBytes).rawValue == completionHash,
           progress == (try completion.progress.domain())
         else { throw DreamRunError.corruption }
+        try capture?(sealed, record, SourceDigest(bytes: bytes))
         if let completed {
           let memory = try MemoryStore(repo: memoryRepository)
           let reports = try zip(outcome.plans, receipts).map { plan, receipt in
@@ -1322,7 +1703,9 @@ public final class DreamRunStore {
               completionHash: SourceDigest(bytes: completionBytes),
               decisionsHash: SourceDigest(bytes: decisionsBytes), changes: outcome.atomicChanges,
               receipts: reports, limitations: sealed.context.limitations,
-              recoveryCheckpointHash: try completion.recoveryCheckpointHash.map { try SourceDigest($0) },
+              recoveryCheckpointHash: try completion.recoveryCheckpointHash.map {
+                try SourceDigest($0)
+              },
               recoveryCheckpoint: try enrolledRecovery(sealed, outcome: outcome)))
         }
       }
@@ -1678,10 +2061,14 @@ public final class DreamRunStore {
 
   private func persist(
     _ bytes: Data, name: String, directory: DreamStateDirectory, isReplacing: Bool,
-    isProgressCommit: Bool = false
+    isProgressCommit: Bool = false, isPromptRelocation: Bool = false,
+    beforeInstall: () throws -> Void = {}
   ) throws {
-    let retained = try root.retainedBytes(maximum: limits.maximumStateBytes)
+    let retained = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
     if !isReplacing, try directory.isPresent(name) {
+      guard !isPromptRelocation else {
+        throw MemoryError("a prompt relocation record already exists")
+      }
       let maximum = max(
         limits.maximumFrozenBytes,
         limits.maximumResponseBytes * 6 + DreamRunEncoding.maximumMetadataBytes)
@@ -1692,15 +2079,22 @@ public final class DreamRunStore {
       try synchronize(directory, name: name)
       return
     }
-    guard bytes.count <= limits.maximumStateBytes - retained else {
-      throw DreamRunError.limitExceeded
-    }
+    guard
+      bytes.count
+        <= (isPromptRelocation
+          ? PromptRelocationRecord.maximumBytes : limits.maximumStateBytes - retained),
+      !isPromptRelocation
+        || (directory === root && name == PromptRelocationRecord.name && !isReplacing)
+    else { throw DreamRunError.limitExceeded }
     let temporary = ".pending-" + UUID().uuidString.lowercased()
     let file = openat(
       directory.descriptor, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard file >= 0 else { throw DreamRunError.persistenceFailure }
     var isClosed = false
-    defer { if !isClosed { _ = close(file) } }
+    defer {
+      if !isClosed { _ = close(file) }
+      if isPromptRelocation { _ = unlinkat(directory.descriptor, temporary, 0) }
+    }
     try directory.verifyFile(file)
     try fault(.beforeWrite(name))
     try bytes.withUnsafeBytes { buffer in
@@ -1721,6 +2115,7 @@ public final class DreamRunStore {
     guard close(file) == 0 else { throw DreamRunError.persistenceFailure }
     isClosed = true
     try fault(.beforeInstall(name))
+    try beforeInstall()
     if isProgressCommit, isCancelled() { throw CancellationError() }
     if isReplacing, try directory.isPresent(name) {
       _ = try directory.read(name, maximum: DreamRunEncoding.maximumMetadataBytes)
@@ -1884,13 +2279,14 @@ final class DreamStateDirectory {
     return names.sorted()
   }
 
-  func retainedBytes(maximum: Int, depth: Int = 0) throws -> Int {
+  func retainedBytes(maximum: Int, depth: Int = 0, isDreamAuthority: Bool = false) throws -> Int {
     guard depth < 64 else { throw DreamRunError.limitExceeded }
     var directoryStatus = stat()
     guard fstat(descriptor, &directoryStatus) == 0 else { throw DreamRunError.unsafeState }
     try Self.verifyDirectory(directoryStatus)
     var total = 0
     for name in try names() {
+      if isDreamAuthority, depth == 0, name == PromptRelocationRecord.name { continue }
       var status = stat()
       guard fstatat(descriptor, name, &status, AT_SYMLINK_NOFOLLOW) == 0 else {
         throw DreamRunError.unsafeState

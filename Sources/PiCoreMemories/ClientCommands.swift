@@ -17,6 +17,9 @@ func executeClientCommand(_ arguments: [String]) throws -> Int32 {
     operation = command
     start = 1
   }
+  let isPromptRelocation =
+    command == "dream"
+    && ["relocate-prompts-preview", "relocate-prompts-confirm"].contains(operation)
   var index = start
   while index < arguments.count {
     guard arguments[index].hasPrefix("--"), index + 1 < arguments.count,
@@ -27,7 +30,13 @@ func executeClientCommand(_ arguments: [String]) throws -> Int32 {
   }
   let allowed: Set<String>
   switch command {
-  case "dream": allowed = ["--config", "--state"]
+  case "dream":
+    switch operation {
+    case "relocate-prompts-preview": allowed = ["--config", "--baseline-run", "--to"]
+    case "relocate-prompts-confirm":
+      allowed = ["--config", "--baseline-run", "--to", "--preview", "--confirm"]
+    default: allowed = ["--config", "--state"]
+    }
   case "draft": allowed = ["--config", "--repo", "--journal", "--id", "--revision", "--key"]
   case "scope", "setup-device": allowed = ["--config"]
   case "bind-project": allowed = ["--config", "--cwd", "--key"]
@@ -49,7 +58,11 @@ func executeClientCommand(_ arguments: [String]) throws -> Int32 {
   func output<T: Encodable>(_ value: T) throws {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    try FileHandle.standardOutput.write(contentsOf: encoder.encode(value) + Data([10]))
+    let bytes = try encoder.encode(value)
+    if isPromptRelocation {
+      guard bytes.count <= 8_388_608 else { throw DreamRunError.limitExceeded }
+    }
+    try FileHandle.standardOutput.write(contentsOf: bytes + Data([10]))
   }
   if command == "scope" {
     let data = try JSONSerialization.data(
@@ -80,6 +93,37 @@ func executeClientCommand(_ arguments: [String]) throws -> Int32 {
     return 0
   }
   if command == "dream" {
+    if isPromptRelocation {
+      guard let baseline = options["--baseline-run"], let target = options["--to"],
+        target.hasPrefix("/"),
+        operation != "relocate-prompts-confirm"
+          || (options["--confirm"] == "yes" && options["--preview"] != nil)
+      else {
+        throw UsageError(
+          description:
+            "prompt relocation requires --baseline-run and canonical --to; confirmation also requires --preview and --confirm yes"
+        )
+      }
+      let sources = try config.reviewSources(
+        stateRoot: config.stateURL,
+        memoryRepository: config.memoryURL, isReadOnly: true)
+      let historical = try sources.historicalSourceIdentities
+      let roles = try config.queueSourceRoles(
+        sessions: historical.sessions, stripping: historical.stripping)
+      if operation == "relocate-prompts-preview" {
+        try output(
+          sources.previewPromptRelocation(
+            baselineRunID: baseline,
+            replacement: URL(fileURLWithPath: target), sourceRoles: roles))
+      } else {
+        try output(
+          sources.confirmPromptRelocation(
+            baselineRunID: baseline,
+            replacement: URL(fileURLWithPath: target), sourceRoles: roles,
+            expectedPreviewHash: options["--preview"]!, authorization: .explicitCaller))
+      }
+      return 0
+    }
     if operation == "inspect" {
       try output(
         DreamInspection.read(

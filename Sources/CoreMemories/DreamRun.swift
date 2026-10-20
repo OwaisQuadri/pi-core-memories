@@ -1091,7 +1091,7 @@ public final class DreamRunStore {
     observe: (DreamProgress, PreparedSessionBatch, Bool) throws -> Void
   ) throws -> DreamTransactionResult {
     _ = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
-    if try root.names() == ["writer.lock"] {
+    if try root.names(isDreamAuthority: true) == ["writer.lock"] {
       guard isLockCreated else { throw DreamRunError.missingPayload }
       try persist(bindingBytes, name: "root.json", directory: root, isReplacing: false)
       for name in ["runs", "admissions", "generations"] {
@@ -2252,7 +2252,7 @@ final class DreamStateDirectory {
     }
   }
 
-  func names(maximum: Int = 10_000) throws -> [String] {
+  func names(maximum: Int = 10_000, isDreamAuthority: Bool = false) throws -> [String] {
     let copy = openat(descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     guard copy >= 0 else { throw DreamRunError.persistenceFailure }
     guard let directory = fdopendir(copy) else {
@@ -2262,6 +2262,7 @@ final class DreamStateDirectory {
     var isClosed = false
     defer { if !isClosed { _ = closedir(directory) } }
     var names: [String] = []
+    var isPromptRelocationPresent = false
     while true {
       errno = 0
       guard let entry = readdir(directory) else {
@@ -2271,8 +2272,15 @@ final class DreamStateDirectory {
       let name = withUnsafePointer(to: &entry.pointee.d_name) {
         String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self))
       }
-      if name != ".", name != ".." { names.append(name) }
-      guard names.count <= maximum else { throw DreamRunError.limitExceeded }
+      if name != ".", name != ".." {
+        names.append(name)
+        if isDreamAuthority, name == PromptRelocationRecord.name {
+          isPromptRelocationPresent = true
+        }
+      }
+      guard names.count - (isPromptRelocationPresent ? 1 : 0) <= maximum else {
+        throw DreamRunError.limitExceeded
+      }
     }
     guard closedir(directory) == 0 else { throw DreamRunError.persistenceFailure }
     isClosed = true
@@ -2285,7 +2293,7 @@ final class DreamStateDirectory {
     guard fstat(descriptor, &directoryStatus) == 0 else { throw DreamRunError.unsafeState }
     try Self.verifyDirectory(directoryStatus)
     var total = 0
-    for name in try names() {
+    for name in try names(isDreamAuthority: isDreamAuthority && depth == 0) {
       if isDreamAuthority, depth == 0, name == PromptRelocationRecord.name { continue }
       var status = stat()
       guard fstatat(descriptor, name, &status, AT_SYMLINK_NOFOLLOW) == 0 else {

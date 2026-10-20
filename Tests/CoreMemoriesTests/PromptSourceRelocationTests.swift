@@ -705,8 +705,116 @@ struct PromptSourceRelocationTests {
     #expect(try fixture.snapshot(fixture.root) == before)
   }
 
-  @Test(arguments: ["topLevel", "nested", "otherName"])
-  func onlyTheExactTopLevelDreamOverlayIsExcludedFromAuthorityTraversal(_ variant: String) throws {
+  @Test func relocationAtCoreEntryLimitKeepsSavedAuthorityUsable() throws {
+    let relocation = try PromptRelocationFixture()
+    let fixture = relocation.transaction
+    defer { fixture.clean() }
+    let store = try relocation.store()
+    let binding = try store.reviewSourceBinding()
+    let review = try MemoryReviewController(
+      repository: fixture.memory,
+      stateRoot: URL(fileURLWithPath: relocation.configuration.reviewState), sources: store,
+      environment: [:])
+    let candidate = try #require(review.list().first)
+    try review.deferCandidate(candidateID: candidate.change.id)
+    let history = try DreamRunEncoding.encode(DreamInspection.read(stateRoot: fixture.state))
+    let main = try fixture.main()
+    let git = Git(repo: fixture.memory, environment: [:])
+    let refs = try git.data(["for-each-ref", "--format=%(refname) %(objectname)"])
+    let directory = try DreamStateDirectory.openRoot(fixture.state, isCreating: false)
+    let count = try directory.names().count
+    for index in count..<10_000 {
+      let file = open(
+        fixture.state.appendingPathComponent("retained-\(index)").path,
+        O_WRONLY | O_CREAT | O_EXCL, 0o600)
+      try #require(file >= 0)
+      try #require(close(file) == 0)
+    }
+    #expect(try directory.names().count == 10_000)
+    let before = try fixture.snapshot(fixture.root)
+    let preview = try relocation.preview(store)
+    #expect(preview.isCompatible)
+    #expect(try fixture.snapshot(fixture.root) == before)
+    try relocation.confirm(preview, store: store)
+    let confirmed = try fixture.snapshot(fixture.root)
+    var withoutRecord = confirmed
+    let record = withoutRecord.removeValue(forKey: relocation.recordURL.path)
+    #expect(record != nil && withoutRecord == before)
+    #expect(throws: DreamRunError.limitExceeded) { try directory.names() }
+    let authorityNames = try directory.names(isDreamAuthority: true)
+    #expect(authorityNames.count == 10_001)
+    #expect(authorityNames.contains("prompt-relocation.json"))
+    #expect(try DreamRunEncoding.encode(DreamInspection.read(stateRoot: fixture.state)) == history)
+    #expect(try store.reviewSourceBinding() == binding)
+    let deferred = try #require(review.list().first)
+    #expect(deferred.change.id == candidate.change.id && deferred.disposition == .deferred)
+    #expect(try review.selection(candidate.change.id.rawValue) == .deferred)
+    #expect(try fixture.snapshot(fixture.root) == confirmed)
+    let replay = try transactionCompleted(
+      relocation.store().run(
+        selection: fixture.selection, resume: .retryInterruptedCall,
+        prepare: transactionUncalledPrepare, call: transactionUncalled))
+    #expect(replay.runID == relocation.baselineRunID && replay.generation == 1)
+    #expect(try store.verifiedCompletedReviewCandidates().count == 1)
+    #expect(try store.reviewSourceBinding() == binding)
+    #expect(try fixture.main() == main)
+    #expect(try git.data(["for-each-ref", "--format=%(refname) %(objectname)"]) == refs)
+    #expect(try fixture.snapshot(fixture.root).mapValues(\.bytes) == confirmed.mapValues(\.bytes))
+    let extra = open(
+      fixture.state.appendingPathComponent("extra-core-entry").path,
+      O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    try #require(extra >= 0)
+    try #require(close(extra) == 0)
+    let overflow = try fixture.snapshot(fixture.root)
+    #expect(throws: DreamRunError.limitExceeded) { try directory.names(isDreamAuthority: true) }
+    #expect(throws: DreamRunError.limitExceeded) {
+      try DreamInspection.read(stateRoot: fixture.state)
+    }
+    #expect(throws: DreamRunError.limitExceeded) {
+      try relocation.store().run(
+        selection: fixture.selection, resume: .retryInterruptedCall,
+        prepare: transactionUncalledPrepare, call: transactionUncalled)
+    }
+    #expect(try fixture.snapshot(fixture.root) == overflow)
+  }
+
+  @Test func optionalOverlayCannotMakeANonemptyRootEligibleForInitialization() throws {
+    let fixture = try TransactionFixture()
+    defer { fixture.clean() }
+    let directory = try DreamStateDirectory.openRoot(fixture.state)
+    let lock = try directory.openLock()
+    try #require(lock.isCreated)
+    try #require(close(lock.descriptor) == 0)
+    let overlay = fixture.state.appendingPathComponent("prompt-relocation.json")
+    try Data("{}".utf8).write(to: overlay)
+    #expect(chmod(overlay.path, 0o600) == 0)
+    let names = try directory.names(isDreamAuthority: true)
+    #expect(names == ["prompt-relocation.json", "writer.lock"])
+    let before = try fixture.snapshot(fixture.state)
+    #expect(before.count == 2)
+    var metadata = stat()
+    try #require(lstat(overlay.path, &metadata) == 0)
+    #expect(
+      metadata.st_mode & 0o7777 == 0o600 && metadata.st_nlink == 1 && metadata.st_uid == geteuid())
+    #expect(throws: DreamRunError.missingPayload) {
+      try fixture.store().run(
+        selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled
+      )
+    }
+    #expect(try directory.names(isDreamAuthority: true) == names)
+    #expect(try fixture.snapshot(fixture.state) == before)
+    #expect(try Data(contentsOf: overlay) == Data("{}".utf8))
+    var afterMetadata = stat()
+    try #require(lstat(overlay.path, &afterMetadata) == 0)
+    #expect(
+      afterMetadata.st_mode == metadata.st_mode && afterMetadata.st_nlink == metadata.st_nlink
+        && afterMetadata.st_uid == metadata.st_uid && afterMetadata.st_ino == metadata.st_ino)
+  }
+
+  @Test(arguments: ["topLevel", "nested", "otherName"], [false, true])
+  func onlyTheExactTopLevelDreamOverlayIsExcludedFromAuthorityTraversal(
+    _ variant: String, isEntryLimit: Bool
+  ) throws {
     let fixture = try TransactionFixture()
     defer { fixture.clean() }
     _ = try fixture.store().run(
@@ -720,17 +828,32 @@ struct PromptSourceRelocationTests {
     default: relative = "prompt-relocation.json"
     }
     let overlay = fixture.state.appendingPathComponent(relative)
-    try FileManager.default.createSymbolicLink(
-      at: overlay,
-      withDestinationURL: fixture.root.appendingPathComponent("unavailable-private-entry"))
-    #expect(throws: DreamRunError.unsafeState) {
+    if isEntryLimit {
+      let parent = try variant == "nested" ? directory.child("runs") : directory
+      let count = try parent.names().count
+      for index in count..<10_000 {
+        let file = openat(
+          parent.descriptor, "retained-\(index)", O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        try #require(file >= 0)
+        try #require(close(file) == 0)
+      }
+      let file = open(overlay.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+      try #require(file >= 0)
+      try #require(close(file) == 0)
+    } else {
+      try FileManager.default.createSymbolicLink(
+        at: overlay,
+        withDestinationURL: fixture.root.appendingPathComponent("unavailable-private-entry"))
+    }
+    let error: DreamRunError = isEntryLimit ? .limitExceeded : .unsafeState
+    #expect(throws: error) {
       try directory.retainedBytes(maximum: 1_073_741_824)
     }
     if variant == "topLevel" {
       #expect(try directory.retainedBytes(maximum: 1_073_741_824, isDreamAuthority: true) > 0)
       #expect(try DreamInspection.read(stateRoot: fixture.state).runs.isEmpty)
     } else {
-      #expect(throws: DreamRunError.unsafeState) {
+      #expect(throws: error) {
         try directory.retainedBytes(maximum: 1_073_741_824, isDreamAuthority: true)
       }
     }

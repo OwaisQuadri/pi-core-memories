@@ -55,7 +55,7 @@ package struct DreamInspection: Codable, Sendable {
       return Self(isPresent: true, isBusy: true, runs: [])
     }
     try root.verifyLock(lock)
-    _ = try root.retainedBytes(maximum: 1_073_741_824)
+    _ = try root.retainedBytes(maximum: 1_073_741_824, isDreamAuthority: true)
     let bytes = try root.read("root.json", maximum: 1_048_576)
     guard let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
       object["schemaVersion"] as? Int == 2
@@ -148,7 +148,8 @@ package struct DreamInspection: Codable, Sendable {
           run: run, context: context, request: request, admissionHash: admissionHash,
           selection: selection, bytes: bytes, maximumResponseBytes: limits.maximumResponseBytes)
         do {
-          suggestionCount = try DreamDecision.validate(response: response, context: context).plans.count
+          suggestionCount = try DreamDecision.validate(response: response, context: context).plans
+            .count
           status = "Reply valid"
         } catch let error as DreamDecisionError {
           status = "Rejected reply"

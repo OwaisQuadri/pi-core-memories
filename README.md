@@ -367,6 +367,49 @@ the original configured root spellings when saved, or the saved canonical spelli
 all configured roots and checks their exact UTF-8 paths against the saved binding.
 Replay does not resolve session or stripping roots.
 
+### Restore a missing registered prompts folder
+
+An established profile can explicitly relocate its registered prompts role for fresh work.
+Select an authoritative frozen input by run ID. Preview the complete replacement folder first.
+
+```sh
+pi-core-memories dream relocate-prompts-preview \
+  --config /path/to/profile.json --baseline-run <run-id> --to /canonical/replacement/prompts
+pi-core-memories dream relocate-prompts-confirm \
+  --config /path/to/profile.json --baseline-run <run-id> --to /canonical/replacement/prompts \
+  --preview <previewHash> --confirm yes
+```
+
+The baseline must be a verified completed run or the current verified admission.
+An explicitly selected older completed run is allowed. The preview reports newer captures and encountered inventory differences.
+Equality covers only that input's complete template subset, not all historical versions or outstanding expansions.
+The comparison includes every sorted Markdown name and all raw bytes, including frontmatter.
+Missing, extra, renamed, changed, or unusable definitions cannot authorize confirmation.
+Confirmation recaptures the folder and requires the exact current preview hash and explicit caller intent.
+It does not verify human identity. A changed head, admission, target, or store requires another preview.
+An unrelated approved-memory advance does not invalidate the preview.
+
+Confirmation installs only `prompt-relocation.json` in the dream state directory.
+It does not rewrite `root.json`, advance progress, start inference, approve memory, or change reviews or drafts.
+The private record binds the store and repository identities, immutable root binding, historical prompts role,
+selected frozen input, activation anchors, complete inventory proof, and confirmed preview hash.
+The original source must remain absent. The target must be canonical and separate from registered sources and dream state.
+Existing records cannot be overwritten, chained, removed, or reset through these commands.
+The commands reject `--state` and options for another operation. They do not initialize missing state or use discovery.
+
+Fresh worker preparation and queue inspection share the effective-source resolver.
+Historical registered roots and review-source identity remain unchanged.
+An unavailable or unsafe replacement blocks fresh preparation and leaves queue coverage unknown, not zero.
+After confirmation, ordinary definition edits and same-path package replacement retain normal per-batch provenance.
+The activation proof does not permanently pin template contents or the replacement directory's inode.
+
+The optional record has a separate 1,048,576-byte bound.
+Dream core-authority traversal excludes exactly its top-level entry without opening or following it.
+All other entries, nested names, and generic review, draft, and configuration traversal retain their existing checks.
+Fresh preparation and relocation commands validate the record independently.
+Saved history, frozen replay, saved-response reuse, and independent manual work do not require a valid record or a live replacement.
+Live confirmation and dream retries remain separate operator actions.
+
 Before receipt recovery or publication, the runner checks the live memory root
 against that same binding. Memory Git is still needed for exact proposal recovery
 and publication.

@@ -157,12 +157,19 @@ private struct WorkerStart {
     let optional = Set(object.keys).intersection(["deviceKey", "projectBindings"])
     try WorkerJSON.fields(
       object,
-      Set(["version", "type", "invocationID", "roots", "selection", "resume", "batchTextBytes"]).union(optional))
-    deviceKey = try object["deviceKey"].map { _ in try WorkerJSON.text(object, "deviceKey", maximum: 64) }
+      Set(["version", "type", "invocationID", "roots", "selection", "resume", "batchTextBytes"])
+        .union(optional))
+    deviceKey = try object["deviceKey"].map { _ in
+      try WorkerJSON.text(object, "deviceKey", maximum: 64)
+    }
     if object["projectBindings"] != nil {
-      guard let bindings = object["projectBindings"] as? [String: String] else { throw WorkerError.protocolFailure }
+      guard let bindings = object["projectBindings"] as? [String: String] else {
+        throw WorkerError.protocolFailure
+      }
       projectBindings = bindings
-    } else { projectBindings = [:] }
+    } else {
+      projectBindings = [:]
+    }
     try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     guard let budget = object["batchTextBytes"] as? Int, !(object["batchTextBytes"] is Bool),
       (65_536...1_048_576).contains(budget)
@@ -485,27 +492,22 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
     let store = try DreamRunStore(
       stateRoot: start.state, sessionsRoot: start.sessions, memoryRepository: start.memory,
       strippingRoots: [start.snippets, start.prompts].compactMap { $0 },
-      globalAgents: start.globalAgents, deviceKey: start.deviceKey, projectBindings: start.projectBindings, isCancelled: { input.isCancelled })
+      globalAgents: start.globalAgents, deviceKey: start.deviceKey,
+      projectBindings: start.projectBindings, isCancelled: { input.isCancelled })
     var coverageFrame: [String: Any]?
     var backlog: DreamBacklog?
     let result = try store.run(
       selection: start.selection, resume: start.resume,
-      prepare: { progress in
+      sourceRoles: DreamSourceRoles(
+        isSnippetsPresent: start.snippets != nil, isPromptsPresent: start.prompts != nil),
+      prepare: { progress, sources in
         guard !input.isCancelled else { throw WorkerError.cancelled }
-        let sources = store.acceptedSources
-        var index = 0
-        let snippets: URL?
-        if start.snippets != nil {
-          snippets = sources.stripping[index]
-          index += 1
-        } else {
-          snippets = nil
-        }
-        let prompts = start.prompts == nil ? nil : sources.stripping[index]
-        return try SessionReader(sessions: sources.sessions, snippets: snippets, prompts: prompts)
-          .prepare(
-            progress: progress, limits: DreamInputLimits(maximumBatchBytes: start.batchTextBytes),
-            backlog: { backlog = $0 }, isCancelled: { input.isCancelled })
+        return try SessionReader(
+          sessions: sources.sessions, snippets: sources.snippets, prompts: sources.prompts
+        )
+        .prepare(
+          progress: progress, limits: DreamInputLimits(maximumBatchBytes: start.batchTextBytes),
+          backlog: { backlog = $0 }, isCancelled: { input.isCancelled })
       },
       call: { request in
         try input.expect(request)
@@ -530,18 +532,21 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
         } catch WorkerError.cancelled {
           throw CancellationError()
         }
-      }, observe: { progress, batch, isRepeated, estimate in
+      },
+      observe: { progress, batch, isRepeated, estimate in
         let frame: [String: Any] = [
           "version": 1, "type": "progress", "invocationID": start.invocationID,
           "backlogBytes": backlog.map { $0.backlogBytes as Any } ?? NSNull(),
-          "backlogLimitBytes": backlog.map { _ in SessionReader.dreamBacklogBytes as Any } ?? NSNull(),
+          "backlogLimitBytes": backlog.map { _ in SessionReader.dreamBacklogBytes as Any }
+            ?? NSNull(),
           "undreamtBytes": backlog.map { $0.undreamtBytes as Any } ?? NSNull(),
           "nextBytes": backlog.map { $0.nextBytes as Any } ?? NSNull(),
           "plannedBytes": batch.keptBytes, "completedBytes": 0,
-          "repeatedRecords": isRepeated ? batch.exactSourceRecords.filter {
-            if case .primaryEvidence = $0.disposition { return true }
-            return false
-          }.count : 0,
+          "repeatedRecords": isRepeated
+            ? batch.exactSourceRecords.filter {
+              if case .primaryEvidence = $0.disposition { return true }
+              return false
+            }.count : 0,
           "estimateSeconds": estimate.map { $0 as Any } ?? NSNull(),
         ]
         coverageFrame = frame

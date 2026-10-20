@@ -352,7 +352,8 @@ extension SessionReader {
         guard record.range.upperBound > savedOffset else { continue }
         undreamtBytes += UInt64(kept)
         let isStored =
-          !extracted.evidence.isEmpty || !extracted.selections.isEmpty || record.range.lowerBound == 0
+          !extracted.evidence.isEmpty || !extracted.selections.isEmpty
+          || record.range.lowerBound == 0
         if !isBatchFull, isStored,
           storedRecords >= limits.maximumBatchRecords
             || (batchBytes > 0 && kept > limits.maximumBatchBytes - batchBytes)
@@ -507,8 +508,8 @@ final class PreparationDirectory {
 
   deinit { close(descriptor) }
 
-  func names() throws -> [String] {
-    let copy = dup(descriptor)
+  func names(maximum: Int = Int.max) throws -> [String] {
+    let copy = openat(descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     guard copy >= 0 else { throw MemoryError("cannot copy preparation directory descriptor") }
     guard let directory = fdopendir(copy) else {
       close(copy)
@@ -526,6 +527,7 @@ final class PreparationDirectory {
         String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self))
       }
       if name != ".", name != ".." { names.append(name) }
+      guard names.count <= maximum else { throw DreamRunError.limitExceeded }
     }
     return names.sorted()
   }
@@ -549,7 +551,74 @@ final class PreparationDirectory {
     return (modified, UInt64(status.st_size))
   }
 
-  func capture(_ name: String, isFollowingLinks: Bool = false) throws -> Data {
+  func verifyPromptRoot() throws {
+    var held = stat()
+    var named = stat()
+    guard fstat(descriptor, &held) == 0, lstat(url.path, &named) == 0,
+      PreparationDirectoryIdentity(held) == identity,
+      PreparationDirectoryIdentity(named) == identity,
+      named.st_mode & S_IFMT == S_IFDIR,
+      [geteuid(), 0].contains(held.st_uid), held.st_mode & 0o022 == 0
+    else { throw MemoryError("unsafe replacement prompt directory") }
+  }
+
+  func checkedTemplates(maximumBytes: Int) throws -> [PreparationStrippingInput] {
+    var held = stat()
+    var named = stat()
+    guard fstat(descriptor, &held) == 0, lstat(url.path, &named) == 0,
+      PreparationDirectoryIdentity(held) == identity,
+      PreparationDirectoryIdentity(named) == identity,
+      named.st_mode & S_IFMT == S_IFDIR,
+      [geteuid(), 0].contains(held.st_uid), held.st_mode & 0o022 == 0
+    else { throw MemoryError("unsafe replacement prompt directory") }
+    let beforeDirectory = held
+    let names = try names(maximum: 10_000)
+    var total = 0
+    var inputs: [PreparationStrippingInput] = []
+    var statuses: [String: stat] = [:]
+    for name in names where name.lowercased().hasSuffix(".md") {
+      var before = stat()
+      guard fstatat(descriptor, name, &before, AT_SYMLINK_NOFOLLOW) == 0,
+        before.st_mode & S_IFMT == S_IFREG, before.st_nlink == 1,
+        [geteuid(), 0].contains(before.st_uid), before.st_mode & 0o022 == 0,
+        before.st_size >= 0, UInt64(before.st_size) <= UInt64(maximumBytes - total)
+      else { throw MemoryError("unsafe or oversized replacement prompt entry") }
+      let bytes = try capture(name, maximumBytes: maximumBytes - total, isCheckingStability: true)
+      guard bytes.count == before.st_size,
+        let text = String(data: bytes, encoding: .utf8), !text.contains("\0"),
+        SessionReader.templateBody(text) != nil
+      else { throw MemoryError("unusable replacement prompt entry") }
+      total += bytes.count
+      statuses[name] = before
+      inputs.append(PreparationStrippingInput(kind: "templates", name: name, bytes: bytes))
+    }
+    for (name, before) in statuses {
+      var after = stat()
+      guard fstatat(descriptor, name, &after, AT_SYMLINK_NOFOLLOW) == 0,
+        Self.isSameCapture(before, after)
+      else { throw MemoryError("replacement prompts changed during capture") }
+    }
+    guard try self.names(maximum: 10_000) == names,
+      fstat(descriptor, &held) == 0, lstat(url.path, &named) == 0,
+      Self.isSameCapture(beforeDirectory, held), Self.isSameCapture(held, named)
+    else { throw MemoryError("replacement prompts changed during capture") }
+    return inputs
+  }
+
+  private static func isSameCapture(_ before: stat, _ after: stat) -> Bool {
+    PreparationDirectoryIdentity(before) == PreparationDirectoryIdentity(after)
+      && before.st_mode == after.st_mode && before.st_uid == after.st_uid
+      && before.st_nlink == after.st_nlink && before.st_size == after.st_size
+      && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec
+      && before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec
+      && before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec
+      && before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec
+  }
+
+  func capture(
+    _ name: String, isFollowingLinks: Bool = false, maximumBytes: Int = Int.max,
+    isCheckingStability: Bool = false
+  ) throws -> Data {
     let flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC | (isFollowingLinks ? 0 : O_NOFOLLOW)
     let file = openat(descriptor, name, flags)
     guard file >= 0 else { throw MemoryError("cannot open session file: \(name)") }
@@ -557,7 +626,7 @@ final class PreparationDirectory {
     defer { try? handle.close() }
     var status = stat()
     guard fstat(file, &status) == 0, status.st_mode & S_IFMT == S_IFREG,
-      status.st_size >= 0, UInt64(status.st_size) <= UInt64(Int.max)
+      status.st_size >= 0, UInt64(status.st_size) <= UInt64(maximumBytes)
     else { throw MemoryError("unsafe session file") }
     let ceiling = Int(status.st_size)
     var data = Data()
@@ -566,6 +635,12 @@ final class PreparationDirectory {
         !chunk.isEmpty
       else { throw MemoryError("session shrank during capture") }
       data.append(chunk)
+    }
+    if isCheckingStability {
+      var after = stat()
+      guard fstat(file, &after) == 0, Self.isSameCapture(status, after) else {
+        throw MemoryError("source changed during capture")
+      }
     }
     return data
   }

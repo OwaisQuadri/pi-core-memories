@@ -22,8 +22,18 @@ export function isCommandMissing(): boolean {
 	return !existsSync(commandPath());
 }
 
-export function commandReady(): Promise<void> {
-	return isCommandMissing() ? building : Promise.resolve();
+export function commandReady(signal?: AbortSignal): Promise<void> {
+	if (!isCommandMissing()) return Promise.resolve();
+	if (!signal) return building;
+	return new Promise((done, fail) => {
+		const abort = () => fail(signal.reason);
+		if (signal.aborted) return abort();
+		signal.addEventListener("abort", abort, { once: true });
+		void building.then(() => {
+			signal.removeEventListener("abort", abort);
+			done();
+		});
+	});
 }
 
 export function buildCommand(ctx: ExtensionContext): Promise<void> {

@@ -203,7 +203,7 @@ export function dreamScopeOptions(value: unknown): DreamScopeOptions {
 }
 
 export async function readDreamScope(signal: AbortSignal): Promise<DreamScopeOptions> {
-	await commandReady();
+	await commandReady(signal);
 	return new Promise((done, fail) => {
 		execFile(dreamExecutable(), ["scope"], { signal, env: workerEnvironment(), timeout: 10_000, maxBuffer: 1_048_576, encoding: "buffer" }, (error, stdout) => {
 			if (error) return fail(error);
@@ -299,7 +299,7 @@ export function workerEnvironment(environment: NodeJS.ProcessEnv = process.env):
 
 export async function runDreamWorker(start: DreamStart, call: DreamCall, signal: AbortSignal, onProgress: (coverage: DreamCoverage) => void = () => {}): Promise<DreamReport> {
 	if (signal.aborted) throw new Error("Dream cancelled.");
-	await commandReady();
+	await commandReady(signal).catch(() => undefined);
 	if (signal.aborted) throw new Error("Dream cancelled.");
 	const initial = Buffer.from(JSON.stringify(start) + "\n");
 	if (initial.length > 65_536) failure();

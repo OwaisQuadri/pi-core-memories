@@ -12,7 +12,7 @@ import { filterMemoryMessages, isSnapshotOnBranch, memoryMessage, withSavedSnaps
 export type Render = (scope: MemoryScope, signal: AbortSignal) => Promise<string>;
 
 export async function renderApproved(scope: MemoryScope, signal: AbortSignal): Promise<string> {
-	await commandReady();
+	await commandReady(signal);
 	return new Promise((done, fail) => {
 		execFile(
 			commandPath(),

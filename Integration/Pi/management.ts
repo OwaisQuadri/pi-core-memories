@@ -14,7 +14,7 @@ export type ReviewCatalog = {
 };
 
 export async function reviewCatalog(repo: string, cwd: string, signal?: AbortSignal): Promise<ReviewCatalog> {
-	await commandReady();
+	await commandReady(signal);
 	return new Promise((done, fail) => {
 		execFile(commandPath(), ["review-catalog", "--repo", repo, "--cwd", cwd], {
 			cwd, env: environment(), signal, timeout: 10_000, maxBuffer: 32 * 1024 * 1024, encoding: "buffer",
@@ -39,7 +39,7 @@ function environment(): NodeJS.ProcessEnv {
 export async function manageMemory(repo: string, cwd: string, request: object, signal?: AbortSignal): Promise<unknown> {
 	const input = JSON.stringify(request);
 	if (Buffer.byteLength(input) > 1_048_576) throw new Error("Memory request is too large.");
-	await commandReady();
+	await commandReady(signal);
 	return new Promise((done, fail) => {
 		const child = execFile(commandPath(), ["manage", "--repo", repo], {
 			cwd, env: environment(), signal, timeout: 30_000, maxBuffer: 32 * 1024 * 1024, encoding: "buffer",
@@ -121,7 +121,7 @@ export function registerMemoryManagement(pi: ExtensionAPI): () => Promise<void> 
 }
 
 async function prepareCheckout(ctx: ExtensionContext, signal: AbortSignal, selection?: { base: string; entry: number }): Promise<void> {
-	await commandReady();
+	await commandReady(signal);
 	const child = spawn(commandPath(), ["memory-prepare-worker"], {
 		cwd: ctx.cwd, env: environment(), stdio: ["ignore", "pipe", "pipe", "pipe"], signal,
 	});

@@ -42,11 +42,11 @@ export function buildCommand(ctx: ExtensionContext): Promise<void> {
 }
 
 export function clearBuildResult(ctx: ExtensionContext): void {
-	if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", undefined);
+	try { if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", undefined); } catch {}
 }
 
 async function build(ctx: ExtensionContext): Promise<void> {
-	const show = (text: string) => { if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", [`pi-core-memories command: ${text}`]); };
+	const show = (text: string) => { try { if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", [`pi-core-memories command: ${text}`]); } catch {} };
 	try {
 		if (!(await isBuildNeeded(commandBuild))) return;
 		show("starting the build");

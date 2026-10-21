@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
 import { BorderedLoader, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { commandPath, commandReady } from "./command.ts";
 
 export const DREAM_REVIEW_TYPE = "core-memory-dream-review";
 export const MAXIMUM_FRAME_BYTES = 32 * 1_048_576 * 6 + 65_536;
@@ -201,7 +202,8 @@ export function dreamScopeOptions(value: unknown): DreamScopeOptions {
 	return { ...(deviceKey === undefined ? {} : { deviceKey }), ...(Object.keys(projectBindings).length ? { projectBindings } : {}) };
 }
 
-export function readDreamScope(signal: AbortSignal): Promise<DreamScopeOptions> {
+export async function readDreamScope(signal: AbortSignal): Promise<DreamScopeOptions> {
+	if (!process.env.PI_CORE_MEMORIES_DREAM_EXECUTABLE) await commandReady(signal);
 	return new Promise((done, fail) => {
 		execFile(dreamExecutable(), ["scope"], { signal, env: workerEnvironment(), timeout: 10_000, maxBuffer: 1_048_576, encoding: "buffer" }, (error, stdout) => {
 			if (error) return fail(error);
@@ -284,7 +286,7 @@ export function dreamReport(value: unknown, start: DreamStart): DreamReport {
 
 export function dreamExecutable(): string {
 	const executable = process.env.PI_CORE_MEMORIES_DREAM_EXECUTABLE;
-	if (!executable) return "pi-core-memories";
+	if (!executable) return commandPath();
 	if (!executable.startsWith("/") || executable.includes("\0") || Buffer.byteLength(executable) > 4096) {
 		throw new Error("Invalid owned dream executable path.");
 	}
@@ -296,6 +298,8 @@ export function workerEnvironment(environment: NodeJS.ProcessEnv = process.env):
 }
 
 export async function runDreamWorker(start: DreamStart, call: DreamCall, signal: AbortSignal, onProgress: (coverage: DreamCoverage) => void = () => {}): Promise<DreamReport> {
+	if (signal.aborted) throw new Error("Dream cancelled.");
+	if (!process.env.PI_CORE_MEMORIES_DREAM_EXECUTABLE) await commandReady(signal).catch(() => undefined);
 	if (signal.aborted) throw new Error("Dream cancelled.");
 	const initial = Buffer.from(JSON.stringify(start) + "\n");
 	if (initial.length > 65_536) failure();

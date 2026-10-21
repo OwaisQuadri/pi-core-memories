@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+import { buildCommand, commandPath, commandReady, isCommandMissing } from "./command.ts";
 import { escapeDreamDisplay, registerDream } from "./dream.ts";
 import { registerReview } from "./review.ts";
 import { registerMemoryManagement, reviewCatalog } from "./management.ts";
@@ -10,10 +11,11 @@ import { filterMemoryMessages, isSnapshotOnBranch, memoryMessage, withSavedSnaps
 
 export type Render = (scope: MemoryScope, signal: AbortSignal) => Promise<string>;
 
-export function renderApproved(scope: MemoryScope, signal: AbortSignal): Promise<string> {
+export async function renderApproved(scope: MemoryScope, signal: AbortSignal): Promise<string> {
+	await commandReady(signal);
 	return new Promise((done, fail) => {
 		execFile(
-			"pi-core-memories",
+			commandPath(),
 			["render", "--repo", scope.memoryRepo, "--cwd", scope.cwd],
 			{ cwd: scope.cwd, timeout: 10_000, signal, encoding: "buffer", maxBuffer: 16 * 1024 * 1024 },
 			(error, stdout) => {
@@ -48,7 +50,8 @@ export default function coreMemories(pi: ExtensionAPI, render: Render = renderAp
 	let reminderSessionId: string | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (ctx.mode !== "tui" || !ctx.hasUI) return;
+		void buildCommand(ctx);
+		if (ctx.mode !== "tui" || !ctx.hasUI || isCommandMissing()) return;
 		const scope = scopeOf(ctx);
 		if (reminder && reminderSessionId === scope.sessionId) return;
 		reminder?.abort();

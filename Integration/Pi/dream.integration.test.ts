@@ -19,7 +19,7 @@ assert.ok(binary, "Set PI_CORE_MEMORIES_BIN to the verified release command");
 async function fixture(t: TestContext, isPrimary = true) {
 	const root = await mkdtemp("/private/tmp/pi-dream-adapter-");
 	const home = join(root, "home"); const agent = join(home, "agent"); const repo = join(root, "memory ' ; $repo"); const bin = join(root, "bin");
-	const previous = Object.fromEntries(["HOME", "PATH", "PI_CORE_MEMORIES_REPO", "PI_CODING_AGENT_DIR"].map((name) => [name, process.env[name]]));
+	const previous = Object.fromEntries(["HOME", "PI_CORE_MEMORIES_EXECUTABLE", "PI_CORE_MEMORIES_REPO", "PI_CODING_AGENT_DIR"].map((name) => [name, process.env[name]]));
 	const previousFetch = globalThis.fetch; let networkCalls = 0;
 	globalThis.fetch = async () => { networkCalls++; throw new Error("Network forbidden"); };
 	t.after(async () => {
@@ -27,8 +27,8 @@ async function fixture(t: TestContext, isPrimary = true) {
 		for (const [name, value] of Object.entries(previous)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
 		await rm(root, { recursive: true, force: true }); assert.equal(networkCalls, 0);
 	});
-	await mkdir(agent, { recursive: true }); await mkdir(bin); await symlink(resolve(binary!), join(bin, "pi-core-memories"));
-	process.env.HOME = home; process.env.PI_CODING_AGENT_DIR = agent; process.env.PI_CORE_MEMORIES_REPO = repo; process.env.PATH = `${bin}:${previous.PATH}`;
+	await mkdir(agent, { recursive: true });
+	process.env.HOME = home; process.env.PI_CODING_AGENT_DIR = agent; process.env.PI_CORE_MEMORIES_REPO = repo; process.env.PI_CORE_MEMORIES_EXECUTABLE = resolve(binary!);
 	const cli = (...args: string[]) => execFileSync(binary!, args, { encoding: "utf8" });
 	cli("init", "--repo", repo);
 	const folder = join(agent, "sessions", "synthetic-project"); await mkdir(folder, { recursive: true });
@@ -379,10 +379,10 @@ function contentHash(context: Context): string {
 }
 
 async function scriptedWorker(t: TestContext, script: string): Promise<void> {
-	const root = await mkdtemp("/private/tmp/dream-protocol-"); const old = process.env.PATH;
-	t.after(async () => { process.env.PATH = old; await rm(root, { recursive: true, force: true }); });
+	const root = await mkdtemp("/private/tmp/dream-protocol-"); const old = process.env.PI_CORE_MEMORIES_EXECUTABLE;
+	t.after(async () => { if (old === undefined) delete process.env.PI_CORE_MEMORIES_EXECUTABLE; else process.env.PI_CORE_MEMORIES_EXECUTABLE = old; await rm(root, { recursive: true, force: true }); });
 	await writeFile(join(root, "pi-core-memories"), `#!${process.execPath}\nif (process.argv[2] === "scope") { process.stdout.write(JSON.stringify({ deviceKey: null, projectBindings: {} }) + "\\n"); process.exit(0); }\n${script}\n`, { mode: 0o755 }); await chmod(join(root, "pi-core-memories"), 0o755);
-	process.env.PATH = `${root}:${old}`;
+	process.env.PI_CORE_MEMORIES_EXECUTABLE = join(root, "pi-core-memories");
 }
 const protocolStart: DreamStart = { version: 1, type: "start", invocationID: "invocation", roots: { state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }, selection: { provider: "fixture", modelID: "selected", thinkingLevel: "off" }, resume: "inspectOrContinue", batchTextBytes: 262_144 };
 const protocolFinal = { version: 1, type: "final", invocationID: "invocation", status: "noNewRecords", generation: "0", runID: null, base: null, proposals: [], notes: [], isBacklog: false, isRecovered: false, reason: null, detail: null, unfinishedTails: 0 };

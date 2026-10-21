@@ -8,6 +8,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, ScrollView, SelectList, Text } from "@earendil-works/pi-tui";
 import type { Component, TUI } from "@earendil-works/pi-tui";
+import { commandPath, isCommandMissing } from "./command.ts";
 import { dreamRoots, escapeDreamDisplay, isMemoryPath, parseDreamJSON, workerEnvironment } from "./dream.ts";
 import type { DreamRoots } from "./dream.ts";
 
@@ -102,7 +103,7 @@ class ReviewWorker {
 
 	constructor(start: Start) {
 		this.start = start;
-		this.child = spawn("pi-core-memories", ["memory-review-worker"], { stdio: ["pipe", "pipe", "pipe", "pipe"], env: workerEnvironment() });
+		this.child = spawn(commandPath(), ["memory-review-worker"], { stdio: ["pipe", "pipe", "pipe", "pipe"], env: workerEnvironment() });
 		this.control = this.child.stdio[3] as Duplex;
 		this.completion = new Promise((resolve) => {
 			this.child.on("error", () => this.fail());
@@ -328,6 +329,7 @@ export function registerReview(pi: ExtensionAPI): () => Promise<void> {
 				const roots = await dreamRoots(getAgentDir(), ctx.cwd, home);
 				try { await lstat(join(roots.state, "root.json")); }
 				catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { ctx.ui.notify("Run /dream first.", "info"); return; } throw error; }
+				if (isCommandMissing()) { ctx.ui.notify("pi-core-memories is still building its command. Run /mem-review again when it finishes.", "info"); return; }
 				if (isShuttingDown) return;
 				await ctx.ui.custom<void>((tui, theme, _keys, done) => {
 					const current = new ReviewWorker({ version: 1, type: "start", invocationID: randomBytes(16).toString("hex"), roots, reviewState: join(home, ".local", "state", "pi-core-memories-review") });

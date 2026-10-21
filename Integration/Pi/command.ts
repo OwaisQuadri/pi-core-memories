@@ -41,18 +41,18 @@ export function buildCommand(ctx: ExtensionContext): Promise<void> {
 	return building;
 }
 
+export function clearBuildResult(ctx: ExtensionContext): void {
+	try { if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", undefined); } catch {}
+}
+
 async function build(ctx: ExtensionContext): Promise<void> {
+	const show = (text: string) => { try { if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", [`pi-core-memories command: ${text}`]); } catch {} };
 	try {
 		if (!(await isBuildNeeded(commandBuild))) return;
-		const show = (text?: string) => { if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", text === undefined ? undefined : [`pi-core-memories command: ${text}`]); };
 		show("starting the build");
-		try {
-			await ensureBuilt(commandBuild, { onProgress: (progress) => show(progressBar(progress)) });
-		} finally {
-			show();
-		}
-		ctx.ui.notify("pi-core-memories built its command.", "info");
+		await ensureBuilt(commandBuild, { onProgress: (progress) => show(progressBar(progress)) });
+		show("built. Memory tools use it now.");
 	} catch (error) {
-		ctx.ui.notify(`pi-core-memories could not build its command: ${(error as Error).message}`, "warning");
+		show(`not built: ${(error as Error).message}`);
 	}
 }

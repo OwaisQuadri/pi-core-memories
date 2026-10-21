@@ -34,6 +34,6 @@
     "typescript": "7.0.2"
   },
   "dependencies": {
-    "pi-compiled": "github:OwaisQuadri/pi-compiled#v0.2.0"
+    "pi-compiled": "github:OwaisQuadri/pi-compiled"
   }
 }

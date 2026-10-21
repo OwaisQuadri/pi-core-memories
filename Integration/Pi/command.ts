@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { binaryPath, ensureBuilt, isBuildNeeded, type BuildSpec } from "pi-compiled";
+import { binaryPath, ensureBuilt, isBuildNeeded, progressBar, type BuildSpec } from "pi-compiled";
 
 export const commandBuild: BuildSpec = {
 	packageRoot: fileURLToPath(new URL("../..", import.meta.url)),
@@ -44,8 +44,13 @@ export function buildCommand(ctx: ExtensionContext): Promise<void> {
 async function build(ctx: ExtensionContext): Promise<void> {
 	try {
 		if (!(await isBuildNeeded(commandBuild))) return;
-		ctx.ui.notify("pi-core-memories is building its command.", "info");
-		await ensureBuilt(commandBuild);
+		const show = (text?: string) => { if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", text === undefined ? undefined : [`pi-core-memories command: ${text}`]); };
+		show("starting the build");
+		try {
+			await ensureBuilt(commandBuild, { onProgress: (progress) => show(progressBar(progress)) });
+		} finally {
+			show();
+		}
 		ctx.ui.notify("pi-core-memories built its command.", "info");
 	} catch (error) {
 		ctx.ui.notify(`pi-core-memories could not build its command: ${(error as Error).message}`, "warning");

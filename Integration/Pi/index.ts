@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { buildCommand, commandPath, commandReady, isCommandMissing } from "./command.ts";
+import { buildCommand, clearBuildResult, commandPath, commandReady, isCommandMissing } from "./command.ts";
 import { escapeDreamDisplay, registerDream } from "./dream.ts";
 import { registerReview } from "./review.ts";
 import { registerMemoryManagement, reviewCatalog } from "./management.ts";
@@ -91,6 +91,7 @@ export default function coreMemories(pi: ExtensionAPI, render: Render = renderAp
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
+		clearBuildResult(ctx);
 		const scope = scopeOf(ctx);
 		if (isSnapshotOnBranch(ctx.sessionManager.getBranch(), scope)) return;
 		controller?.abort();

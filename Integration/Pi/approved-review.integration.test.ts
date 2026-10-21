@@ -19,10 +19,10 @@ async function waitFor(check: () => boolean): Promise<void> {
 test("native approved review works without dream; Back and Defer preserve dates, explicit Confirm changes metadata only", { timeout: 30000 }, async (t) => {
 	const root = await mkdtemp("/private/tmp/pi-approved-review-");
 	const repo = join(root, "memory"); const bin = join(root, "bin"); const home = join(root, "home");
-	const previous = Object.fromEntries(["HOME", "PATH", "PI_CORE_MEMORIES_REPO"].map((name) => [name, process.env[name]]));
+	const previous = Object.fromEntries(["HOME", "PI_CORE_MEMORIES_EXECUTABLE", "PI_CORE_MEMORIES_REPO"].map((name) => [name, process.env[name]]));
 	t.after(async () => { for (const [name, value] of Object.entries(previous)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; } await rm(root, { recursive: true, force: true }); });
-	await mkdir(home); await mkdir(bin); await symlink(resolve(binary!), join(bin, "pi-core-memories"));
-	process.env.HOME = home; process.env.PATH = `${bin}:${previous.PATH}`; process.env.PI_CORE_MEMORIES_REPO = repo;
+	await mkdir(home);
+	process.env.HOME = home; process.env.PI_CORE_MEMORIES_EXECUTABLE = resolve(binary!); process.env.PI_CORE_MEMORIES_REPO = repo;
 	const cli = (args: string[], input?: object) => execFileSync(binary!, args, { input: input ? JSON.stringify(input) : undefined, encoding: "utf8" });
 	const git = (...args: string[]) => execFileSync("/usr/bin/git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 	cli(["init", "--repo", repo]); git("checkout", "--detach");

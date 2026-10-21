@@ -21,7 +21,7 @@ assert.ok(binary, "Set PI_CORE_MEMORIES_BIN to the verified release command");
 async function fixture(t: TestContext) {
 	const root = await mkdtemp("/private/tmp/pi-entry-review-");
 	const home = join(root, "home"); const agent = join(home, "agent"); const repo = join(root, "memory"); const bin = join(root, "bin");
-	const previous = Object.fromEntries(["HOME", "PATH", "PI_CORE_MEMORIES_REPO", "PI_CODING_AGENT_DIR"].map((name) => [name, process.env[name]]));
+	const previous = Object.fromEntries(["HOME", "PI_CORE_MEMORIES_EXECUTABLE", "PI_CORE_MEMORIES_REPO", "PI_CODING_AGENT_DIR"].map((name) => [name, process.env[name]]));
 	const previousFetch = globalThis.fetch;
 	globalThis.fetch = async () => assert.fail("No network calls");
 	t.after(async () => {
@@ -29,8 +29,8 @@ async function fixture(t: TestContext) {
 		for (const [name, value] of Object.entries(previous)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
 		await rm(root, { recursive: true, force: true });
 	});
-	await mkdir(agent, { recursive: true }); await mkdir(bin); await symlink(resolve(binary!), join(bin, "pi-core-memories"));
-	process.env.HOME = home; process.env.PATH = `${bin}:${previous.PATH}`; process.env.PI_CODING_AGENT_DIR = agent; process.env.PI_CORE_MEMORIES_REPO = repo;
+	await mkdir(agent, { recursive: true });
+	process.env.HOME = home; process.env.PI_CORE_MEMORIES_EXECUTABLE = resolve(binary!); process.env.PI_CODING_AGENT_DIR = agent; process.env.PI_CORE_MEMORIES_REPO = repo;
 	execFileSync(binary!, ["init", "--repo", repo]);
 	const sessions = join(agent, "sessions", "fixture"); await mkdir(sessions, { recursive: true });
 	await writeFile(join(sessions, "fixture.jsonl"), [

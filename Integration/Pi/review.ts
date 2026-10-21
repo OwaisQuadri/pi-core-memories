@@ -8,6 +8,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, ScrollView, SelectList, Text } from "@earendil-works/pi-tui";
 import type { Component, TUI } from "@earendil-works/pi-tui";
+import { commandPath } from "./command.ts";
 import { dreamRoots, escapeDreamDisplay, isMemoryPath, parseDreamJSON, workerEnvironment } from "./dream.ts";
 import type { DreamRoots } from "./dream.ts";
 
@@ -102,7 +103,7 @@ class ReviewWorker {
 
 	constructor(start: Start) {
 		this.start = start;
-		this.child = spawn("pi-core-memories", ["memory-review-worker"], { stdio: ["pipe", "pipe", "pipe", "pipe"], env: workerEnvironment() });
+		this.child = spawn(commandPath(), ["memory-review-worker"], { stdio: ["pipe", "pipe", "pipe", "pipe"], env: workerEnvironment() });
 		this.control = this.child.stdio[3] as Duplex;
 		this.completion = new Promise((resolve) => {
 			this.child.on("error", () => this.fail());

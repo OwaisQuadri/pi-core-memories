@@ -39,13 +39,11 @@ Do not initialize an existing store. Set the app's Memory repository field to th
 
 ## Install the Pi integration
 
-After the command is on your path:
-
 ```zsh
 pi install https://github.com/OwaisQuadri/pi-core-memories
 ```
 
-Start a new Pi session. Set `PI_CORE_MEMORIES_REPO` when your data store differs from the loader's default. If you already use a separate core-memories extension, disable that copy before enabling this package. Do not load both copies.
+Start a new Pi session. The package builds its own command with [pi-compiled](https://github.com/OwaisQuadri/pi-compiled) into `target/release/pi-core-memories` inside the installed clone. It builds in the background at session start when the command is missing or its committed Swift source changed, which includes the first start after `pi install` or `pi update`. It refuses to build from a checkout with uncommitted, untracked, or ignored source changes, or with a `.swiftpm` directory. Set `PI_CORE_MEMORIES_EXECUTABLE` to an absolute path to use another build instead. The Pi package does not use the command on your path. Set `PI_CORE_MEMORIES_REPO` when your data store differs from the loader's default. If you already use a separate core-memories extension, disable that copy before enabling this package. Do not load both copies.
 
 The package adds memory loading, `/dream`, `/mem-review`, `/mem-rereview`, `/mem-prepare`, and the existing memory management tools. Installing the package does not approve candidates or run a dream.
 

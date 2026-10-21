@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
 import { BorderedLoader, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { commandPath } from "./command.ts";
 
 export const DREAM_REVIEW_TYPE = "core-memory-dream-review";
 export const MAXIMUM_FRAME_BYTES = 32 * 1_048_576 * 6 + 65_536;
@@ -284,7 +285,7 @@ export function dreamReport(value: unknown, start: DreamStart): DreamReport {
 
 export function dreamExecutable(): string {
 	const executable = process.env.PI_CORE_MEMORIES_DREAM_EXECUTABLE;
-	if (!executable) return "pi-core-memories";
+	if (!executable) return commandPath();
 	if (!executable.startsWith("/") || executable.includes("\0") || Buffer.byteLength(executable) > 4096) {
 		throw new Error("Invalid owned dream executable path.");
 	}

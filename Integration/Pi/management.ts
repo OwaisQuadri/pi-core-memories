@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import type { Writable } from "node:stream";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { commandPath } from "./command.ts";
 import { escapeDreamDisplay, parseDreamJSON } from "./dream.ts";
 import { chooseApprovedReview } from "./approved-review.ts";
 
@@ -14,7 +15,7 @@ export type ReviewCatalog = {
 
 export function reviewCatalog(repo: string, cwd: string, signal?: AbortSignal): Promise<ReviewCatalog> {
 	return new Promise((done, fail) => {
-		execFile("pi-core-memories", ["review-catalog", "--repo", repo, "--cwd", cwd], {
+		execFile(commandPath(), ["review-catalog", "--repo", repo, "--cwd", cwd], {
 			cwd, env: environment(), signal, timeout: 10_000, maxBuffer: 32 * 1024 * 1024, encoding: "buffer",
 		}, (error, stdout) => {
 			if (error) return fail(error);
@@ -38,7 +39,7 @@ export function manageMemory(repo: string, cwd: string, request: object, signal?
 	const input = JSON.stringify(request);
 	if (Buffer.byteLength(input) > 1_048_576) return Promise.reject(new Error("Memory request is too large."));
 	return new Promise((done, fail) => {
-		const child = execFile("pi-core-memories", ["manage", "--repo", repo], {
+		const child = execFile(commandPath(), ["manage", "--repo", repo], {
 			cwd, env: environment(), signal, timeout: 30_000, maxBuffer: 32 * 1024 * 1024, encoding: "buffer",
 		}, (error, stdout, stderr) => {
 			if (error) return fail(new Error(`Memory operation did not return a receipt. Read current entries before retrying a change. ${stderr.toString("utf8") || error.message}`));
@@ -118,7 +119,7 @@ export function registerMemoryManagement(pi: ExtensionAPI): () => Promise<void> 
 }
 
 async function prepareCheckout(ctx: ExtensionContext, signal: AbortSignal, selection?: { base: string; entry: number }): Promise<void> {
-	const child = spawn("pi-core-memories", ["memory-prepare-worker"], {
+	const child = spawn(commandPath(), ["memory-prepare-worker"], {
 		cwd: ctx.cwd, env: environment(), stdio: ["ignore", "pipe", "pipe", "pipe"], signal,
 	});
 	const previewController = new AbortController();

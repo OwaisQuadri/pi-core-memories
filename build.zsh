@@ -5,6 +5,7 @@ if [[ -e .swiftpm ]]; then
   print -u2 'Remove .swiftpm before building: SwiftPM reads its configuration, which Git does not track.'
   exit 1
 fi
+rm -rf target/build
 build_args=(--package-path "$PWD" --scratch-path "$PWD/target/build" -c release --product pi-core-memories -Xswiftc -warnings-as-errors)
 swift build "${build_args[@]}"
 bin_path=$(swift build "${build_args[@]}" --show-bin-path)

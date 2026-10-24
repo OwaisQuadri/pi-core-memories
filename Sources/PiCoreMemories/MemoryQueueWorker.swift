@@ -5,7 +5,7 @@ import Foundation
 private final class QueueInput: @unchecked Sendable {
   private let condition = NSCondition()
   private var events: [(Bool, [String: Any])] = []
-  private var expected: (MemoryQueueDisplay, String)?
+  private var expected: ([String: String], String)?
   private var isStopped = false
   let invocation: String
 
@@ -26,7 +26,13 @@ private final class QueueInput: @unchecked Sendable {
 
   func expect(_ display: MemoryQueueDisplay?, type: String = "presented") {
     condition.lock()
-    expected = display.map { ($0, type) }
+    expected = display.map { (queueTuple($0), type) }
+    condition.unlock()
+  }
+
+  func expectManagement(_ display: MemoryManagementDisplay, type: String = "manage-presented") {
+    condition.lock()
+    expected = (managementTuple(display), type)
     condition.unlock()
   }
 
@@ -44,11 +50,14 @@ private final class QueueInput: @unchecked Sendable {
             guard let (display, requiredType) = expected, type == requiredType else {
               throw WorkerError.protocolFailure
             }
-            try queueMatch(object, display: display)
+            try matchTuple(object, tuple: display)
             expected = nil
           } else {
             guard
-              ["list", "claim", "release", "recover", "inventory", "finish", "cancel"].contains(
+              [
+                "list", "claim", "release", "recover", "inventory", "finish", "cancel",
+                "approved-list", "approved-get", "manage-preview", "manage-recover",
+              ].contains(
                 type)
             else { throw WorkerError.protocolFailure }
           }
@@ -87,16 +96,33 @@ private final class QueueInput: @unchecked Sendable {
   }
 }
 
-private func queueMatch(_ object: [String: Any], display: MemoryQueueDisplay) throws {
+private func queueTuple(_ display: MemoryQueueDisplay) -> [String: String] {
   let presentation = display.presentation
-  for (key, value) in [
+  return [
     "claimID": presentation.claimID, "sequence": presentation.sequence,
     "revision": presentation.finding.revision, "previewDigest": presentation.previewDigest,
     "displayDigest": display.displayDigest, "sessionID": presentation.request.sessionID,
     "requestID": presentation.request.requestID,
-  ] {
+  ]
+}
+
+private func managementTuple(_ display: MemoryManagementDisplay) -> [String: String] {
+  [
+    "claimID": display.claimID, "sequence": display.sequence, "revision": display.currentBase,
+    "previewDigest": display.previewDigest,
+    "displayDigest": display.displayDigest, "sessionID": display.request.sessionID,
+    "requestID": display.request.requestID,
+  ]
+}
+
+private func matchTuple(_ object: [String: Any], tuple: [String: String]) throws {
+  for (key, value) in tuple {
     guard try WorkerJSON.text(object, key) == value else { throw WorkerError.protocolFailure }
   }
+}
+
+private func queueMatch(_ object: [String: Any], display: MemoryQueueDisplay) throws {
+  try matchTuple(object, tuple: queueTuple(display))
 }
 
 func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
@@ -138,12 +164,17 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
         journal: URL(fileURLWithPath: configuration.journal),
         environment: ProcessInfo.processInfo.environment)
     }
+    let management = queue.map {
+      MemoryQueueManagement(queue: $0, configurationURL: configURL, configuration: configuration)
+    }
+    var managementDisplay: MemoryManagementDisplay?
     let input = QueueInput(invocation: invocation)
     queue?.isCancelled = { input.isCancelled }
     Thread.detachNewThread { input.read(descriptor: STDIN_FILENO, isControl: false) }
     Thread.detachNewThread { input.read(descriptor: control, isControl: true) }
     defer {
       input.stop()
+      management?.release()
       queue?.release()
     }
     let tuple: Set<String> = [
@@ -155,7 +186,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
     try emit(
       "ready",
       [
-        "policyVersion": 1, "ownership": "whole-store", "successors": "blocked",
+        "policyVersion": 1, "ownership": "whole-store", "successors": "source-bound-v1",
         "isReviewAvailable": queue != nil,
         "reason": queue == nil
           ? "verified dream sources unavailable; inventory only" as Any : NSNull(),
@@ -164,6 +195,23 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
       let (isControl, object) = try input.next()
       let type = try WorkerJSON.header(object)
       do {
+        if !isControl, ["approved-list", "approved-get"].contains(type) {
+          try WorkerJSON.fields(
+            object, type == "approved-list" ? header : header.union(["request"]))
+          let request =
+            type == "approved-list"
+            ? MemoryManagementRequest(operation: .list)
+            : try MemoryManagementRequest.decode(
+              JSONSerialization.data(withJSONObject: object["request"] as Any))
+          guard [.list, .get].contains(request.operation) else { throw WorkerError.protocolFailure }
+          try emit(
+            "approved",
+            [
+              "result": encoded(
+                MemoryManagement(repository: configuration.memoryURL).execute(request))
+            ])
+          continue
+        }
         guard let queue else {
           guard !isControl, ["inventory", "finish"].contains(type) else {
             throw WorkerError.protocolFailure
@@ -178,7 +226,43 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             ["inventory": encoded(MemoryQueueInventory.readOnly(configuration: configuration))])
           continue
         }
-        if isControl {
+        if isControl, let current = managementDisplay, let management {
+          try matchTuple(object, tuple: managementTuple(current))
+          let managementFields = header.union(managementTuple(current).keys)
+          if type == "manage-presented" {
+            try WorkerJSON.fields(object, managementFields.union(["messageReference"]))
+            try management.presented(
+              current, messageReference: WorkerJSON.identifier(object, "messageReference"))
+            input.expectManagement(current, type: "manage-choice")
+            try emit("manage-presented", ["displayDigest": current.displayDigest])
+          } else {
+            try WorkerJSON.fields(
+              object,
+              managementFields.union(["action", "decisionID", "responseReference", "isInteractive"])
+            )
+            guard let isInteractive = object["isInteractive"] as? NSNumber,
+              CFGetTypeID(isInteractive) == CFBooleanGetTypeID(), isInteractive.boolValue
+            else { throw WorkerError.protocolFailure }
+            let decisionID = try WorkerJSON.identifier(object, "decisionID")
+            defer {
+              management.release()
+              managementDisplay = nil
+              input.expect(nil)
+            }
+            do {
+              let receipt = try management.decide(
+                current, action: WorkerJSON.text(object, "action"), decisionID: decisionID,
+                responseReference: WorkerJSON.identifier(object, "responseReference"))
+              try emit("manage-decision", ["receipt": encoded(receipt)])
+            } catch {
+              if let receipt = try? management.recover(decisionID: decisionID) {
+                try emit("manage-decision", ["receipt": encoded(receipt)])
+              } else {
+                try emit("blocked", ["code": "outcome-unresolved", "decisionID": decisionID])
+              }
+            }
+          }
+        } else if isControl {
           guard let current = display else { throw WorkerError.protocolFailure }
           try queueMatch(object, display: current)
           if type == "presented" {
@@ -223,6 +307,8 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try WorkerJSON.fields(object, header)
             input.expect(nil)
             display = nil
+            managementDisplay = nil
+            management?.release()
             queue.release()
             try emit("released")
           case "recover":
@@ -233,7 +319,42 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try WorkerJSON.fields(object, header)
             let inventory = try queue.inventory(configuration: configuration)
             try emit("inventory", ["inventory": encoded(inventory)])
+          case "manage-recover":
+            guard let management else { throw WorkerError.protocolFailure }
+            try WorkerJSON.fields(object, header.union(["decisionID"]))
+            try emit(
+              "manage-decision",
+              [
+                "receipt": encoded(
+                  management.recover(decisionID: WorkerJSON.identifier(object, "decisionID")))
+              ])
+          case "manage-preview":
+            guard display == nil, managementDisplay == nil, let management else {
+              throw WorkerError.protocolFailure
+            }
+            try WorkerJSON.fields(
+              object, header.union(["sessionID", "requestID", "request", "mode"]))
+            let mode = try WorkerJSON.text(object, "mode")
+            guard ["crud", "confirm-reviewed"].contains(mode) else {
+              throw WorkerError.protocolFailure
+            }
+            let request = try MemoryManagementRequest.decode(
+              JSONSerialization.data(withJSONObject: object["request"] as Any))
+            let identity = try MemoryQueueRequest(
+              sessionID: WorkerJSON.identifier(object, "sessionID"),
+              requestID: WorkerJSON.identifier(object, "requestID"))
+            let current = try management.preview(
+              request, identity: identity, isConfirmReviewed: mode == "confirm-reviewed")
+            managementDisplay = current
+            input.expectManagement(current)
+            try emit(
+              "manage-presentation",
+              [
+                "display": encoded(current),
+                "displayBytes": current.publicationBytes().base64EncodedString(),
+              ])
           case "list", "claim":
+            guard managementDisplay == nil else { throw WorkerError.protocolFailure }
             let fields =
               type == "list"
               ? ["sessionID", "requestID", "offset"] : ["sessionID", "requestID", "revision"]

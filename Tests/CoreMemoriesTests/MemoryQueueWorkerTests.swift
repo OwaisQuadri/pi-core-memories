@@ -242,8 +242,97 @@ func queueWorkerOnlyExactPrivateInteractiveChoiceReturnsReceipt(mode: String) th
   let artifacts = try #require(inventory["artifacts"] as? [[String: Any]])
   #expect(artifacts.contains { $0["source"] as? String == "proposal" })
   #expect(artifacts.contains { $0["source"] as? String == "journal" })
+  try worker.send("approved-list")
+  let approved = try #require(worker.frame()["result"] as? [String: Any])
+  #expect(approved["base"] as? String == (try fixture.main()))
+  #expect(approved["entries"] is [[String: Any]])
+  try worker.send(
+    "approved-get",
+    [
+      "request": [
+        "operation": "get", "base": approved["base"]!, "path": "MEMORY.md",
+        "locator": ["start": 0, "end": 1], "expected": "wrong bytes",
+      ]
+    ])
+  #expect(try worker.frame()["type"] as? String == "blocked")
   try worker.send("finish")
   #expect(try worker.frame()["type"] as? String == "final")
   worker.process.waitUntilExit()
   #expect(try fixture.snapshot(fixture.root) == before)
+}
+
+@Test(arguments: [
+  "valid", "stdin", "generated", "changed", "stale", "no-presentation", "detach",
+  "attached-approve",
+])
+func queueManagementRequiresExactPrivateLiveChoiceAndPreservesCheckedReceipt(mode: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  let config = try queueWorkerConfig(fixture)
+  let queue = try queueFixture(fixture, sources: sources)
+  _ = try queue.list(request: MemoryQueueRequest(sessionID: "initial", requestID: "binding"))
+  if !["detach", "attached-approve"].contains(mode) {
+    let review = try queue.controller()
+    try review.confirmDetach(review.checkoutPreview())
+  }
+  queue.release()
+  let worker = try QueueWorkerFixture(config: config)
+  let base = try fixture.main()
+  try worker.send(
+    "manage-preview",
+    [
+      "sessionID": "manual", "requestID": "edit", "mode": "crud",
+      "request": [
+        "operation": "add", "base": base, "path": "MEMORY.md",
+        "replacement": fact("Manual fixture correction."), "reason": "Explicit manual edit",
+      ],
+    ])
+  let frame = try worker.frame()
+  #expect(frame["type"] as? String == "manage-presentation")
+  let display = try #require(frame["display"] as? [String: Any])
+  let bytes = try #require(Data(base64Encoded: frame["displayBytes"] as! String))
+  #expect(display["displayDigest"] as? String == SourceDigest(bytes: bytes).rawValue)
+  #expect(display["documentBefore"] != nil && display["replacement"] != nil)
+  var tuple: [String: Any] = ["sessionID": "manual", "requestID": "edit"]
+  for key in ["claimID", "sequence", "previewDigest", "displayDigest"] { tuple[key] = display[key] }
+  tuple["revision"] = display["currentBase"]
+  if mode != "no-presentation" {
+    var presented = tuple
+    presented["messageReference"] = "exact-publication"
+    try worker.send("manage-presented", presented, isControl: true)
+    try #require(worker.frame()["type"] as? String == "manage-presented")
+  }
+  tuple["action"] = mode == "detach" ? "detach" : "approve"
+  tuple["decisionID"] = "manual-save"
+  tuple["responseReference"] = "interactive-response"
+  tuple["isInteractive"] = mode != "generated"
+  if mode == "stale" { tuple["displayDigest"] = String(repeating: "0", count: 64) }
+  if mode == "changed" {
+    let git = Git(repo: fixture.memory, environment: [:])
+    let changed = try git.text(
+      ["commit-tree", "\(base)^{tree}", "-p", base, "-m", "Synthetic intervening change"],
+      additions: Git.proposalIdentity)
+    _ = try git.data(["update-ref", "refs/heads/main", changed, base])
+  }
+  let beforeChoice = try fixture.main()
+  try worker.send("manage-choice", tuple, isControl: mode != "stdin")
+  let outcome = try worker.frame()
+  if ["valid", "detach"].contains(mode) {
+    let receipt = try #require(outcome["receipt"] as? [String: Any])
+    #expect(receipt["status"] as? String == (mode == "detach" ? "detached" : "approved"))
+    #expect(receipt["commit"] as? String == (try fixture.main()))
+    #expect((try fixture.main() != base) == (mode == "valid"))
+    try worker.send("manage-recover", ["decisionID": "manual-save"])
+    #expect(try worker.frame()["receipt"] as? NSDictionary == receipt as NSDictionary)
+    try worker.send("finish")
+    #expect(try worker.frame()["type"] as? String == "final")
+  } else {
+    #expect(try fixture.main() == beforeChoice)
+    if outcome["type"] as? String != "final" {
+      try worker.send("finish")
+      #expect(try worker.frame()["type"] as? String == "final")
+    }
+  }
+  worker.process.waitUntilExit()
 }

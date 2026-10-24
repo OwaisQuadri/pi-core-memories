@@ -22,7 +22,7 @@ First verified queue access pins the actual review/source/repository binding and
 
 `MemoryReviewController` checks this binding at initialization and refresh. `MemoryStore.publishCheckedMemoryCommit` holds the repository authority lock through checked publication. A bound repository requires the matching native controller binding. No wire request can supply that proof. Unbound publication semantics remain unchanged.
 
-Direct `manage` mutations and legacy manual draft Save have no review-profile proof and cannot publish after binding. List/get and checked historical recovery remain available. A supported matching-profile path is `MemoryBatchSession(repository:drafts:review:...)` with the actual verified controller, fresh per-item authorization, and `save()`. It supports requested additions, updates, deletions, and confirm-reviewed changes through the existing batch types. The conversation adapter still needs a private host protocol for that path. This worker currently reviews verified inferred candidates only.
+Direct `manage` mutations and legacy manual draft Save have no review-profile proof and cannot publish after binding. List/get and checked historical recovery remain available. A supported matching-profile path is `MemoryBatchSession(repository:drafts:review:...)` with the actual verified controller, fresh per-item authorization, and `save()`. It supports requested additions, updates, deletions, and confirm-reviewed changes through the existing batch types. The private management operations below expose that matching-profile path; legacy `manage` mutation remains fenced.
 
 ## Transport and ownership
 
@@ -30,7 +30,7 @@ All frames are newline-delimited UTF-8 JSON objects. Input frames must be shorte
 
 Opaque identifiers match `[A-Za-z0-9._:-]{1,256}`. This includes invocation, session, request, decision, and host-message references. The host can map a longer locator to a stable opaque identifier. Counters in the new queue records are canonical decimal strings. Digests are full lowercase SHA-256 hex. Git object IDs retain their native full length. Byte fields use standard padded base64 without line breaks. Optional Codable fields are omitted when absent, not encoded as null. Legacy `SavedDreamRun` inventory fields retain their existing numeric encoding.
 
-Descriptor 3 must be an inherited, owned anonymous pipe or unnamed connected Unix socket. Named pipes, listening sockets, files, and foreign endpoints fail. The descriptor is close-on-exec before Git runs. Only descriptor 3 accepts `presented` and `choice`. Ordinary stdin, model text, restored transcripts, and generated answers cannot approve.
+Descriptor 3 must be an inherited, owned anonymous pipe or unnamed connected Unix socket. Named pipes, listening sockets, files, and foreign endpoints fail. The descriptor is close-on-exec before Git runs. Only descriptor 3 accepts `presented`, `choice`, `manage-presented`, and `manage-choice`. Ordinary stdin, model text, restored transcripts, and generated answers cannot approve.
 
 One live controller owns the whole review store from successful `claim` through disposition or release. Other owners receive `busy`. List and inventory normally acquire ownership only for their operation, so they can also report busy during another session's review. Queue file locks are short-lived and never held while waiting for a person. No heartbeat timeout steals a live lock. EOF on either host channel, explicit finish/cancel, helper death, and settled choices release ownership. A connected hung host remains busy until it releases or closes.
 
@@ -39,10 +39,10 @@ One live controller owns the whole review store from successful `claim` through 
 Successful start emits:
 
 ```json
-{"version":1,"type":"ready","invocationID":"fixture-review","policyVersion":1,"ownership":"whole-store","successors":"blocked","isReviewAvailable":true,"reason":null}
+{"version":1,"type":"ready","invocationID":"fixture-review","policyVersion":1,"ownership":"whole-store","successors":"source-bound-v1","isReviewAvailable":true,"reason":null}
 ```
 
-If verified dream-source initialization is unavailable, `isReviewAvailable` is false and `reason` is `"verified dream sources unavailable; inventory only"`. Only stdin `inventory` and `finish` are then accepted. This mode creates no controller, repository binding, or queue state. It can report retained manual drafts and ref-only proposals without inventing evidence. It is blocked migration inventory, not completed migration or review.
+If verified dream-source initialization is unavailable, `isReviewAvailable` is false and `reason` is `"verified dream sources unavailable; inventory only"`. Only stdin `inventory`, `approved-list`, `approved-get`, and `finish` are then accepted. This mode creates no controller, repository binding, or queue state. It can report retained manual drafts and ref-only proposals without inventing evidence. It is blocked migration inventory, not completed migration or review.
 
 ## Stdin operations
 
@@ -74,7 +74,7 @@ A row has `finding`, `disposition`, and optional `blockReason`. Dispositions are
 - `contradictions` contains `kind`, optional `evidence`, optional base64 `anchor`, and `explanation`. Primary conflicts contain full source evidence. A memory anchor decodes to a canonical JSON string array `[scopePath, documentDigest, start, end, before]`. An owner anchor decodes to `[key, ownerDigest, start, end, before, reference, scopePath]`.
 - `limitations`, `inputDigest`, `contextDigest`, and `responseDigest` retain native frozen coverage and analysis provenance. Stored references are not independently verified evidence.
 
-There is no supporting-tool evidence fabrication. This component consumes the existing verified primary-evidence contract. Expanded tool evidence and longitudinal intake belong to the later evidence lane.
+Tool/related-window evidence uses the integrated native input component's verified primary-evidence contract. Observed tool activity is not human intent or consent. Optional `successor` retains the complete versioned hint below; optional `suppressionEpoch` identifies an admitted changed-evidence epoch, and optional `successorRejections` freezes exactly which rejected revisions its proof covered.
 
 ### Presentation record
 
@@ -106,6 +106,46 @@ Every value must exactly match the current presentation. Native accepts only one
 
 Before mutation, native persists the exact decision intent. Approval delegates to the existing controller and checked publisher. Recovery verifies the original native audit, preview bytes, and publication. A stored intent or restored draft never authorizes another publication. A duplicate key must use `recover`, not a new choice. Recovery derives and returns the original checked receipt without publishing again. If the outcome cannot be proved, it stays unresolved and suppresses further lineage review. No automatic retry consumes old consent.
 
+## Approved-memory management
+
+All operations use the same worker/configuration and common header. Read operations remain useful without verified dream sources and do not create queue authority:
+
+| Stdin type | Additional fields | Result |
+| --- | --- | --- |
+| `approved-list` | none | `approved` with `result` (native committed base and exact entries, including immutable limitations) |
+| `approved-get` | `request` | `approved` with `result`; request must be the exact native `get` shape |
+| `manage-preview` | `sessionID`, `requestID`, `mode`, `request` | `manage-presentation` with `display` and base64 `displayBytes` |
+| `manage-recover` | `decisionID` | `manage-decision` with checked `receipt`; never publishes |
+
+`mode` is `crud` or `confirm-reviewed`. CRUD request objects are the existing exact `MemoryManagementRequest.decode` shapes (no extra or omitted fields):
+
+- add: `{operation:"add",base,path,replacement,reason}`
+- update: `{operation:"update",base,path,locator:{start,end},expected,replacement,reason}`
+- delete: `{operation:"delete",base,path,locator:{start,end},expected,reason}`
+- get / confirm-reviewed: `{operation:"get",base,path,locator:{start,end},expected}`
+
+Offsets are native numeric UTF-8 byte offsets. Expected/replacement values are exact UTF-8 strings. A CRUD preview permits only add/update/delete; confirm-reviewed uses the exact get target and stages native fresh confirm-reviewed authority. Base, locator, scope and source-annotation preservation are checked by the existing facade. Changes use the actual configured controller and journal; no arbitrary roots or replacement memory store are accepted.
+
+The management `display` is a flat object containing `claimID`, decimal `sequence`, `request:{sessionID,requestID}`, `operation`, `reason`, scope `path`, `currentBase`, base64 effect `before`/`after`, base64 full-document `documentBefore`/final `replacement`, `previewDigest`, `isDetachRequired`, `checkoutCommit`, `checkoutDigest`, and `displayDigest`. `displayBytes` is the canonical sorted-key, unescaped-slash JSON object with **only `displayDigest` removed**. SHA-256(decoded displayBytes) equals displayDigest. Verify these native bytes rather than recreating JSON. Display all exact decoded before/final/annotation/scope bytes and reason before enabling the choice. Base64 alone, truncation, paraphrase, partial text, or hidden attachments do not constitute publication.
+
+Descriptor 3 accepts `manage-presented` with the common header, the full queue tuple (`revision` is **currentBase**, not a candidate digest), and `messageReference`. After exact installation and native `manage-presented` acknowledgement, a new live callback may send `manage-choice` with the same tuple plus `action`, `decisionID`, `responseReference`, and Boolean `isInteractive:true`. Action is `approve` or separately `detach`. An attached checkout cannot approve. Detach cannot save memory: after its checked receipt, obtain a new preview/publication and explicit decision. `release`, finish, either EOF, and helper death invalidate active preview authority. There is only one active inferred or management presentation.
+
+`manage-decision.receipt` has `decisionID`, `displayDigest`, `status`, and optional `commit`/`auditRef`. Only `approved` with a checked native batch receipt proves saved memory. `detached` is checkout preparation only; `outcome-unresolved` does not prove mutation. Intent files (`management-<decisionID>.json`) preserve the exact display, native draft, action and opaque live response reference before mutation. Recovery verifies the native journal/publication or detach outcome and never reconstructs approval. On stale base, changed configuration/checkout/bytes, or failed publication, release and obtain a fresh exact preview and explicit decision. Recovered drafts or model/stdin frames cannot approve.
+
+## Versioned changed-evidence successor
+
+Add/update decisions may omit `successor` for legacy responses; generated strict schemas require `successor:null` or this exact object:
+
+```json
+{"version":1,"predecessorRevision":"<rejected native revision SHA256>","priorClaim":"<exact prior proposed UTF-8 including source annotations and newline>","newEvidence":[{"source":{"session":"one","entry":"new-entry","part":0},"contentDigest":"<SHA256 exact primaryEvidence.text>"}],"explanation":"The changed claim/condition and how the new evidence changes it."}
+```
+
+The native model request now supplies `primaryEvidence[].contentDigest`, so callers copy the digest rather than calculating it with the model. Every selected new source must be unique, present in the native pinned catalogue, and a supporting source of this proposal; its digest must equal SHA-256 of its exact primary text. Existing native saved-source verification still applies before claim/publication. The hint is metadata, never approval.
+
+Queue admission additionally requires a currently rejected, same-scope predecessor, byte-exact priorClaim, changed unannotated claim digest, a nonempty bounded explanation, and at least one supporting identity **and exact content digest** absent from the predecessor's connected historical evidence (including primary contradictions). A copied identical text under a new identity fails. Every connected rejected revision must be covered by that predecessor lineage/its previously frozen rejection exclusions; an unrelated rejected lineage bridged by the new proposal stays blocked. One epoch is admitted per predecessor. Repeated hints cannot reset rejection; only the same changed claim with the admitted new source proofs inherits that epoch, while old-only evidence remains suppressed. Rejecting the admitted epoch blocks repeated runs and future requests until a genuinely new successor proof covers that newer rejection.
+
+The explanation must identify an actual changed claim or condition and the relevance of new evidence; unrelated evidence, rereads, rewording and overlapping analysis alone are prohibited by model policy. **Native verifies structural source/byte novelty, not semantic truth, causal relevance, or natural-language equivalence.** Rephrased/copied evidence with different bytes is not semantically detected. The foreground must publish the exact prior claim, explanation, new evidence and limitations, and obtain fresh explicit approval through the unchanged private channel. The parent foreground/background integration must supply the rejected predecessor revision and exact prior claim to its proposal context; native does not autonomously choose or approve that model hint.
+
 ## Errors and lifetime
 
 Recoverable operation failures emit `blocked` with `code:"busy"` or `code:"blocked"`. A choice whose receipt cannot be established emits `blocked` with `code:"outcome-unresolved"` and `decisionID`. Some recoveries return a `decision` receipt whose status is `outcome-unresolved`. Neither form means saved. Read the current row or inventory for retained limitations rather than interpreting a generic blocked result as success.
@@ -114,7 +154,7 @@ Protocol, control-channel, startup, or binding failures can end with `final`, `s
 
 ## Recurrence and migration
 
-Within a target path, overlapping primary identities and equal unannotated claim digests connect revisions transitively. Rejection suppresses that connected lineage. New response hashes, base commits, rewording, and adding evidence to an overlapping rejected lineage do not reopen it. Positive successor admission is deliberately absent. A later versioned contract must name the rejected predecessor, preserve its exact claim/revision, identify genuinely new evidence and content digests, and establish how that evidence changes the finding. This component does not claim semantic equivalence detection for disjoint rephrased evidence.
+Within a target path, overlapping supporting/contradictory source identities, exact source-content digests, lineage IDs, and equal unannotated claim digests connect revisions transitively. Rejection suppresses that connected lineage. New response hashes, base commits, rewording, and adding evidence without the source-bound successor proof below do not reopen it. This is structural byte/content novelty, not semantic equivalence detection for disjoint rephrased evidence.
 
 Deferral and cancelled display suppress the connected lineage for the same request across restart. A later genuinely relevant request can reconsider a deferred finding. No timer, fixed question quota, or minimum occurrence count is used.
 

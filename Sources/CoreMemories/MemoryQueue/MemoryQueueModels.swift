@@ -107,6 +107,9 @@ package struct MemoryQueueFinding: Codable, Equatable {
   package let inputDigest: String
   package let contextDigest: String
   package let responseDigest: String
+  package var successor: DreamFindingSuccessor?
+  package var suppressionEpoch: String?
+  package var successorRejections: [String]?
 }
 
 package struct MemoryQueueRow: Codable {

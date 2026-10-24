@@ -100,7 +100,9 @@ package final class MemoryQueue {
     return SourceDigest(bytes: Data(text.utf8)).rawValue
   }
 
-  private static func relatedRevisions(_ finding: MemoryQueueFinding, state: QueueLedger) -> Set<
+  static func relatedRevisions(
+    _ finding: MemoryQueueFinding, state: QueueLedger, isAcrossEpochs: Bool = false
+  ) -> Set<
     String
   > {
     var groups: [String: [String]] = [:]
@@ -108,8 +110,12 @@ package final class MemoryQueue {
     for row in state.findings {
       let identifiers =
         ["claim:" + row.claimDigest, "lineage:" + row.findingID]
-        + row.evidence.map { "evidence:" + $0.identity }
-      keys[row.revision] = identifiers.map { row.path + "\0" + $0 }
+        + (row.evidence + row.contradictions.compactMap(\.evidence)).flatMap {
+          ["evidence:" + $0.identity, "content:" + $0.contentDigest]
+        }
+      keys[row.revision] = identifiers.map {
+        row.path + "\0" + (isAcrossEpochs ? "all" : row.suppressionEpoch ?? "initial") + "\0" + $0
+      }
       for key in keys[row.revision]! { groups[key, default: []].append(row.revision) }
     }
     var revisions: Set<String> = [finding.revision]
@@ -131,20 +137,59 @@ package final class MemoryQueue {
       let change = row.change
       let evidence = try change.sources.map(MemoryQueueEvidence.init)
       let digest = Self.claimDigest(change)
+      let conflicts = try change.contradictions.map(MemoryQueueConflict.init)
+      let evidenceKeys = Set(
+        (evidence + conflicts.compactMap(\.evidence)).flatMap { [$0.identity, $0.contentDigest] })
       let related = state.findings.filter {
         $0.path == change.path
-          && ($0.claimDigest == digest
-            || !Set($0.evidence.map(\.identity)).isDisjoint(with: evidence.map(\.identity)))
+          && ($0.claimDigest == digest || $0.revision == change.successor?.predecessorRevision
+            || !Set(
+              ($0.evidence + $0.contradictions.compactMap(\.evidence)).flatMap {
+                [$0.identity, $0.contentDigest]
+              }
+            ).isDisjoint(with: evidenceKeys))
       }
-      let finding = MemoryQueueFinding(
+      var finding = MemoryQueueFinding(
         findingID: related.first?.findingID ?? change.id.rawValue, revision: change.id.rawValue,
         candidateID: change.id.rawValue, relatedRevisions: related.map(\.revision).sorted(),
         path: change.path, operation: change.operation.rawValue, frozenBase: change.base,
         before: change.before ?? Data(), proposed: change.after, claimDigest: digest,
         reason: change.reason, evidence: evidence,
-        contradictions: try change.contradictions.map(MemoryQueueConflict.init),
+        contradictions: conflicts,
         limitations: row.frozenLimitations, inputDigest: change.inputHash.rawValue,
         contextDigest: change.contextHash.rawValue, responseDigest: change.responseHash.rawValue)
+      finding.successor = change.successor
+      finding.suppressionEpoch =
+        related.reversed().compactMap { prior -> String? in
+          guard let origin = state.findings.first(where: { $0.revision == prior.suppressionEpoch }),
+            Self.isRepeatedSuccessor(finding, origin: origin)
+          else { return nil }
+          return origin.revision
+        }.first
+      let rejected = Set(rows.filter { $0.disposition == .rejected }.map { $0.change.id.rawValue })
+        .union(
+          state.intents.filter { $0.action == "reject" }.map {
+            $0.display.presentation.finding.revision
+          })
+      var proposed = state
+      proposed.findings.append(finding)
+      let relatedRejected = Self.relatedRevisions(finding, state: proposed, isAcrossEpochs: true)
+        .intersection(rejected)
+      if let successor = change.successor {
+        if let existing = state.findings.first(where: {
+          $0.successor?.predecessorRevision == successor.predecessorRevision
+            && $0.suppressionEpoch == $0.revision
+        }) {
+          finding.suppressionEpoch =
+            Self.isRepeatedSuccessor(finding, origin: existing) ? existing.suppressionEpoch : nil
+        } else if Self.successorPredecessor(finding, rejected: relatedRejected, state: state) != nil
+        {
+          finding.suppressionEpoch = finding.revision
+          finding.successorRejections = relatedRejected.sorted()
+        } else {
+          finding.suppressionEpoch = nil
+        }
+      }
       state.findings.append(finding)
     }
     guard state.findings.count <= 10_000 else { throw DreamRunError.limitExceeded }
@@ -154,15 +199,20 @@ package final class MemoryQueue {
     _ finding: MemoryQueueFinding, request: MemoryQueueRequest, rows: [MemoryReviewCandidate],
     state: QueueLedger
   ) -> String? {
+    if finding.successor != nil, finding.suppressionEpoch == nil {
+      return "blocked-successor: changed-evidence proof is absent or invalid"
+    }
     let revisions = Self.relatedRevisions(finding, state: state)
-    if rows.contains(where: {
-      revisions.contains($0.change.id.rawValue) && $0.disposition == .rejected
-    })
-      || state.intents.contains(where: {
-        revisions.contains($0.display.presentation.finding.revision)
-          && $0.action == "reject"
-      })
-    {
+    let connected = Self.relatedRevisions(finding, state: state, isAcrossEpochs: true)
+    let rejected = Set(rows.filter { $0.disposition == .rejected }.map { $0.change.id.rawValue })
+      .union(
+        state.intents.filter { $0.action == "reject" }.map {
+          $0.display.presentation.finding.revision
+        })
+    let excluded = Set(
+      state.findings.first(where: { $0.revision == finding.suppressionEpoch })?.successorRejections
+        ?? [])
+    if !connected.intersection(rejected).subtracting(excluded).isEmpty {
       return
         "blocked-successor: rejected evidence or claim requires a versioned changed-evidence successor"
     }

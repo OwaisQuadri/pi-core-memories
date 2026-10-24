@@ -23,7 +23,9 @@ import Testing
   let draft = session.projection.draft
   let before = try fixture.transaction.snapshot(drafts.journal)
   let main = try fixture.transaction.main()
-  let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+  let binary = try #require(
+    ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+      ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
   for operation in ["update", "save"] {
     let result = try runCommand(
       executable: URL(fileURLWithPath: binary),

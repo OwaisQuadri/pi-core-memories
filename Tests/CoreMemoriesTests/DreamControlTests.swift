@@ -217,7 +217,9 @@ private final class ControlEvents: @unchecked Sendable {
   config.reviewState = fixture.root.appendingPathComponent("review").path
   let configURL = fixture.root.appendingPathComponent("profile/config.json")
   try config.save(to: configURL)
-  let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+  let binary = try #require(
+    ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+      ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
   let result = try runCommand(
     executable: URL(fileURLWithPath: binary),
     arguments: ["dream", "start", "--config", configURL.path],

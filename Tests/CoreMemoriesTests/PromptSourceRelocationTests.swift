@@ -536,7 +536,9 @@ struct PromptSourceRelocationTests {
     defer { fixture.clean() }
     let configURL = fixture.root.appendingPathComponent("profile/config.json")
     try relocation.configuration.save(to: configURL)
-    let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+    let binary = try #require(
+      ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+        ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
     func command(_ arguments: [String]) throws -> CommandResult {
       try runCommand(
         executable: URL(fileURLWithPath: binary), arguments: ["dream"] + arguments,

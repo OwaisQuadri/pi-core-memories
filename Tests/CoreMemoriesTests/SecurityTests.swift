@@ -144,7 +144,9 @@ func symbolicMainCannotPublishOrDeduplicate(isDuplicate: Bool) throws {
   let root = try temporaryDirectory()
   defer { try? FileManager.default.removeItem(at: root) }
   let repo = root.appendingPathComponent("new000")
-  let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+  let binary = try #require(
+    ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+      ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
   let result = try runCommand(
     executable: URL(fileURLWithPath: "/bin/zsh"),
     arguments: [
@@ -213,7 +215,9 @@ func symbolicMainCannotPublishOrDeduplicate(isDuplicate: Bool) throws {
   defer { fixture.clean() }
   let base = try fixture.store.approvedCommit()
   let before = try fixture.humanState()
-  let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+  let binary = try #require(
+    ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+      ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
   let body = String(repeating: fact("Repeated review café 👩🏽‍💻 🐢"), count: 128)
   var createSeconds = 0.0
   var duplicateSeconds = 0.0

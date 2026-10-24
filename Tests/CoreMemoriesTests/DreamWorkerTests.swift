@@ -13,7 +13,9 @@ final class DreamWorkerProcess {
   private let deadline = Date().addingTimeInterval(20)
 
   init(arguments: [String] = ["dream-worker"]) throws {
-    let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+    let binary = try #require(
+      ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+        ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
     process.executableURL = URL(fileURLWithPath: binary)
     process.arguments = arguments
     process.environment = [

@@ -72,4 +72,13 @@ test("install argv ignores the session executable override, propagates failure a
 	assert.equal(execFileSync(join(root, "target/release/pi-core-memories"), { encoding: "utf8" }), "fixture");
 	assert.equal(existsSync(join(root, "target/release/pi-core-memories.stamp")), true);
 	assert.equal(existsSync(join(root, "target/build")), false);
+	const output = readFileSync(join(root, "target/release/pi-core-memories"));
+	const stamp = readFileSync(join(root, "target/release/pi-core-memories.stamp"));
+	rmSync(join(root, ".git"), { recursive: true });
+	const unverified = spawnSync(executable!, args, options);
+	assert.ifError(unverified.error);
+	assert.notEqual(unverified.status, 0);
+	assert.match(unverified.stderr, /refused/i);
+	assert.deepEqual(readFileSync(join(root, "target/release/pi-core-memories")), output);
+	assert.deepEqual(readFileSync(join(root, "target/release/pi-core-memories.stamp")), stamp);
 });

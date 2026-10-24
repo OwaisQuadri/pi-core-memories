@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { askMemoryDecision } from "./conversation.ts";
-import { callDreamModel, dreamBatchTextBytes, dreamRoots, readDreamScope, runDreamWorker, type DreamRequest, type DreamSelection } from "./dream.ts";
+import { callDreamModel, dreamBatchTextBytes, dreamRoots, readDreamScope, runDreamWorker, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
 import { decodeQueuePreview, openQueueClient, queueObject, type QueueConnection, type QueueObject } from "./queue-client.ts";
 import { protectDreamSources } from "./source-protection.ts";
+import { joinInteractiveMembership, type InteractiveMembership } from "./interactive-membership.ts";
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 export function memoryRequestIdentity(ctx: Pick<ExtensionContext, "sessionManager">): { sessionID: string; requestID: string } {
@@ -12,7 +15,8 @@ export function memoryRequestIdentity(ctx: Pick<ExtensionContext, "sessionManage
 	if (!entry) throw new Error("Memory review needs a durable user request on the current branch.");
 	return { sessionID: hash(ctx.sessionManager.getSessionId()), requestID: hash(entry.id) };
 }
-export function assertArchivedRequest(request: DreamRequest, sessionID: string): void {
+export function assertArchivedRequest(request: DreamRequest, sessionID: string | string[]): void {
+	const excluded = new Set(typeof sessionID === "string" ? [sessionID] : sessionID);
 	for (const message of request.messages) {
 		if (message.role !== "user") continue;
 		const payload = queueObject(JSON.parse(message.text));
@@ -21,7 +25,7 @@ export function assertArchivedRequest(request: DreamRequest, sessionID: string):
 			if (!value || typeof value !== "object") return false;
 			if (Array.isArray(value)) return value.some(containsSession);
 			const object = value as QueueObject;
-			return object.session === sessionID || Object.values(object).some(containsSession);
+			return (typeof object.session === "string" && excluded.has(object.session)) || Object.values(object).some(containsSession);
 		};
 		if (containsSession(payload)) throw new Error("The memory batch includes this active session. Archived-only admission is required before model dispatch.");
 	}
@@ -74,10 +78,13 @@ type RuntimeDependencies = {
 	call: typeof callDreamModel;
 	protect: typeof protectDreamSources;
 	idleMilliseconds: number;
+	membership: typeof joinInteractiveMembership;
+	membershipDirectory: string;
 };
 export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<RuntimeDependencies> = {}): () => Promise<void> {
-	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, ...overrides };
+	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, membership: joinInteractiveMembership, membershipDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
 	let context: ExtensionContext | undefined;
+	let membership: InteractiveMembership | undefined;
 	let background: AbortController | undefined;
 	let backgroundCompletion: Promise<void> | undefined;
 	let foreground: AbortController | undefined;
@@ -89,9 +96,13 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let generation = 0;
 	function stopBackground(): void { clearTimeout(timer); timer = undefined; background?.abort(); }
 	function invalidate(): void { generation++; foreground?.abort(); stopBackground(); }
+	function updateMembership(): void {
+		if (context) membership?.set({ sessionID: context.sessionManager.getSessionId(), isForeground: isWorking || !!foreground || context.hasPendingMessages() });
+	}
+	async function leaveMembership(): Promise<void> { const previous = membership; membership = undefined; await previous?.close(); }
 	function schedule(): void {
 		clearTimeout(timer);
-		if (!isAlive || isWorking || foreground || !context || failures >= 3) return;
+		if (!isAlive || !membership || isWorking || foreground || !context || failures >= 3) return;
 		timer = setTimeout(() => { timer = undefined; void startBackground(); }, deps.idleMilliseconds * 2 ** failures);
 		timer.unref?.();
 	}
@@ -107,13 +118,21 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const sessionID = ctx.sessionManager.getSessionId();
 		backgroundCompletion = (async () => {
 			try {
+				const live = membership;
+				if (!live) return;
+				updateMembership();
+				const admitted = await live.snapshot();
+				if (admitted.isForeground || !admitted.sessionIDs.length || admitted.sessionIDs.length > 64) return;
 				const roots = await deps.roots(getAgentDir(), ctx.cwd);
 				const scope = await deps.scope(current.signal);
 				current.signal.throwIfAborted();
 				const invocationID = randomUUID();
-				const report = await deps.run({ version: 1, type: "start", invocationID, roots, selection, resume: "inspectOrContinue", batchTextBytes, ...scope }, async (request, signal) => {
+				const start: DreamStart & { excludedSessionIDs: string[] } = { version: 1, type: "start", invocationID, roots, selection, resume: "inspectOrContinue", batchTextBytes, ...scope, excludedSessionIDs: admitted.sessionIDs };
+				const report = await deps.run(start, async (request, signal) => {
 					if (!isAlive || isWorking || current.signal.aborted || ctx.sessionManager.getSessionId() !== sessionID || ctx.model?.id !== model.id || ctx.model?.provider !== model.provider || (ctx.thinkingLevel ?? pi.getThinkingLevel()) !== selection.thinkingLevel) throw new Error("Memory worker selection or lifecycle changed.");
-					assertArchivedRequest(request, sessionID);
+					const currentMembers = await live.snapshot();
+					if (currentMembers.isForeground || membership !== live || JSON.stringify(currentMembers.sessionIDs) !== JSON.stringify(admitted.sessionIDs) || signal.aborted || current.signal.aborted) throw new Error("Interactive memory membership changed.");
+					assertArchivedRequest(request, currentMembers.sessionIDs);
 					return deps.call(request, ctx, model, selection, signal);
 				}, current.signal, () => {}, (value: unknown, signal: AbortSignal) => deps.protect(pi, invocationID, value, signal));
 				if (["blocked", "pending"].includes(report.status)) failures = 3;
@@ -124,22 +143,32 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		})();
 		await backgroundCompletion;
 	}
-	pi.on("session_start", (_event, ctx) => {
-		invalidate(); context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; isWorking = !ctx.isIdle(); failures = 0; schedule();
+	pi.on("session_start", async (_event, ctx) => {
+		invalidate(); const epoch = generation; await leaveMembership();
+		if (generation !== epoch) return;
+		context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; isWorking = !ctx.isIdle(); failures = 0;
+		if (!isAlive) return;
+		try {
+			const joined = await deps.membership(deps.membershipDirectory, { sessionID: ctx.sessionManager.getSessionId(), isForeground: isWorking }, () => { stopBackground(); schedule(); });
+			if (generation !== epoch || !isAlive) { await joined.close(); return; }
+			membership = joined;
+		} catch { return; }
+		updateMembership(); schedule();
 	});
-	pi.on("input", () => { invalidate(); failures = 0; isWorking = true; });
-	pi.on("before_agent_start", () => { stopBackground(); isWorking = true; });
-	pi.on("agent_end", (_event, ctx) => { context = ctx; isWorking = false; schedule(); });
-	pi.on("tool_execution_start", () => { stopBackground(); });
+	pi.on("input", () => { invalidate(); failures = 0; isWorking = true; updateMembership(); });
+	pi.on("before_agent_start", () => { stopBackground(); isWorking = true; updateMembership(); });
+	pi.on("agent_end", (_event, ctx) => { context = ctx; isWorking = false; updateMembership(); schedule(); });
+	pi.on("tool_execution_start", () => { stopBackground(); updateMembership(); });
 	pi.on("model_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; schedule(); });
 	pi.on("thinking_level_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; schedule(); });
-	pi.on("session_before_switch", () => { isAlive = false; invalidate(); });
-	pi.on("session_before_fork", () => { isAlive = false; invalidate(); });
-	pi.on("session_before_tree", () => { invalidate(); });
-	pi.on("session_before_compact", () => { invalidate(); });
-	pi.on("session_tree", (_event, ctx) => { context = ctx; schedule(); });
-	pi.on("session_compact", (_event, ctx) => { context = ctx; schedule(); });
-	const stop = async () => { isAlive = false; invalidate(); await Promise.allSettled([backgroundCompletion, foregroundCompletion]); };
+	pi.on("session_before_switch", async () => { isAlive = false; invalidate(); await leaveMembership(); });
+	pi.on("session_before_fork", async () => { isAlive = false; invalidate(); await leaveMembership(); });
+	pi.on("session_before_tree", () => { invalidate(); isWorking = true; updateMembership(); });
+	pi.on("session_before_compact", () => { invalidate(); isWorking = true; updateMembership(); });
+	pi.on("session_tree", (_event, ctx) => { context = ctx; isWorking = !ctx.isIdle(); updateMembership(); schedule(); });
+	pi.on("session_compact", (_event, ctx) => { context = ctx; isWorking = !ctx.isIdle(); updateMembership(); schedule(); });
+	pi.on("session_compact_failed", (_event, ctx) => { context = ctx; isWorking = !ctx.isIdle(); updateMembership(); schedule(); });
+	const stop = async () => { isAlive = false; invalidate(); await leaveMembership(); await Promise.allSettled([backgroundCompletion, foregroundCompletion]); };
 	pi.on("session_shutdown", stop);
 	pi.registerTool({
 		name: "memory_queue", label: "Memory queue", executionMode: "sequential",
@@ -154,7 +183,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		async execute(_id, params, signal, _update, ctx) {
 			if (ctx.mode !== "tui" || !ctx.hasUI || !isAlive || foreground) throw new Error("Memory queue needs one live interactive session.");
 			const identity = memoryRequestIdentity(ctx);
-			const current = new AbortController(); foreground = current;
+			const current = new AbortController(); foreground = current; updateMembership();
 			const combined = AbortSignal.any(signal ? [signal, current.signal] : [current.signal]);
 			const epoch = generation;
 			const isCurrent = () => {
@@ -184,7 +213,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			try {
 				const result = await foregroundCompletion;
 				return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
-			} finally { if (foreground === current) foreground = undefined; schedule(); }
+			} finally { if (foreground === current) foreground = undefined; updateMembership(); schedule(); }
 		},
 	});
 	return stop;

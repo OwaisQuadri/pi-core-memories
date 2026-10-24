@@ -116,21 +116,31 @@ function runtime(run: typeof runDreamWorker, mode = "tui") {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
 	const pi = { ...bus(), on: (name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => { handlers.set(name, handler); }, registerTool: () => {}, getThinkingLevel: () => "high" } as unknown as ExtensionAPI;
 	const { ctx } = context(); (ctx as { mode: string }).mode = mode;
-	const stop = registerQueuedRuntime(pi, { run, idleMilliseconds: 5, roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}) });
-	return { ctx, stop, emit: async (name: string) => handlers.get(name)?.({}, ctx) };
+	let changed = () => {}; let isPeerForeground = false;
+	const stop = registerQueuedRuntime(pi, { run, idleMilliseconds: 5, membership: async (_directory, _initial, onChanged) => { changed = onChanged; return { set: () => {}, snapshot: async () => ({ sessionIDs: ["session", "another-live-session"].sort(), isForeground: isPeerForeground }), close: async () => {} }; }, roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}) });
+	return { ctx, stop, peerForeground: () => { isPeerForeground = true; changed(); }, emit: async (name: string) => handlers.get(name)?.({}, ctx) };
 }
 
 test("foreground work cancels idle background and shutdown stops rescheduling", async () => {
 	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
 	let workerSignal: AbortSignal | undefined; let runs = 0;
 	const f = runtime(async (_start, _call, signal, _progress, protect) => {
-		runs++; workerSignal = signal; assert.equal(typeof protect, "function"); enter();
+		runs++; workerSignal = signal; assert.equal(typeof protect, "function");
+		assert.deepEqual((_start as typeof _start & { excludedSessionIDs: string[] }).excludedSessionIDs, ["another-live-session", "session"]); enter();
 		await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
 		throw new Error("cancelled");
 	});
 	await f.emit("session_start"); await Promise.race([entered, sleep(1000).then(() => assert.fail("No idle worker"))]);
 	await f.emit("before_agent_start"); assert.equal(workerSignal!.aborted, true);
 	await f.stop(); await sleep(20); assert.equal(runs, 1);
+});
+
+test("a peer foreground notification aborts an already running local worker", async () => {
+	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
+	let workerSignal: AbortSignal | undefined;
+	const f = runtime(async (_start, _call, signal) => { workerSignal = signal; enter(); await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })); throw new Error("cancelled"); });
+	await f.emit("session_start"); await Promise.race([entered, sleep(1000).then(() => assert.fail("No idle worker"))]);
+	f.peerForeground(); assert.equal(workerSignal!.aborted, true); await f.stop();
 });
 
 test("noninteractive hosts never start background and busy retries are bounded", async () => {

@@ -250,3 +250,56 @@ private func admittedBatch(
   try worker.finish()
   #expect(try names.map { try Data(contentsOf: fixture.payload($0)) } == before)
 }
+
+@Test func admittedWindowsAdvanceLargeHistoricalSessionWithoutReadmittingOldEvidence() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: (0..<1_100).map { "SYNTHETIC_SECRET preference \($0)." })
+  let original = try Data(contentsOf: fixture.source)
+  let first = try admittedBatch(fixture)
+  #expect(first.isBacklog)
+  #expect(first.admittedViews[0].version == 2)
+  #expect(first.admittedViews[0].records.count <= 256)
+  #expect(first.positionsAfter[0].completeBytes < UInt64(original.count))
+  let progress = try DreamProgress(generation: 1, positions: first.positionsAfter)
+  let second = try admittedBatch(fixture, progress: progress, prior: first.admittedViews)
+  try DreamRunEncoding.validate(progress: progress, batch: second, limits: DreamRunLimits())
+  try second.admittedViews[0].requireExtension(of: first.admittedViews[0])
+  #expect(second.isBacklog)
+  #expect(second.positionsAfter[0].completeBytes > first.positionsAfter[0].completeBytes)
+  #expect(second.admittedViews[0].records.count <= 256)
+  #expect(Set(first.evidence.map(\.id)).isDisjoint(with: Set(second.evidence.map(\.id))))
+  #expect(!second.evidence.isEmpty)
+  #expect(
+    second.admittedViews[0].window?.predecessorRelationHash == first.admittedViews[0].relationHash)
+  #expect(
+    second.positionsAfter[0].prefixHash
+      == SourceDigest(bytes: original.prefix(Int(second.positionsAfter[0].completeBytes))))
+  let store = try fixture.store()
+  var observed: Set<PrimaryTextID> = []
+  for _ in 0..<2 {
+    _ = try transactionCompleted(
+      store.run(
+        selection: fixture.selection,
+        sourceRoles: DreamSourceRoles(isSnippetsPresent: true, isPromptsPresent: false),
+        protect: { _ in },
+        prepare: { progress, sources in
+          try admittedBatch(fixture, progress: progress, prior: sources.admittedViews)
+        },
+        call: { request in
+          let context = try transactionObject(request)
+          let primary = context["primaryEvidence"] as! [[String: Any]]
+          #expect(!primary.isEmpty)
+          #expect(!String(describing: context).contains("SYNTHETIC_SECRET"))
+          for item in primary {
+            let source = item["source"] as! [String: Any]
+            let id = PrimaryTextID(
+              citation: Citation(
+                session: source["session"] as! String, entry: source["entry"] as! String),
+              part: source["part"] as! Int)
+            #expect(observed.insert(id).inserted)
+          }
+          return try transactionNotes(request)
+        }))
+  }
+}

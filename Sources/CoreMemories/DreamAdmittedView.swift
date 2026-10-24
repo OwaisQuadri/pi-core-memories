@@ -22,9 +22,20 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
   package let relationHash: String
   package let bytes: Data
   package let records: [Record]
+  package var window: Window? = nil
+
+  package struct Window: Codable, Equatable, Sendable {
+    package let originalStart: UInt64
+    package let originalPrefixHash: String
+    package let admittedStart: UInt64
+    package let predecessorRelationHash: String?
+  }
 
   func validate() throws {
-    guard version == 1, extractionVersion == SessionReader.preparationSchemaVersion,
+    guard (version == 1 && window == nil) || (version == 2 && window != nil) else {
+      throw DreamSourceProtectionError.invalidReply
+    }
+    guard extractionVersion == SessionReader.preparationSchemaVersion,
       bytes.count <= DreamSourceProtection.maximumInputBytes,
       records.count <= DreamSourceProtection.maximumPieces,
       SourceDigest(bytes: bytes).rawValue == admittedHash, try binding() == relationHash
@@ -34,7 +45,8 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
     var original: UInt64 = 0
     var admitted: UInt64 = 0
     for record in records {
-      guard record.originalStart == original, record.originalEnd > original,
+      guard window != nil || record.originalStart == original,
+        record.originalEnd > record.originalStart,
         record.admittedStart == admitted, record.admittedEnd > admitted,
         record.admittedEnd <= UInt64(bytes.count)
       else { throw DreamSourceProtectionError.invalidReply }
@@ -53,7 +65,22 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
       original = record.originalEnd
       admitted = record.admittedEnd
     }
-    guard original == originalCompleteBytes, admitted == UInt64(bytes.count), !records.isEmpty,
+    if let window {
+      _ = try SourceDigest(window.originalPrefixHash)
+      guard window.admittedStart <= UInt64(bytes.count),
+        window.originalStart < originalCompleteBytes
+      else { throw DreamSourceProtectionError.invalidReply }
+      var offset = window.originalStart
+      for record in records.filter({
+        $0.originalStart >= window.originalStart && $0.originalEnd <= originalCompleteBytes
+      }).sorted(by: { $0.originalStart < $1.originalStart }) {
+        guard record.originalStart == offset else { throw DreamSourceProtectionError.invalidReply }
+        offset = record.originalEnd
+      }
+      guard offset == originalCompleteBytes else { throw DreamSourceProtectionError.invalidReply }
+    }
+    guard window != nil || original == originalCompleteBytes, admitted == UInt64(bytes.count),
+      !records.isEmpty,
       records.last?.originalPrefixHash == originalPrefixHash
     else {
       throw DreamSourceProtectionError.invalidReply
@@ -69,13 +96,14 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
       let originalPrefixHash: String
       let admittedHash: String
       let records: [Record]
+      let window: Window?
     }
     return SourceDigest(
       bytes: try DreamRunEncoding.encode(
         Binding(
           version: version, extractionVersion: extractionVersion, path: path,
           originalCompleteBytes: originalCompleteBytes, originalPrefixHash: originalPrefixHash,
-          admittedHash: admittedHash, records: records))
+          admittedHash: admittedHash, records: records, window: window))
     ).rawValue
   }
 
@@ -83,12 +111,31 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
     DreamAdmittedView(
       version: version, extractionVersion: extractionVersion, path: path,
       originalCompleteBytes: originalCompleteBytes, originalPrefixHash: originalPrefixHash,
-      admittedHash: admittedHash, relationHash: try binding(), bytes: bytes, records: records)
+      admittedHash: admittedHash, relationHash: try binding(), bytes: bytes, records: records,
+      window: window)
   }
 
   func requireExtension(of prior: DreamAdmittedView) throws {
     try validate()
     try prior.validate()
+    if self == prior { return }
+    if let window {
+      guard path == prior.path, window.originalStart == prior.originalCompleteBytes,
+        window.originalPrefixHash == prior.originalPrefixHash,
+        window.predecessorRelationHash == prior.relationHash
+      else { throw DreamSourceProtectionError.invalidReply }
+      for record in records where record.admittedEnd <= window.admittedStart {
+        if let previous = prior.records.first(where: { $0.originalStart == record.originalStart }) {
+          guard previous.originalEnd == record.originalEnd,
+            previous.originalHash == record.originalHash,
+            previous.admittedHash == record.admittedHash,
+            previous.identityHash == record.identityHash,
+            previous.isOmitted == record.isOmitted
+          else { throw DreamSourceProtectionError.invalidReply }
+        }
+      }
+      return
+    }
     guard path == prior.path, originalCompleteBytes >= prior.originalCompleteBytes,
       bytes.starts(with: prior.bytes), records.starts(with: prior.records)
     else { throw DreamSourceProtectionError.invalidReply }
@@ -96,6 +143,7 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
 
   func admittedOffset(original: UInt64) throws -> UInt64 {
     if original == 0 { return 0 }
+    if let window, original == window.originalStart { return window.admittedStart }
     guard let record = records.first(where: { $0.originalEnd == original }) else {
       throw DreamSourceProtectionError.invalidReply
     }
@@ -104,6 +152,7 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
 
   func originalOffset(admitted: UInt64) throws -> UInt64 {
     if admitted == 0 { return 0 }
+    if let window, admitted == window.admittedStart { return window.originalStart }
     guard let record = records.first(where: { $0.admittedEnd == admitted }) else {
       throw DreamSourceProtectionError.invalidReply
     }
@@ -200,9 +249,12 @@ extension PreparedSessionBatch {
       guard position.completeBytes <= view.originalCompleteBytes else {
         throw DreamSourceProtectionError.invalidReply
       }
-      guard
-        view.records.first(where: { $0.originalEnd == position.completeBytes })?.originalPrefixHash
-          == position.prefixHash.rawValue
+      let expected =
+        view.window?.originalStart == position.completeBytes
+        ? view.window?.originalPrefixHash
+        : view.records.first(where: { $0.originalEnd == position.completeBytes })?
+          .originalPrefixHash
+      guard expected == position.prefixHash.rawValue
       else { throw DreamSourceProtectionError.invalidReply }
     }
     for tail in unfinishedTails {

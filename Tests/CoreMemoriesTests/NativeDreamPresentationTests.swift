@@ -248,13 +248,8 @@ func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPre
     fixture.store().run(
       selection: fixture.selection, prepare: { try fixture.prepare($0) },
       call: { try transactionAdd($0) }))
-  model.run(.start)
-  let deadline = ContinuousClock.now + .seconds(10)
-  while (model.isDreamRunning || model.isBusy || model.actionableCandidates.count != 2)
-    && ContinuousClock.now < deadline
-  {
-    try await Task.sleep(for: .milliseconds(10))
-  }
+  let invocation = try #require(model.run(.start))
+  await invocation.value
   #expect(!model.isDreamRunning)
   try #require(!model.isBusy)
   #expect(model.failure == nil)

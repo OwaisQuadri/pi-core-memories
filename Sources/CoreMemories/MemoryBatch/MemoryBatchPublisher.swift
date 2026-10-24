@@ -287,7 +287,8 @@ final class MemoryBatchPublisher {
         throw MemoryError("checkout changed immediately before publication")
       }
       try store.publishCheckedMemoryCommit(
-        commit: commit, base: draft.baseCommit, auditRef: auditRef, checkout: expected)
+        commit: commit, base: draft.baseCommit, auditRef: auditRef, checkout: expected,
+        reviewBinding: review?.binding)
       return commit
     }
     if let leaseState { return try publish(leaseState) }

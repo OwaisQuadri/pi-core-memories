@@ -9,6 +9,28 @@ func queueFixture(_ fixture: TransactionFixture, sources: DreamRunStore) throws 
     journal: fixture.root.appendingPathComponent("journal"), environment: [:])
 }
 
+@Test func queueRejectsConflictingStoredCandidateAliasWithoutRewritingHistory() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  let queue = try queueFixture(fixture, sources: sources)
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  _ = try queue.list(request: request)
+  let base = try fixture.main()
+  let bytes = try queue.directory.read("queue.json", maximum: MemoryReviewEncoding.maximumFileBytes)
+  var ledger = try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+  var findings = try #require(ledger["findings"] as? [[String: Any]])
+  findings[0]["candidateID"] = String(repeating: "f", count: 64)
+  ledger["findings"] = findings
+  let corrupted = try JSONSerialization.data(withJSONObject: ledger, options: [.sortedKeys])
+  try queue.directory.installReviewFile(corrupted, name: "queue.json", isReplacing: true)
+  #expect(throws: (any Error).self) { try queue.list(request: request) }
+  #expect(
+    try queue.directory.read("queue.json", maximum: MemoryReviewEncoding.maximumFileBytes)
+      == corrupted)
+  #expect(try fixture.main() == base)
+}
+
 @Test func queueDeferAndCancelledDisplayDoNotRepeatWithinResumedRequest() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

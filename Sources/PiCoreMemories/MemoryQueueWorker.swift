@@ -24,15 +24,9 @@ private final class QueueInput: @unchecked Sendable {
     condition.unlock()
   }
 
-  func expect(_ display: MemoryQueueDisplay?, type: String = "presented") {
+  func expect(_ tuple: [String: String]?, type: String = "presented") {
     condition.lock()
-    expected = display.map { (queueTuple($0), type) }
-    condition.unlock()
-  }
-
-  func expectManagement(_ display: MemoryManagementDisplay, type: String = "manage-presented") {
-    condition.lock()
-    expected = (managementTuple(display), type)
+    expected = tuple.map { ($0, type) }
     condition.unlock()
   }
 
@@ -119,10 +113,6 @@ private func matchTuple(_ object: [String: Any], tuple: [String: String]) throws
   for (key, value) in tuple {
     guard try WorkerJSON.text(object, key) == value else { throw WorkerError.protocolFailure }
   }
-}
-
-private func queueMatch(_ object: [String: Any], display: MemoryQueueDisplay) throws {
-  try matchTuple(object, tuple: queueTuple(display))
 }
 
 func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
@@ -233,7 +223,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try WorkerJSON.fields(object, managementFields.union(["messageReference"]))
             try management.presented(
               current, messageReference: WorkerJSON.identifier(object, "messageReference"))
-            input.expectManagement(current, type: "manage-choice")
+            input.expect(managementTuple(current), type: "manage-choice")
             try emit("manage-presented", ["displayDigest": current.displayDigest])
           } else {
             try WorkerJSON.fields(
@@ -264,12 +254,12 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
           }
         } else if isControl {
           guard let current = display else { throw WorkerError.protocolFailure }
-          try queueMatch(object, display: current)
+          try matchTuple(object, tuple: queueTuple(current))
           if type == "presented" {
             try WorkerJSON.fields(object, tuple.union(["messageReference"]))
             try queue.presented(
               current, messageReference: WorkerJSON.identifier(object, "messageReference"))
-            input.expect(current, type: "choice")
+            input.expect(queueTuple(current), type: "choice")
             try emit("presented", ["displayDigest": current.displayDigest])
           } else {
             try WorkerJSON.fields(
@@ -346,7 +336,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             let current = try management.preview(
               request, identity: identity, isConfirmReviewed: mode == "confirm-reviewed")
             managementDisplay = current
-            input.expectManagement(current)
+            input.expect(managementTuple(current), type: "manage-presented")
             try emit(
               "manage-presentation",
               [
@@ -380,7 +370,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
               let current = try queue.claim(
                 revision: WorkerJSON.text(object, "revision", maximum: 64), request: request)
               display = current
-              input.expect(current)
+              input.expect(queueTuple(current))
               let encoder = JSONEncoder()
               encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
               try emit(

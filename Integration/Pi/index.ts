@@ -45,7 +45,7 @@ export default function coreMemories(pi: ExtensionAPI, render: Render = renderAp
 	const abortDream = registerDream(pi);
 	const abortReview = registerReview(pi);
 	const abortManagement = registerMemoryManagement(pi);
-	const abortQueue = registerQueuedRuntime(pi);
+	registerQueuedRuntime(pi);
 	let controller: AbortController | undefined;
 	let warnedSessionId: string | undefined;
 	let reminder: AbortController | undefined;
@@ -89,7 +89,7 @@ export default function coreMemories(pi: ExtensionAPI, render: Render = renderAp
 		controller?.abort();
 		reminder?.abort();
 		controller = undefined;
-		return Promise.all([abortDream(), abortReview(), abortManagement(), abortQueue()]).then(() => {});
+		return Promise.all([abortDream(), abortReview(), abortManagement()]).then(() => {});
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {

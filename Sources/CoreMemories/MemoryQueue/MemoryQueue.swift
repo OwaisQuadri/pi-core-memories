@@ -84,7 +84,12 @@ package final class MemoryQueue {
         QueueLedger.self,
         bytes: directory.read("queue.json", maximum: MemoryReviewEncoding.maximumFileBytes))
       : QueueLedger(schemaVersion: 1, binding: binding)
-    guard state.schemaVersion == 1, state.binding == binding else {
+    guard state.schemaVersion == 1, state.binding == binding,
+      state.findings.allSatisfy({ $0.revision == $0.candidateID }),
+      state.intents.allSatisfy({
+        $0.display.presentation.finding.revision == $0.display.presentation.finding.candidateID
+      })
+    else {
       throw MemoryError("queue binding conflict")
     }
     let result = try operation(&state)
@@ -133,7 +138,7 @@ package final class MemoryQueue {
 
   private func admit(_ rows: [MemoryReviewCandidate], state: inout QueueLedger) throws {
     for row in rows
-    where !state.findings.contains(where: { $0.candidateID == row.change.id.rawValue }) {
+    where !state.findings.contains(where: { $0.revision == row.change.id.rawValue }) {
       let change = row.change
       let evidence = try change.sources.map(MemoryQueueEvidence.init)
       let digest = Self.claimDigest(change)
@@ -244,7 +249,7 @@ package final class MemoryQueue {
     try ledger(review) { state in
       try admit(rows, state: &state)
       return rows.map { row in
-        let finding = state.findings.first { $0.candidateID == row.change.id.rawValue }!
+        let finding = state.findings.first { $0.revision == row.change.id.rawValue }!
         return MemoryQueueRow(
           finding: finding, disposition: row.disposition.rawValue,
           blockReason: blockReason(finding, request: request, rows: rows, state: state)
@@ -371,7 +376,7 @@ package final class MemoryQueue {
       var commit: String?
       var auditRef: String?
       var status = "outcome-unresolved"
-      if intent.action == "approve", let attempt = review.approvals[finding.candidateID],
+      if intent.action == "approve", let attempt = review.approvals[finding.revision],
         attempt.previewHash == presentation.previewDigest,
         attempt.preview.before == presentation.before, attempt.preview.after == presentation.after,
         attempt.preview.replacement == presentation.replacement
@@ -381,13 +386,13 @@ package final class MemoryQueue {
         status = "approved"
       } else if intent.action == "reject" || intent.action == "defer" {
         let disposition: MemoryReviewDisposition = intent.action == "reject" ? .rejected : .deferred
-        let name = "\(disposition.rawValue)-\(finding.candidateID).json"
+        let name = "\(disposition.rawValue)-\(finding.revision).json"
         if try review.root.isPresent(name) {
           let selection = try MemoryReviewEncoding.decode(
             ReviewSelection.self,
             bytes: review.root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
           guard
-            selection == ReviewSelection(candidateID: finding.candidateID, disposition: disposition)
+            selection == ReviewSelection(candidateID: finding.revision, disposition: disposition)
           else { throw DreamRunError.corruption }
           status = disposition.rawValue
         }

@@ -130,13 +130,16 @@ enum DreamRunEncoding {
     guard batch.predecessorGeneration == progress.generation else {
       throw DreamRunError.staleGeneration
     }
+    try batch.validateOriginalProgress(progress)
+    let progress = try batch.admittedProgress(progress)
+    let batch = try batch.admittedProjection()
     guard progress.schemaVersion == 1, batch.readerSchemaVersion == 1 else {
       throw DreamRunError.unsupportedSchema
     }
     guard progress.positions.count <= limits.maximumPositions,
       batch.positionsAfter.count <= limits.maximumPositions
     else { throw DreamRunError.limitExceeded }
-    try SessionReader.verifyPreparation(batch)
+    try SessionReader.verifyPreparation(batch, isProjected: true)
     var aggregate = 0
     func count(_ size: Int) throws {
       guard size <= limits.maximumFrozenBytes - aggregate else { throw DreamRunError.limitExceeded }
@@ -463,6 +466,7 @@ enum DreamRunEncoding {
     let exactText: String
     let witness: Witness
     let agentContext: String?
+    let originalWitness: Witness?
 
     init(_ value: PrimaryTextEvidence) {
       id = ID(value.id)
@@ -472,16 +476,19 @@ enum DreamRunEncoding {
       exactText = value.exactText
       witness = Witness(value.witness)
       agentContext = value.agentContext
+      originalWitness = value.originalWitness.map(Witness.init)
     }
 
     func domain() throws -> PrimaryTextEvidence {
       guard let kind = PrimaryTextKind(rawValue: kind) else { throw DreamRunError.corruption }
       let time = Double(bitPattern: timestampBits)
       guard time.isFinite else { throw DreamRunError.corruption }
-      return try PrimaryTextEvidence(
+      var value = try PrimaryTextEvidence(
         id: id.domain(), kind: kind, timestamp: Date(timeIntervalSinceReferenceDate: time),
         projectScope: projectScope, exactText: exactText, witness: witness.domain(),
         agentContext: agentContext)
+      value.originalWitness = try originalWitness?.domain()
+      return value
     }
   }
 
@@ -574,6 +581,7 @@ enum DreamRunEncoding {
 
   private struct Provenance: Codable {
     let isToolEvidenceIncluded: Bool?
+    let admittedViews: [DreamAdmittedView]?
     let stripping: [Stripping]
     let sessions: [Classification]
 
@@ -581,6 +589,7 @@ enum DreamRunEncoding {
       let kind: String
       let name: String
       let bytes: Data
+      let originalHash: String?
     }
 
     struct Classification: Codable {
@@ -595,7 +604,11 @@ enum DreamRunEncoding {
 
     init(_ value: PreparationProvenance) {
       isToolEvidenceIncluded = value.isToolEvidenceIncluded ? true : nil
-      stripping = value.stripping.map { Stripping(kind: $0.kind, name: $0.name, bytes: $0.bytes) }
+      admittedViews = value.admittedViews.isEmpty ? nil : value.admittedViews
+      stripping = value.stripping.map {
+        Stripping(
+          kind: $0.kind, name: $0.name, bytes: $0.bytes, originalHash: $0.originalHash?.rawValue)
+      }
       sessions = value.sessions.map {
         Classification(
           path: $0.path.rawValue,
@@ -608,8 +621,11 @@ enum DreamRunEncoding {
     func domain() throws -> PreparationProvenance {
       try PreparationProvenance(
         isToolEvidenceIncluded: isToolEvidenceIncluded ?? false,
+        admittedViews: admittedViews ?? [],
         stripping: stripping.map {
-          PreparationStrippingInput(kind: $0.kind, name: $0.name, bytes: $0.bytes)
+          try PreparationStrippingInput(
+            kind: $0.kind, name: $0.name, bytes: $0.bytes,
+            originalHash: $0.originalHash.map { try SourceDigest($0) })
         },
         sessions: sessions.map {
           try PreparationClassificationWitness(

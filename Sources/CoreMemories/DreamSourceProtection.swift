@@ -46,9 +46,10 @@ package enum DreamSourceProtection {
     }
   }
 
-  static func requireAdmissibleReadProvenance(_ records: [[String: Any]]) throws {
+  static func omittedReadResults(_ records: [[String: Any]]) throws -> Set<Int> {
     var calls: [String: (name: String, isProtected: Bool)] = [:]
-    for record in records {
+    var omitted: Set<Int> = []
+    for (index, record) in records.enumerated() {
       guard let message = record["message"] as? [String: Any] else { continue }
       if message["role"] as? String == "assistant" {
         for block in message["content"] as? [[String: Any]] ?? []
@@ -68,12 +69,18 @@ package enum DreamSourceProtection {
       }
       if message["role"] as? String == "toolResult" {
         let call = (message["toolCallId"] as? String).flatMap { calls[$0] }
-        guard call?.isProtected != true else { throw DreamSourceProtectionError.blocked }
-        if message["toolName"] as? String == "read" {
-          guard call?.name == "read" else { throw DreamSourceProtectionError.blocked }
+        if call?.isProtected == true
+          || (message["toolName"] as? String == "read" && call?.name != "read")
+        {
+          omitted.insert(index)
         }
       }
     }
+    return omitted
+  }
+
+  static func requireAdmissibleReadProvenance(_ records: [[String: Any]]) throws {
+    guard try omittedReadResults(records).isEmpty else { throw DreamSourceProtectionError.blocked }
   }
 
   static func text(_ bytes: Data) throws -> String {
@@ -84,12 +91,18 @@ package enum DreamSourceProtection {
   }
 
   static func pieces(_ batch: PreparedSessionBatch) throws -> [String] {
-    try requireAdmissibleReadProvenance(
-      try batch.exactSourceRecords.compactMap {
-        guard let bytes = $0.bytes else { return nil }
-        return try JSONSerialization.jsonObject(with: bytes) as? [String: Any]
-      })
-    var pieces: [String] = []
+    if batch.admittedViews.isEmpty {
+      try requireAdmissibleReadProvenance(
+        try batch.exactSourceRecords.compactMap {
+          guard let bytes = $0.bytes else { return nil }
+          return try JSONSerialization.jsonObject(with: bytes) as? [String: Any]
+        })
+    }
+    var pieces: [String] = try batch.admittedViews.flatMap { view in
+      try view.records.map {
+        try text(view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd)))
+      }
+    }
     for position in batch.positionsAfter { pieces.append(position.relativePath.rawValue) }
     for record in batch.exactSourceRecords {
       if let bytes = record.bytes { pieces.append(try text(bytes)) }

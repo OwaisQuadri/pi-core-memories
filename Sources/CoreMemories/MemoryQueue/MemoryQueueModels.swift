@@ -36,6 +36,9 @@ package struct MemoryQueueEvidence: Codable, Equatable {
   package let end: String
   package let recordDigest: String
   package let agentContext: String?
+  package let admittedStart: String?
+  package let admittedEnd: String?
+  package let admittedRecordDigest: String?
 
   init(_ source: PrimaryTextEvidence) throws {
     session = source.id.citation.session
@@ -48,10 +51,14 @@ package struct MemoryQueueEvidence: Codable, Equatable {
     timestamp = source.timestamp.ISO8601Format()
     projectScope = source.projectScope
     exactText = source.exactText
-    relativePath = source.witness.relativePath.rawValue
-    start = String(source.witness.byteRange.lowerBound)
-    end = String(source.witness.byteRange.upperBound)
-    recordDigest = source.witness.rawRecordHash.rawValue
+    let original = source.originalWitness ?? source.witness
+    relativePath = original.relativePath.rawValue
+    start = String(original.byteRange.lowerBound)
+    end = String(original.byteRange.upperBound)
+    recordDigest = original.rawRecordHash.rawValue
+    admittedStart = source.originalWitness.map { _ in String(source.witness.byteRange.lowerBound) }
+    admittedEnd = source.originalWitness.map { _ in String(source.witness.byteRange.upperBound) }
+    admittedRecordDigest = source.originalWitness.map { _ in source.witness.rawRecordHash.rawValue }
     agentContext = source.agentContext
   }
 }

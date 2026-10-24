@@ -12,7 +12,7 @@ import Testing
 }
 
 @Test(arguments: [
-  "blocked", "changed", "wrongID", "wrongInput", "wrongOutput", "wrongInvocation", "cancel",
+  "blocked", "wrongPolicy", "wrongID", "wrongInput", "wrongOutput", "wrongInvocation", "cancel",
   "timeout",
 ])
 func sourceProtectionFailureNeverFreezesInputOrDispatchesModel(mode: String) throws {
@@ -36,7 +36,7 @@ func sourceProtectionFailureNeverFreezesInputOrDispatchesModel(mode: String) thr
       "requestID": request["requestID"]!, "inputDigest": request["inputDigest"]!,
       "status": "blocked", "code": "unavailable",
     ]
-  case "changed": reply = workerProtectionReply(request, pieces: pieces.map { $0 + "[redacted]" })
+  case "wrongPolicy": reply["policy"] = "foreign"
   case "wrongID": reply["requestID"] = "foreign"
   case "wrongInput": reply["inputDigest"] = String(repeating: "0", count: 64)
   case "wrongOutput": reply["outputDigest"] = String(repeating: "0", count: 64)
@@ -63,7 +63,7 @@ func sourceProtectionFailureNeverFreezesInputOrDispatchesModel(mode: String) thr
     })
 }
 
-@Test(arguments: ["source", "owner", "approved"])
+@Test(arguments: ["owner", "approved"])
 func sourceProtectionChangedRawOrAuthorityBytesBlockBeforeFreeze(target: String) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
@@ -167,14 +167,21 @@ func sourceProtectionProtectedReadNeverSendsBodyToHostOrFreezesIt(path: String) 
     let frame = try worker.frame()
     #expect(!String(describing: frame).contains("SYNTHETIC_PROTECTED_BODY"))
     if frame["type"] as? String == "final" {
-      #expect(frame["status"] as? String == "blocked")
+      #expect(frame["status"] as? String == "completed")
       break
+    }
+    if frame["type"] as? String == "modelRequest" {
+      try worker.send(workerReply(frame, text: workerDecision(frame)))
+      continue
     }
     try #require(frame["type"] as? String == "sourceProtectionRequest")
     try worker.send(workerProtectionReply(frame))
   }
   try worker.finish()
-  #expect(!(try fixture.snapshot(fixture.state)).keys.contains { $0.hasSuffix("input.json") })
+  #expect(
+    (try fixture.snapshot(fixture.state)).values.allSatisfy {
+      !String(decoding: $0.bytes, as: UTF8.self).contains("SYNTHETIC_PROTECTED_BODY")
+    })
 }
 
 @Test func sourceProtectionReadResultCannotRenameItsToolToBypassCallProvenance() throws {

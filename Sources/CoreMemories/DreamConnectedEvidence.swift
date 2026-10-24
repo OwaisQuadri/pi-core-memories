@@ -99,6 +99,7 @@ public struct ConnectedDreamEvidence: Sendable {
 
   private static func isIdentical(_ lhs: PrimaryTextEvidence, _ rhs: PrimaryTextEvidence) -> Bool {
     lhs.id == rhs.id && lhs.kind == rhs.kind && lhs.witness == rhs.witness
+      && lhs.originalWitness == rhs.originalWitness
       && lhs.timestamp.timeIntervalSinceReferenceDate.bitPattern
         == rhs.timestamp.timeIntervalSinceReferenceDate.bitPattern
       && lhs.projectScope.map({ Data($0.utf8) }) == rhs.projectScope.map({ Data($0.utf8) })

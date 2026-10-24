@@ -1112,7 +1112,10 @@ public final class DreamRunStore {
       _ = try DreamRunEncoding.decode(RootBinding.self, bytes: bytes)
       guard bytes == bindingBytes else { throw DreamRunError.unsafeState }
     }
-    let chain = try loadChain()
+    var admittedViews: [String: DreamAdmittedView] = [:]
+    let chain = try loadChain(capture: { sealed, _, _ in
+      for view in sealed.run.batch.admittedViews { admittedViews[view.path] = view }
+    })
     let progress = try chain.record.progress.domain()
     let admissions = try root.child("admissions")
     let runs = try root.child("runs")
@@ -1164,9 +1167,10 @@ public final class DreamRunStore {
       isRecovered = true
     } else {
       guard cached?.runID == nil else { throw DreamRunError.missingPayload }
-      let sources: DreamFreshSources?
+      var sources: DreamFreshSources?
       if let sourceRoles {
         sources = try freshSources(roles: sourceRoles, chain: chain)
+        sources?.admittedViews = admittedViews.values.sorted { $0.path < $1.path }
       } else {
         guard !(try root.isPresent(PromptRelocationRecord.name)) else {
           throw MemoryError("fresh prompt relocation requires named source roles")
@@ -1177,6 +1181,9 @@ public final class DreamRunStore {
         sources = nil
       }
       let batch = try prepare(progress, sources)
+      for view in batch.admittedViews {
+        if let prior = admittedViews[view.path] { try view.requireExtension(of: prior) }
+      }
       do {
         try DreamRunEncoding.validate(progress: progress, batch: batch, limits: limits)
       } catch let error as DreamRunError { throw error } catch { throw DreamRunError.corruption }
@@ -1669,6 +1676,7 @@ public final class DreamRunStore {
     let generations = try root.child("generations")
     let installed = Set(try generations.names().filter { !$0.hasPrefix(".pending-") })
     guard !installed.isEmpty else { throw DreamRunError.missingPayload }
+    var priorViews: [String: DreamAdmittedView] = [:]
     var previous: DreamRunEncoding.Generation?
     var previousHash: SourceDigest?
     var hashes: [UInt64: String] = [:]
@@ -1696,6 +1704,10 @@ public final class DreamRunStore {
         let sealed = try loadAdmission(generation: generation - 1, chain: priorChain)
         guard sealed.run.runID == runID, sealed.admissionHash.rawValue == admissionHash else {
           throw DreamRunError.corruption
+        }
+        for view in sealed.run.batch.admittedViews {
+          if let prior = priorViews[view.path] { try view.requireExtension(of: prior) }
+          priorViews[view.path] = view
         }
         let outcome = try validatedOutcome(sealed)
         let decisionsBytes = try sealed.directory.read(

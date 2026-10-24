@@ -58,6 +58,7 @@ final class DreamWorkerProcess {
 
   var progressFrames: [[String: Any]] = []
   var isProtectingAutomatically = true
+  var protectionTransform: ([String]) -> [String] = { $0 }
 
   func frame() throws -> [String: Any] {
     while true {
@@ -67,7 +68,8 @@ final class DreamWorkerProcess {
         let frame = try #require(
           try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any])
         if frame["type"] as? String == "sourceProtectionRequest", isProtectingAutomatically {
-          try send(workerProtectionReply(frame))
+          try send(
+            workerProtectionReply(frame, pieces: protectionTransform(frame["pieces"] as! [String])))
           continue
         }
         if frame["type"] as? String == "progress" {
@@ -147,7 +149,7 @@ func workerProtectionReply(_ request: [String: Any], pieces: [String]? = nil) ->
   ]
 }
 
-private func workerReply(_ request: [String: Any], text: String? = nil, category: String? = nil)
+func workerReply(_ request: [String: Any], text: String? = nil, category: String? = nil)
   -> [String: Any]
 {
   var reply: [String: Any] = [
@@ -164,7 +166,7 @@ private func workerReply(_ request: [String: Any], text: String? = nil, category
   return reply
 }
 
-private func workerDecision(_ request: [String: Any], isProposal: Bool = false) throws -> String {
+func workerDecision(_ request: [String: Any], isProposal: Bool = false) throws -> String {
   let messages = try #require(request["messages"] as? [[String: Any]])
   let text = try #require(messages.first?["text"] as? String)
   let context = try #require(

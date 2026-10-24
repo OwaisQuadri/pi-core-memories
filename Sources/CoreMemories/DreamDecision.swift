@@ -1247,7 +1247,7 @@ private struct DecisionJSONParser {
 extension DreamDecisionContext {
   func requestMessages(timestampMilliseconds: Int64) throws -> [DreamRequestMessage] {
     let primary: [DecisionJSON] = primaryCatalogue.map {
-      .object([
+      var fields: [String: DecisionJSON] = [
         "source": sourceJSON($0.id), "kind": .string($0.kind.rawValue),
         "text": .string($0.exactText),
         "contentDigest": .string(SourceDigest(bytes: Data($0.exactText.utf8)).rawValue),
@@ -1261,7 +1261,17 @@ extension DreamDecisionContext {
         ]),
         "timestampReferenceTimeBits": .string(
           String($0.timestamp.timeIntervalSinceReferenceDate.bitPattern)),
-      ])
+      ]
+      if let original = $0.originalWitness {
+        fields["admittedLocator"] = fields["locator"]
+        fields["locator"] = .object([
+          "relativePath": .string(original.relativePath.rawValue),
+          "start": .string(String(original.byteRange.lowerBound)),
+          "end": .string(String(original.byteRange.upperBound)),
+          "rawRecordHash": .string(original.rawRecordHash.rawValue),
+        ])
+      }
+      return .object(fields)
     }
     let agents: [DecisionJSON] = primaryCatalogue.compactMap { evidence in
       evidence.agentContext.map {

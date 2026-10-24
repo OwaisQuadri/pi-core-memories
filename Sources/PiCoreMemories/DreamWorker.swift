@@ -276,6 +276,10 @@ private final class WorkerInput: @unchecked Sendable {
   }
 
   func protect(_ pieces: [String], invocationID: String) throws {
+    try DreamSourceProtection.requireUnchanged(pieces, check(pieces, invocationID: invocationID))
+  }
+
+  func check(_ pieces: [String], invocationID: String) throws -> [String] {
     try DreamSourceProtection.validate(
       pieces, maximumBytes: DreamSourceProtection.maximumInputBytes)
     let id = UUID().uuidString.lowercased()
@@ -309,9 +313,9 @@ private final class WorkerInput: @unchecked Sendable {
     guard failure == nil, !isCancelledFlag else { throw DreamSourceProtectionError.cancelled }
     if let protectionFailure { throw protectionFailure }
     guard let protectionReply else { throw DreamSourceProtectionError.invalidReply }
-    try DreamSourceProtection.requireUnchanged(pieces, protectionReply)
     protectionRequest = nil
     self.protectionReply = nil
+    return protectionReply
   }
 
   private func consumeProtection(_ object: [String: Any]) throws {
@@ -601,6 +605,8 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
         .prepareProtected(
           progress: progress, limits: DreamInputLimits(maximumBatchBytes: start.batchTextBytes),
           protect: { try input.protect($0, invocationID: start.invocationID) },
+          admit: { try input.check($0, invocationID: start.invocationID) },
+          priorViews: sources.admittedViews,
           backlog: { backlog = $0 }, isCancelled: { input.isCancelled })
       },
       call: { request in

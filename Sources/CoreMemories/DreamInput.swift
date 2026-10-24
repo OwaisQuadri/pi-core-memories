@@ -95,7 +95,7 @@ public struct DreamProgress: Equatable, Sendable {
 }
 
 public enum PrimaryTextKind: String, Sendable {
-  case typed, typedSkillArguments, answered
+  case typed, typedSkillArguments, answered, toolCall, toolResult
 }
 
 public struct PrimaryTextID: Hashable, Sendable {
@@ -228,22 +228,29 @@ extension SessionReader {
     progress: DreamProgress, limits: DreamInputLimits,
     modifiedAfter: Date = Date().addingTimeInterval(-dreamWindow),
     maximumBacklogBytes: UInt64 = dreamBacklogBytes,
+    isToolEvidenceIncluded: Bool = false, isSourceScrubbed: Bool = false,
     backlog: (DreamBacklog) -> Void = { _ in },
     isCancelled: () -> Bool = { false }
   ) throws -> PreparedSessionBatch {
     try prepare(
       progress: progress, limits: limits, modifiedAfter: modifiedAfter,
-      maximumBacklogBytes: maximumBacklogBytes, beforeRead: { _ in }, backlog: backlog,
+      maximumBacklogBytes: maximumBacklogBytes,
+      isToolEvidenceIncluded: isToolEvidenceIncluded, isSourceScrubbed: isSourceScrubbed,
+      beforeRead: { _ in }, backlog: backlog,
       isCancelled: isCancelled)
   }
 
   func prepare(
     progress: DreamProgress, limits: DreamInputLimits, modifiedAfter: Date = .distantPast,
     maximumBacklogBytes: UInt64 = .max,
+    isToolEvidenceIncluded: Bool = false, isSourceScrubbed: Bool = false,
     beforeRead: (URL) throws -> Void,
     backlog: (DreamBacklog) -> Void = { _ in },
     isCancelled: () -> Bool = { false }
   ) throws -> PreparedSessionBatch {
+    guard !isToolEvidenceIncluded || isSourceScrubbed else {
+      throw MemoryError("tool evidence requires caller-scrubbed source input")
+    }
     func checkedRead(_ url: URL) throws {
       if isCancelled() { throw CancellationError() }
       try beforeRead(url)
@@ -343,6 +350,7 @@ extension SessionReader {
         let parent = record.object["parentId"] as? String
         let extracted = try record.extract(
           session: session, snippets: stripping.snippets, templates: stripping.templates,
+          isToolEvidenceIncluded: isToolEvidenceIncluded,
           agentContext: { PreparedChainLink.context(parent: parent, chain: chain) })
         if let id = record.object["id"] as? String {
           chain[id] = PreparedChainLink(parent: parent, text: extracted.agentText)
@@ -382,6 +390,9 @@ extension SessionReader {
                 && ($0.agentContext?.utf8.count ?? 0) <= limits.maximumEvidenceBytes
             })
           else { throw MemoryError("oversized dream evidence: \(session.path.rawValue)") }
+          guard !extracted.evidence.contains(where: { $0.kind == .toolCall || $0.kind == .toolResult })
+            || kept <= limits.maximumBatchBytes
+          else { throw MemoryError("oversized dream tool record: \(session.path.rawValue)") }
           guard record.bytes.count <= limits.maximumRecordBytes else {
             throw MemoryError("oversized dream record: \(session.path.rawValue)")
           }
@@ -419,7 +430,7 @@ extension SessionReader {
       exactSourceRecords: records, evidence: evidence, selections: selections,
       unfinishedTails: tails, isBacklog: isBacklog,
       provenance: PreparationProvenance(
-        stripping: stripping.inputs,
+        isToolEvidenceIncluded: isToolEvidenceIncluded, stripping: stripping.inputs,
         sessions: captured.filter { session in
           records.contains { $0.witness.relativePath == session.path }
         }.map { session in
@@ -765,7 +776,7 @@ private struct PreparedRecord {
 
   func extract(
     session: CapturedSession, snippets: [String], templates: [String],
-    agentContext: () -> String?
+    isToolEvidenceIncluded: Bool, agentContext: () -> String?
   ) throws -> (
     disposition: RecordDisposition, evidence: [PrimaryTextEvidence],
     selections: [SelectionContext], agentText: String?
@@ -794,12 +805,14 @@ private struct PreparedRecord {
     case "user", "assistant", "toolResult": break
     default: throw MemoryError("unknown message role")
     }
-    if role == "assistant" {
+    if role == "assistant", !isToolEvidenceIncluded || session.sessionClass != .primary {
       return excluded(.assistantV1, agentText: try textContent(message["content"], isHuman: false))
     }
     if session.sessionClass == .child { return excluded(.childV1) }
     if session.sessionClass == .infrastructure { return excluded(.infrastructureV1) }
-    if role == "toolResult", message["toolName"] as? String != "ask_user_question" {
+    if role == "toolResult", !isToolEvidenceIncluded,
+      message["toolName"] as? String != "ask_user_question"
+    {
       return excluded(.toolOutputV1)
     }
     guard let time = object["timestamp"] as? String, let timestamp = SessionReader.date(time) else {
@@ -817,6 +830,40 @@ private struct PreparedRecord {
         projectScope: session.projectScope, exactText: text, witness: source,
         agentContext: context)
     }
+    func toolText(_ fields: [String: Any]) throws -> String {
+      String(decoding: try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
+        as: UTF8.self)
+    }
+    if role == "assistant" {
+      guard let blocks = message["content"] as? [[String: Any]] else {
+        return excluded(.assistantV1, agentText: try textContent(message["content"], isHuman: false))
+      }
+      var units: [PrimaryTextEvidence] = []
+      for (part, block) in blocks.enumerated() where block["type"] as? String == "toolCall" {
+        guard let id = block["id"] as? String, !id.isEmpty,
+          let name = block["name"] as? String, !name.isEmpty,
+          let arguments = block["arguments"] as? [String: Any]
+        else { throw MemoryError("invalid primary tool call") }
+        units.append(evidence(try toolText([
+          "toolCallID": id, "toolName": name, "arguments": arguments,
+        ]), kind: .toolCall, part: part))
+      }
+      let agentText = try textContent(message["content"], isHuman: false)
+      return units.isEmpty ? excluded(.assistantV1, agentText: agentText)
+        : (.primaryEvidence(units.map(\.id)), units, [], agentText)
+    }
+    if role == "toolResult", message["toolName"] as? String != "ask_user_question" {
+      guard let id = message["toolCallId"] as? String, !id.isEmpty,
+        let name = message["toolName"] as? String, !name.isEmpty,
+        let isError = message["isError"] as? Bool
+      else { throw MemoryError("invalid primary tool result") }
+      let text = try textContent(message["content"], isHuman: false)
+      guard !text.isEmpty else { return excluded(.attachmentOnlyV1) }
+      let unit = evidence(try toolText([
+        "toolCallID": id, "toolName": name, "text": text, "isError": isError,
+      ]), kind: .toolResult, part: 0)
+      return (.primaryEvidence([unit.id]), [unit], [], nil)
+    }
     if role == "user" {
       let raw = try textContent(message["content"], isHuman: true)
       switch SessionReader.humanText(
@@ -833,6 +880,10 @@ private struct PreparedRecord {
       case .empty: return excluded(raw.isEmpty ? .emptyV1 : .attachmentOnlyV1)
       }
     }
+    if let details = message["details"] as? [String: Any],
+      let status = details["status"] as? String,
+      ["policy-guidance", "automatic-policy-guidance"].contains(status)
+    { return excluded(.generatedV1) }
     guard let details = message["details"] as? [String: Any],
       let status = details["status"] as? String,
       ["answered", "cancelled", "invalid", "unavailable"].contains(status)
@@ -903,6 +954,7 @@ struct PreparationClassificationWitness: Sendable {
 }
 
 struct PreparationProvenance: Sendable {
+  var isToolEvidenceIncluded: Bool = false
   let stripping: [PreparationStrippingInput]
   let sessions: [PreparationClassificationWitness]
 }
@@ -1002,7 +1054,7 @@ extension SessionReader {
       }
       let extracted = try raw.extract(
         session: session, snippets: snippets, templates: templates,
-        agentContext: {
+        isToolEvidenceIncluded: provenance.isToolEvidenceIncluded, agentContext: {
           batch.evidence.first { $0.witness == record.witness }?.agentContext
         })
       switch (record.disposition, extracted.disposition) {

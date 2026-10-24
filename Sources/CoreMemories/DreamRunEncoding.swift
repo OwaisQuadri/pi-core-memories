@@ -248,7 +248,7 @@ enum DreamRunEncoding {
         record.session == evidence.id.citation.session, record.entry == evidence.id.citation.entry,
         UInt64(evidence.id.part) < evidence.witness.byteRange.upperBound
           - evidence.witness.byteRange.lowerBound,
-        evidence.kind == .answered || evidence.id.part == 0
+        evidence.kind == .answered || evidence.kind == .toolCall || evidence.id.part == 0
       else { throw DreamRunError.corruption }
       if evidence.kind == .answered { selectionCitations.insert(evidence.id.citation) }
     }
@@ -561,7 +561,14 @@ enum DreamRunEncoding {
     }
   }
 
+  static func batchBinding(_ batch: PreparedSessionBatch, maximumBytes: Int) throws -> Data {
+    let bytes = try encode(Batch(batch))
+    guard bytes.count <= maximumBytes else { throw DreamRunError.limitExceeded }
+    return bytes
+  }
+
   private struct Provenance: Codable {
+    let isToolEvidenceIncluded: Bool?
     let stripping: [Stripping]
     let sessions: [Classification]
 
@@ -582,6 +589,7 @@ enum DreamRunEncoding {
     }
 
     init(_ value: PreparationProvenance) {
+      isToolEvidenceIncluded = value.isToolEvidenceIncluded ? true : nil
       stripping = value.stripping.map { Stripping(kind: $0.kind, name: $0.name, bytes: $0.bytes) }
       sessions = value.sessions.map {
         Classification(
@@ -594,7 +602,7 @@ enum DreamRunEncoding {
 
     func domain() throws -> PreparationProvenance {
       try PreparationProvenance(
-        stripping: stripping.map {
+        isToolEvidenceIncluded: isToolEvidenceIncluded ?? false, stripping: stripping.map {
           PreparationStrippingInput(kind: $0.kind, name: $0.name, bytes: $0.bytes)
         },
         sessions: sessions.map {
@@ -898,6 +906,7 @@ extension DreamRunEncoding {
   }
 
   private struct ContextPayload: Decodable {
+    let relatedBatches: [Data]?
     let deviceKey: String?
     let projectBindings: [String: String]?
     let schemaVersion: Int
@@ -1061,7 +1070,10 @@ extension DreamRunEncoding {
         run: run, snapshot: snapshot, scopes: scopes,
         owners: payload.owners.map { try $0.domain() }, addedDate: payload.date,
         limits: limits, limitations: payload.limitations, deviceKey: payload.deviceKey,
-        projectBindings: payload.projectBindings ?? [:])
+        projectBindings: payload.projectBindings ?? [:],
+        relatedBatches: try (payload.relatedBatches ?? []).map {
+          try JSONDecoder().decode(Batch.self, from: $0).domain()
+        })
       guard context.canonicalBytes == bytes else { throw DreamRunError.corruption }
       return context
     } catch let error as DreamRunError { throw error } catch { throw DreamRunError.corruption }

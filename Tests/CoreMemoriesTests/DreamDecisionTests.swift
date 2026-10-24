@@ -16,7 +16,7 @@ private struct DecisionFixture {
   init(
     document: String = "# Memory\n", texts: [String] = ["Use green buttons, not blue."],
     projectKeys: [String] = [], cwd: String = "/synthetic/removed-project",
-    isAnswerIncluded: Bool = false
+    isAnswerIncluded: Bool = false, isToolEvidenceIncluded: Bool = false
   ) throws {
     store = try Fixture()
     try store.write(document, path: "MEMORY.md")
@@ -36,6 +36,15 @@ private struct DecisionFixture {
               ["type": "other", "label": "Other preference"],
             ])))
     }
+    if isToolEvidenceIncluded {
+      lines += [
+        dreamAssistant("calls", nil, dreamOld, [
+          dreamText("Agent text"), dreamCall("c1", "read", ["path": "src/A.swift"]),
+          dreamCall("c2", "read", ["path": "src/B.swift"]),
+        ]),
+        dreamResult("result", "calls", call: "c1", tool: "read", "Synthetic output"),
+      ]
+    }
     lines += [
       dreamAssistant("assistant", nil, dreamOld, [dreamText("Not primary")]),
       dreamJSON([
@@ -53,7 +62,8 @@ private struct DecisionFixture {
         + dreamUser("childtext", nil, dreamOld, "Not primary") + "\n",
       path: "--fixture--/child.jsonl", at: sessions)
     let batch = try SessionReader(sessions: sessions, snippets: nil, environment: [:]).prepare(
-      progress: DreamProgress(), limits: DreamInputLimits())
+      progress: DreamProgress(), limits: DreamInputLimits(),
+      isToolEvidenceIncluded: isToolEvidenceIncluded, isSourceScrubbed: isToolEvidenceIncluded)
     let base = try store.store.approvedCommit()
     let selection = try DreamSelectedCall(
       provider: "synthetic", modelID: "fixture", thinkingLevel: "off")
@@ -1142,4 +1152,72 @@ func dreamDecisionNativeBlockRangesKeepOriginalLineEndings(ending: String) throw
       #expect(try DreamDecision.validate(response: response, context: context).plans.count == 1)
     }
   }
+}
+
+@Test func dreamDecisionRelatedWindowsSharePinnedCatalogueAndRetainConditionalConflicts() throws {
+  let fixture = try DecisionFixture(texts: ["Use green unless offline."])
+  defer { fixture.clean() }
+  let prior = try DecisionFixture(texts: ["Use green unless offline.", "Use blue when offline."])
+  defer { prior.clean() }
+  let scopes = prior.run.batch.evidence.map {
+    PinnedEvidenceScope(source: $0.id, projectScope: $0.projectScope,
+      resolution: .outsideGit(isGlobalEligible: true))
+  }
+  let context = try DreamDecisionContext(run: fixture.run, snapshot: fixture.snapshot,
+    scopes: scopes, owners: [], addedDate: "2026-01-02", relatedBatches: [prior.run.batch])
+  #expect(context.primaryCatalogue.count == 2)
+  let restored = try DreamRunEncoding.context(bytes: context.canonicalBytes, run: fixture.run)
+  #expect(restored.contextHash == context.contextHash)
+  #expect(restored.primaryCatalogue.map(\.witness) == context.primaryCatalogue.map(\.witness))
+  #expect(context.contextHash != (try fixture.context()).contextHash)
+  let source = context.primaryCatalogue[0].id
+  let conflict = context.primaryCatalogue[1].id
+  var proposal = decisionAdd(source, text: "Use green unless offline.")
+  proposal["conditions"] = [["source": decisionSource(source), "explanation": "Unless offline."]]
+  proposal["contradictions"] = [["kind": "primary", "source": decisionSource(conflict),
+    "explanation": "Offline is a distinct condition, not an unconditional green preference."]]
+  var other = decisionAdd(conflict, text: "Use blue when offline.")
+  other["conditions"] = [["source": decisionSource(conflict), "explanation": "When offline."]]
+  let response = try fixture.response([proposal, other], context: context)
+  let result = try DreamDecision.validate(response: response, context: context)
+  #expect(result.plans.count == 1)
+  #expect(result.plans[0].sources.count == 2)
+  #expect(result.plans[0].reason.contains("conditions"))
+  #expect(result.plans[0].contradictions.contains("Offline is a distinct condition"))
+  let message = try #require(try context.requestMessages(timestampMilliseconds: 0).first)
+  let payload = try #require(try JSONSerialization.jsonObject(with: Data(message.text.utf8))
+    as? [String: Any])
+  #expect((payload["primaryEvidence"] as? [[String: Any]])?.count == 2)
+  #expect((payload["connectedWindowBindings"] as? [String])?.count == 2)
+  #expect(throws: (any Error).self) {
+    try DreamDecisionContext(run: fixture.run, snapshot: fixture.snapshot,
+      scopes: Array(scopes.prefix(1)), owners: [], addedDate: "2026-01-02",
+      relatedBatches: [prior.run.batch])
+  }
+  proposal["conditions"] = [["source": decisionSource(conflict), "explanation": "Wrong support."]]
+  #expect(throws: (any Error).self) {
+    try DreamDecision.validate(response: fixture.response([proposal, other], context: context),
+      context: context)
+  }
+}
+
+@Test func dreamDecisionFrozenToolEvidenceRetainsKindAndIsLabeledAsToolActivity() throws {
+  let fixture = try DecisionFixture(isToolEvidenceIncluded: true)
+  defer { fixture.clean() }
+  #expect(fixture.run.batch.evidence.filter { $0.kind == .toolCall }.map { $0.id.part } == [1, 2])
+  #expect(fixture.run.batch.evidence.filter { $0.kind == .toolResult }.count == 1)
+  let context = try fixture.context()
+  let message = try #require(try context.requestMessages(timestampMilliseconds: 0).first)
+  let payload = try #require(try JSONSerialization.jsonObject(with: Data(message.text.utf8))
+    as? [String: Any])
+  let evidence = try #require(payload["primaryEvidence"] as? [[String: Any]])
+  let tools = evidence.filter { ["toolCall", "toolResult"].contains($0["kind"] as? String ?? "") }
+  #expect(tools.count == 3)
+  #expect(tools.allSatisfy { $0["isToolActivity"] as? Bool == true && $0["locator"] != nil })
+  #expect(DreamDecisionContext.systemPrompt.contains("do not require repetition"))
+  #expect(DreamDecisionContext.systemPrompt.contains("never human instructions"))
+  let decisions = context.primaryCatalogue.map { decisionAdd($0.id) }
+  let result = try DreamDecision.validate(
+    response: fixture.response(decisions, context: context), context: context)
+  #expect(result.plans[0].sources.count == context.primaryCatalogue.count)
 }

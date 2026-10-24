@@ -30,7 +30,7 @@ private struct PromptRelocationFixture {
       memoryRepository: fixture.memory,
       strippingRoots: (isSnippetsPresent ? [fixture.snippets] : []) + [prompts])
     let result = try store.run(
-      selection: fixture.selection, sourceRoles: roles,
+      selection: fixture.selection, sourceRoles: roles, protect: { _ in },
       prepare: { progress, sources in
         try SessionReader(
           sessions: sources.sessions, snippets: sources.snippets,
@@ -74,7 +74,7 @@ private struct PromptRelocationFixture {
     call: (DreamModelRequest) throws -> DreamCompletedResponse = transactionNotes
   ) throws -> DreamTransactionResult {
     try (store ?? self.store()).run(
-      selection: transaction.selection, sourceRoles: roles,
+      selection: transaction.selection, sourceRoles: roles, protect: { _ in },
       prepare: { progress, sources in
         try SessionReader(
           sessions: sources.sessions, snippets: sources.snippets,
@@ -429,6 +429,7 @@ struct PromptSourceRelocationTests {
       try store.run(
         selection: relocation.transaction.selection,
         sourceRoles: DreamSourceRoles(isSnippetsPresent: false, isPromptsPresent: true),
+        protect: { _ in },
         prepare: { _, _ in throw MemoryError("must not prepare") }, call: transactionUncalled)
     }
   }

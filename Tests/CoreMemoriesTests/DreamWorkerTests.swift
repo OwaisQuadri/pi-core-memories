@@ -57,16 +57,27 @@ final class DreamWorkerProcess {
   func closeInput() throws { try input.fileHandleForWriting.close() }
 
   var progressFrames: [[String: Any]] = []
+  var isProtectingAutomatically = true
 
   func frame() throws -> [String: Any] {
     while true {
       if let newline = buffered.firstIndex(of: 10) {
         let bytes = buffered[..<newline]
         buffered.removeSubrange(...newline)
-        let frame = try #require(try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any])
+        let frame = try #require(
+          try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any])
+        if frame["type"] as? String == "sourceProtectionRequest", isProtectingAutomatically {
+          try send(workerProtectionReply(frame))
+          continue
+        }
         if frame["type"] as? String == "progress" {
           progressFrames.append(frame)
-          #expect(Set(frame.keys) == ["version", "type", "invocationID", "backlogBytes", "backlogLimitBytes", "plannedBytes", "completedBytes", "undreamtBytes", "nextBytes", "repeatedRecords", "estimateSeconds"])
+          #expect(
+            Set(frame.keys) == [
+              "version", "type", "invocationID", "backlogBytes", "backlogLimitBytes",
+              "plannedBytes", "completedBytes", "undreamtBytes", "nextBytes", "repeatedRecords",
+              "estimateSeconds",
+            ])
           continue
         }
         return frame
@@ -107,7 +118,7 @@ private func workerBytes(_ object: [String: Any]) throws -> Data {
     withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]) + Data([10])
 }
 
-private func workerStart(
+func workerStart(
   _ fixture: TransactionFixture, resume: String = "inspectOrContinue", sessions: URL? = nil,
   snippets: URL? = nil, isStripping: Bool = true
 ) -> [String: Any] {
@@ -123,6 +134,16 @@ private func workerStart(
       "provider": fixture.selection.provider, "modelID": fixture.selection.modelID,
       "thinkingLevel": fixture.selection.thinkingLevel,
     ], "resume": resume, "batchTextBytes": 262_144,
+  ]
+}
+
+func workerProtectionReply(_ request: [String: Any], pieces: [String]? = nil) -> [String: Any] {
+  let checked = pieces ?? (request["pieces"] as! [String])
+  return [
+    "version": 1, "type": "sourceProtectionResult", "invocationID": request["invocationID"]!,
+    "requestID": request["requestID"]!, "inputDigest": request["inputDigest"]!,
+    "status": "checked", "policy": "pi-credentials/redact-v1", "pieces": checked,
+    "outputDigest": DreamSourceProtection.digest(checked).rawValue,
   ]
 }
 

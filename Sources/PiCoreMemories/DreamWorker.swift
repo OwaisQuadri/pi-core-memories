@@ -209,12 +209,18 @@ private struct WorkerStart {
 
 private final class WorkerInput: @unchecked Sendable {
   static let maximumStartBytes = 65_536
-  static let maximumReplyBytes = 262_144 * 6 + 8192
-  static let maximumAggregateBytes = maximumStartBytes + maximumReplyBytes + 2048
+  static let maximumReplyBytes = DreamSourceProtection.maximumOutputBytes * 6 + 8192
+  static let maximumProtectionRequests = 16
+  static let maximumAggregateBytes =
+    maximumStartBytes + maximumReplyBytes * maximumProtectionRequests + 262_144 * 6 + 8192
   private let condition = NSCondition()
   private var start: WorkerStart?
   private var request: DreamModelRequest?
   private var reply: String?
+  private var protectionRequest: (id: String, digest: String, pieces: [String])?
+  private var protectionReply: [String]?
+  private var protectionFailure: DreamSourceProtectionError?
+  private var protectionCount = 0
   private var failure: WorkerError?
   private var isStopped = false
   private var isCancelledFlag = false
@@ -268,6 +274,81 @@ private final class WorkerInput: @unchecked Sendable {
     return try DreamCompletedResponse(text: reply)
   }
 
+  func protect(_ pieces: [String], invocationID: String) throws {
+    try DreamSourceProtection.validate(
+      pieces, maximumBytes: DreamSourceProtection.maximumInputBytes)
+    let id = UUID().uuidString.lowercased()
+    let digest = DreamSourceProtection.digest(pieces).rawValue
+    condition.lock()
+    guard protectionRequest == nil, request == nil, failure == nil, !isCancelledFlag,
+      protectionCount < Self.maximumProtectionRequests
+    else {
+      condition.unlock()
+      throw DreamSourceProtectionError.unavailable
+    }
+    protectionCount += 1
+    protectionRequest = (id, digest, pieces)
+    protectionReply = nil
+    protectionFailure = nil
+    condition.unlock()
+    try WorkerOutput.emit(
+      [
+        "version": 1, "type": "sourceProtectionRequest", "invocationID": invocationID,
+        "requestID": id, "inputDigest": digest, "pieces": pieces,
+      ], maximum: DreamSourceProtection.maximumInputBytes * 6 + 8192)
+    condition.lock()
+    defer { condition.unlock() }
+    let deadline = Date().addingTimeInterval(10)
+    while protectionReply == nil, protectionFailure == nil, failure == nil, !isCancelledFlag {
+      if !condition.wait(until: deadline) {
+        isCancelledFlag = true
+        throw DreamSourceProtectionError.timeout
+      }
+    }
+    guard failure == nil, !isCancelledFlag else { throw DreamSourceProtectionError.cancelled }
+    if let protectionFailure { throw protectionFailure }
+    guard let protectionReply else { throw DreamSourceProtectionError.invalidReply }
+    try DreamSourceProtection.requireUnchanged(pieces, protectionReply)
+    protectionRequest = nil
+    self.protectionReply = nil
+  }
+
+  private func consumeProtection(_ object: [String: Any]) throws {
+    guard let expected = protectionRequest, protectionReply == nil, protectionFailure == nil,
+      !isCancelReceived,
+      try WorkerJSON.identifier(object, "requestID") == expected.id,
+      try WorkerJSON.identifier(object, "inputDigest") == expected.digest
+    else { throw WorkerError.protocolFailure }
+    let status = try WorkerJSON.text(object, "status", maximum: 16)
+    let keys: Set<String> = [
+      "version", "type", "invocationID", "requestID", "inputDigest", "status",
+    ]
+    if status == "blocked" {
+      try WorkerJSON.fields(object, keys.union(["code"]))
+      let code = try WorkerJSON.text(object, "code", maximum: 32)
+      guard
+        [
+          "not-ready", "unavailable", "timeout", "cancelled", "invalid-input", "invalid-output",
+          "failed",
+        ].contains(code)
+      else { throw WorkerError.protocolFailure }
+      protectionFailure = .blocked
+    } else {
+      try WorkerJSON.fields(object, keys.union(["policy", "pieces", "outputDigest"]))
+      guard status == "checked",
+        try WorkerJSON.text(object, "policy") == "pi-credentials/redact-v1",
+        let pieces = object["pieces"] as? [String], pieces.count == expected.pieces.count
+      else { throw WorkerError.protocolFailure }
+      try DreamSourceProtection.validate(
+        pieces, maximumBytes: DreamSourceProtection.maximumOutputBytes)
+      guard
+        try WorkerJSON.identifier(object, "outputDigest")
+          == DreamSourceProtection.digest(pieces).rawValue
+      else { throw WorkerError.protocolFailure }
+      protectionReply = pieces
+    }
+  }
+
   private func consume(_ bytes: Data) throws {
     let object = try WorkerJSON.object(bytes)
     let type = try WorkerJSON.header(object)
@@ -287,6 +368,11 @@ private final class WorkerInput: @unchecked Sendable {
       isCancelledFlag = true
       return
     }
+    if type == "sourceProtectionResult" {
+      try consumeProtection(object)
+      return
+    }
+    guard protectionRequest == nil else { throw WorkerError.protocolFailure }
     guard let request, !isReplyReceived, !isCancelReceived,
       type == "modelResponse" || type == "modelFailure"
     else { throw WorkerError.protocolFailure }
@@ -357,7 +443,9 @@ private final class WorkerInput: @unchecked Sendable {
         try consume(frame)
         frame.removeAll(keepingCapacity: true)
       } else {
-        if start != nil && (request == nil || isReplyReceived) { isCancelledFlag = true }
+        if start != nil && protectionRequest == nil && (request == nil || isReplyReceived) {
+          isCancelledFlag = true
+        }
         let maximum = start == nil ? Self.maximumStartBytes : Self.maximumReplyBytes
         guard frame.count < maximum else { throw WorkerError.protocolFailure }
         frame.append(byte)
@@ -500,13 +588,15 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
       selection: start.selection, resume: start.resume,
       sourceRoles: DreamSourceRoles(
         isSnippetsPresent: start.snippets != nil, isPromptsPresent: start.prompts != nil),
+      protect: { try input.protect($0, invocationID: start.invocationID) },
       prepare: { progress, sources in
         guard !input.isCancelled else { throw WorkerError.cancelled }
         return try SessionReader(
           sessions: sources.sessions, snippets: sources.snippets, prompts: sources.prompts
         )
-        .prepare(
+        .prepareProtected(
           progress: progress, limits: DreamInputLimits(maximumBatchBytes: start.batchTextBytes),
+          protect: { try input.protect($0, invocationID: start.invocationID) },
           backlog: { backlog = $0 }, isCancelled: { input.isCancelled })
       },
       call: { request in
@@ -572,13 +662,24 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
           invocationID, nil,
           reason: input.isProtocolFailure
             ? "protocolFailure"
-            : ((error as? WorkerError) == .cancelled ? "cancelled" : "workerFailure"),
-          detail: String(describing: error), isBusy: (error as? DreamRunError) == .busy)
+            : ((error as? WorkerError) == .cancelled
+              ? "cancelled"
+              : (error as? DreamSourceProtectionError).map {
+                "sourceProtection:" + String(describing: $0)
+              } ?? "workerFailure"),
+          detail: [
+            "no snippet bodies in --snippets", "no prompt templates in --prompts",
+            "unsafe dream state",
+          ].contains(
+            String(describing: error)) ? String(describing: error) : nil,
+          isBusy: (error as? DreamRunError) == .busy)
         return 0
       } catch {}
     }
     try? FileHandle.standardError.write(
-      contentsOf: Data("dream-worker: \(String(describing: error).prefix(1024))\n".utf8))
+      contentsOf: Data(
+        "dream-worker: \(input.isProtocolFailure || (error as? WorkerError) == .protocolFailure ? "protocolFailure" : "workerFailure")\n"
+          .utf8))
     return 1
   }
 }

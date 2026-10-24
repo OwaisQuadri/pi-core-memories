@@ -994,12 +994,13 @@ public final class DreamRunStore {
   ) throws -> DreamTransactionResult {
     try performRun(
       selection: selection, resume: resume, sourceRoles: nil,
-      prepare: { progress, _ in try prepare(progress) }, call: call, observe: observe)
+      prepare: { progress, _ in try prepare(progress) }, protect: nil, call: call, observe: observe)
   }
 
   package func run(
     selection: DreamSelectedCall, resume: DreamResumeAction = .inspectOrContinue,
     sourceRoles: DreamSourceRoles,
+    protect: @escaping ([String]) throws -> Void,
     prepare: (DreamProgress, DreamFreshSources) throws -> PreparedSessionBatch,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void = { _, _, _, _ in }
@@ -1009,12 +1010,13 @@ public final class DreamRunStore {
       prepare: { progress, sources in
         guard let sources else { throw DreamRunError.unsafeState }
         return try prepare(progress, sources)
-      }, call: call, observe: observe)
+      }, protect: protect, call: call, observe: observe)
   }
 
   private func performRun(
     selection: DreamSelectedCall, resume: DreamResumeAction, sourceRoles: DreamSourceRoles?,
     prepare: (DreamProgress, DreamFreshSources?) throws -> PreparedSessionBatch,
+    protect: (([String]) throws -> Void)?,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void
   ) throws -> DreamTransactionResult {
@@ -1041,7 +1043,7 @@ public final class DreamRunStore {
     var observedInputBytes = 0
     let result = try runLocked(
       selection: selection, resume: resume, isLockCreated: ownership.isCreated,
-      sourceRoles: sourceRoles, prepare: prepare,
+      sourceRoles: sourceRoles, prepare: prepare, protect: protect,
       call: { request in
         let started = ContinuousClock.now
         let response = try call(request)
@@ -1087,6 +1089,7 @@ public final class DreamRunStore {
     selection: DreamSelectedCall, resume: DreamResumeAction, isLockCreated: Bool,
     sourceRoles: DreamSourceRoles?,
     prepare: (DreamProgress, DreamFreshSources?) throws -> PreparedSessionBatch,
+    protect: (([String]) throws -> Void)?,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool) throws -> Void
   ) throws -> DreamTransactionResult {
@@ -1150,6 +1153,7 @@ public final class DreamRunStore {
       guard let runID = chain.record.runID else { throw DreamRunError.corruption }
       let prior = try loadAdmission(generation: progress.generation - 1, chain: chain)
       guard prior.run.runID == runID else { throw DreamRunError.corruption }
+      try checkProtection(prior, protect: protect)
       try observe(prior.run.progress, prior.run.batch, false)
       return try finish(
         prior, chain: chain, isRecovered: true, isCommitted: true)
@@ -1182,6 +1186,7 @@ public final class DreamRunStore {
         return .noNewRecords(
           generation: progress.generation, unfinishedTails: batch.unfinishedTails)
       }
+      if let protect { try protect(DreamSourceProtection.pieces(batch)) }
       guard progress.generation < UInt64.max else { throw DreamRunError.staleGeneration }
       let memory = try MemoryStore(repo: memoryRepository)
       let base = try memory.approvedCommit()
@@ -1194,7 +1199,7 @@ public final class DreamRunStore {
         bytes: input, runID: runID, inputHash: SourceDigest(bytes: input),
         bindingHash: bindingHash, limits: limits)
       let date = clock()
-      let context = try capture(run: run, memory: memory, date: date)
+      let context = try capture(run: run, memory: memory, date: date, protect: protect)
       let milliseconds = date.timeIntervalSince1970 * 1_000
       guard milliseconds.isFinite, milliseconds >= Double(Int64.min),
         milliseconds < Double(Int64.max)
@@ -1230,6 +1235,7 @@ public final class DreamRunStore {
         directory: directory)
       try save(generation: progress.generation, hash: chain.hash, sealed: sealed)
     }
+    if isRecovered { try checkProtection(sealed, protect: protect) }
     if isRecovered, cached?.admissionHash != sealed.admissionHash.rawValue {
       try save(generation: sealed.run.progress.generation, hash: chain.hash, sealed: sealed)
     }
@@ -1320,7 +1326,23 @@ public final class DreamRunStore {
     return try finish(sealed, chain: chain, isRecovered: isRecovered, isCommitted: false)
   }
 
-  private func capture(run: FrozenDreamRun, memory: MemoryStore, date: Date) throws
+  private func checkProtection(
+    _ sealed: SealedRun, protect: (([String]) throws -> Void)?
+  ) throws {
+    guard let protect else { return }
+    try protect(DreamSourceProtection.pieces(sealed.run.batch))
+    for bytes in sealed.context.connectedEvidence?.relatedBatchBytes ?? [] {
+      try protect(DreamRunEncoding.protectionPieces(batchBytes: bytes))
+    }
+    try protect(
+      DreamSourceProtection.authority(sealed.context.snapshot, owners: sealed.context.owners))
+    try protect([sealed.request.systemPrompt] + sealed.request.messages.map(\.text))
+  }
+
+  private func capture(
+    run: FrozenDreamRun, memory: MemoryStore, date: Date,
+    protect: (([String]) throws -> Void)?
+  ) throws
     -> DreamDecisionContext
   {
     let decisionLimits = try DreamDecisionLimits(
@@ -1370,10 +1392,14 @@ public final class DreamRunStore {
     ).sorted()
     let snapshot = try memory.decisionSnapshot(
       base: run.approvedBase, projectKeys: keys, limits: decisionLimits, deviceKey: deviceKey)
+    if let protect { try protect(DreamSourceProtection.authority(snapshot, owners: [])) }
     var owners: [PinnedOwnerInput] = []
     var attempted: Set<Data> = []
     var totalBytes = 0
     func captureOwner(_ file: URL, scope: DreamMemoryScope) throws -> String? {
+      guard !DreamSourceProtection.isProtectedPath(file.path) else {
+        throw DreamSourceProtectionError.blocked
+      }
       guard attempted.insert(Data(file.path.utf8)).inserted else { return nil }
       let parent: URL
       do { parent = try Self.canonicalExisting(file.deletingLastPathComponent()) } catch {
@@ -1429,6 +1455,7 @@ public final class DreamRunStore {
       guard let text = String(data: bytes, encoding: .utf8), !text.contains("\0") else {
         throw DreamRunError.unsafeState
       }
+      if let protect { try protect([canonical.path, text]) }
       let key = SourceDigest(bytes: Data(canonical.path.utf8)).rawValue
       let reference = canonical.lastPathComponent + " (" + key + ")"
       owners.append(
@@ -1564,6 +1591,7 @@ public final class DreamRunStore {
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = TimeZone(secondsFromGMT: 0)
     formatter.dateFormat = "yyyy-MM-dd"
+    if let protect { try protect(DreamSourceProtection.authority(snapshot, owners: owners)) }
     let context = try DreamDecisionContext(
       run: run, snapshot: snapshot, scopes: scopes, owners: owners,
       addedDate: formatter.string(from: date), limits: decisionLimits,

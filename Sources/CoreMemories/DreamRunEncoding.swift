@@ -46,9 +46,10 @@ enum DreamRunEncoding {
     do {
       let decoder = JSONDecoder()
       let schema = try decoder.decode(Schema.self, from: bytes)
-      guard schema.schemaVersion == 2
-        || (type == Completion.self && schema.schemaVersion == 3)
-        || (type == RecoveryCheckpoint.self && schema.schemaVersion == 1)
+      guard
+        schema.schemaVersion == 2
+          || (type == Completion.self && schema.schemaVersion == 3)
+          || (type == RecoveryCheckpoint.self && schema.schemaVersion == 1)
       else { throw DreamRunError.unsupportedSchema }
       let value = try decoder.decode(type, from: bytes)
       let encoded = try encode(value)
@@ -561,6 +562,10 @@ enum DreamRunEncoding {
     }
   }
 
+  static func protectionPieces(batchBytes: Data) throws -> [String] {
+    try DreamSourceProtection.pieces(JSONDecoder().decode(Batch.self, from: batchBytes).domain())
+  }
+
   static func batchBinding(_ batch: PreparedSessionBatch, maximumBytes: Int) throws -> Data {
     let bytes = try encode(Batch(batch))
     guard bytes.count <= maximumBytes else { throw DreamRunError.limitExceeded }
@@ -602,7 +607,8 @@ enum DreamRunEncoding {
 
     func domain() throws -> PreparationProvenance {
       try PreparationProvenance(
-        isToolEvidenceIncluded: isToolEvidenceIncluded ?? false, stripping: stripping.map {
+        isToolEvidenceIncluded: isToolEvidenceIncluded ?? false,
+        stripping: stripping.map {
           PreparationStrippingInput(kind: $0.kind, name: $0.name, bytes: $0.bytes)
         },
         sessions: sessions.map {

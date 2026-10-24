@@ -240,10 +240,24 @@ extension SessionReader {
       isCancelled: isCancelled)
   }
 
+  package func prepareProtected(
+    progress: DreamProgress, limits: DreamInputLimits,
+    protect: @escaping ([String]) throws -> Void,
+    backlog: (DreamBacklog) -> Void = { _ in },
+    isCancelled: () -> Bool = { false }
+  ) throws -> PreparedSessionBatch {
+    try prepare(
+      progress: progress, limits: limits,
+      modifiedAfter: Date().addingTimeInterval(-Self.dreamWindow),
+      maximumBacklogBytes: Self.dreamBacklogBytes, protect: protect,
+      beforeRead: { _ in }, backlog: backlog, isCancelled: isCancelled)
+  }
+
   func prepare(
     progress: DreamProgress, limits: DreamInputLimits, modifiedAfter: Date = .distantPast,
     maximumBacklogBytes: UInt64 = .max,
     isToolEvidenceIncluded: Bool = false, isSourceScrubbed: Bool = false,
+    protect: (([String]) throws -> Void)? = nil,
     beforeRead: (URL) throws -> Void,
     backlog: (DreamBacklog) -> Void = { _ in },
     isCancelled: () -> Bool = { false }
@@ -256,6 +270,10 @@ extension SessionReader {
       try beforeRead(url)
     }
     let stripping = try preparationStrippingInputs(beforeRead: checkedRead)
+    if let protect {
+      try protect(
+        try stripping.inputs.flatMap { [$0.name, try DreamSourceProtection.text($0.bytes)] })
+    }
     var modified: [SourceRelativePath: Date] = [:]
     let tracked = Dictionary(uniqueKeysWithValues: progress.positions.map { ($0.relativePath, $0) })
     var captured: [CapturedSession] = []
@@ -290,6 +308,12 @@ extension SessionReader {
         }
         guard complete > 0 else { continue }
         let session = try CapturedSession(path: path, bytes: data, completeBytes: complete)
+        if let protect {
+          try session.requireAdmissibleReadProvenance()
+          try protect(
+            [path.rawValue] + (try session.records.map { try DreamSourceProtection.text($0.bytes) })
+          )
+        }
         guard identities.insert(session.id).inserted else {
           throw MemoryError("duplicate session identity: \(session.id.rawValue)")
         }
@@ -312,6 +336,7 @@ extension SessionReader {
     guard Set(tracked.keys).isSubset(of: discovered) else {
       throw MemoryError("missing tracked session file")
     }
+    let isIncludingTools = isToolEvidenceIncluded || protect != nil
     captured.sort {
       modified[$0.path]! != modified[$1.path]!
         ? modified[$0.path]! > modified[$1.path]! : $0.path.rawValue < $1.path.rawValue
@@ -350,7 +375,7 @@ extension SessionReader {
         let parent = record.object["parentId"] as? String
         let extracted = try record.extract(
           session: session, snippets: stripping.snippets, templates: stripping.templates,
-          isToolEvidenceIncluded: isToolEvidenceIncluded,
+          isToolEvidenceIncluded: isIncludingTools,
           agentContext: { PreparedChainLink.context(parent: parent, chain: chain) })
         if let id = record.object["id"] as? String {
           chain[id] = PreparedChainLink(parent: parent, text: extracted.agentText)
@@ -390,8 +415,9 @@ extension SessionReader {
                 && ($0.agentContext?.utf8.count ?? 0) <= limits.maximumEvidenceBytes
             })
           else { throw MemoryError("oversized dream evidence: \(session.path.rawValue)") }
-          guard !extracted.evidence.contains(where: { $0.kind == .toolCall || $0.kind == .toolResult })
-            || kept <= limits.maximumBatchBytes
+          guard
+            !extracted.evidence.contains(where: { $0.kind == .toolCall || $0.kind == .toolResult })
+              || kept <= limits.maximumBatchBytes
           else { throw MemoryError("oversized dream tool record: \(session.path.rawValue)") }
           guard record.bytes.count <= limits.maximumRecordBytes else {
             throw MemoryError("oversized dream record: \(session.path.rawValue)")
@@ -430,7 +456,7 @@ extension SessionReader {
       exactSourceRecords: records, evidence: evidence, selections: selections,
       unfinishedTails: tails, isBacklog: isBacklog,
       provenance: PreparationProvenance(
-        isToolEvidenceIncluded: isToolEvidenceIncluded, stripping: stripping.inputs,
+        isToolEvidenceIncluded: isIncludingTools, stripping: stripping.inputs,
         sessions: captured.filter { session in
           records.contains { $0.witness.relativePath == session.path }
         }.map { session in
@@ -459,6 +485,10 @@ extension SessionReader {
       var bodies: [String] = []
       for name in try directory.names() where name.lowercased().hasSuffix(".md") {
         try beforeRead(folder.appendingPathComponent(name))
+        guard !DreamSourceProtection.isProtectedPath(folder.appendingPathComponent(name).path)
+        else {
+          throw DreamSourceProtectionError.blocked
+        }
         let bytes = try directory.capture(name, isFollowingLinks: true)
         guard let raw = String(data: bytes, encoding: .utf8) else {
           throw MemoryError("invalid stripping input UTF-8")
@@ -681,6 +711,10 @@ private struct CapturedSession {
   let classificationHash: SourceDigest
   let projectScope: String
 
+  func requireAdmissibleReadProvenance() throws {
+    try DreamSourceProtection.requireAdmissibleReadProvenance(records.map(\.object))
+  }
+
   init(path: SourceRelativePath, bytes: Data, completeBytes: Int) throws {
     var records: [PreparedRecord] = []
     var start = 0
@@ -831,12 +865,14 @@ private struct PreparedRecord {
         agentContext: context)
     }
     func toolText(_ fields: [String: Any]) throws -> String {
-      String(decoding: try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
+      String(
+        decoding: try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
         as: UTF8.self)
     }
     if role == "assistant" {
       guard let blocks = message["content"] as? [[String: Any]] else {
-        return excluded(.assistantV1, agentText: try textContent(message["content"], isHuman: false))
+        return excluded(
+          .assistantV1, agentText: try textContent(message["content"], isHuman: false))
       }
       var units: [PrimaryTextEvidence] = []
       for (part, block) in blocks.enumerated() where block["type"] as? String == "toolCall" {
@@ -844,12 +880,15 @@ private struct PreparedRecord {
           let name = block["name"] as? String, !name.isEmpty,
           let arguments = block["arguments"] as? [String: Any]
         else { throw MemoryError("invalid primary tool call") }
-        units.append(evidence(try toolText([
-          "toolCallID": id, "toolName": name, "arguments": arguments,
-        ]), kind: .toolCall, part: part))
+        units.append(
+          evidence(
+            try toolText([
+              "toolCallID": id, "toolName": name, "arguments": arguments,
+            ]), kind: .toolCall, part: part))
       }
       let agentText = try textContent(message["content"], isHuman: false)
-      return units.isEmpty ? excluded(.assistantV1, agentText: agentText)
+      return units.isEmpty
+        ? excluded(.assistantV1, agentText: agentText)
         : (.primaryEvidence(units.map(\.id)), units, [], agentText)
     }
     if role == "toolResult", message["toolName"] as? String != "ask_user_question" {
@@ -859,9 +898,10 @@ private struct PreparedRecord {
       else { throw MemoryError("invalid primary tool result") }
       let text = try textContent(message["content"], isHuman: false)
       guard !text.isEmpty else { return excluded(.attachmentOnlyV1) }
-      let unit = evidence(try toolText([
-        "toolCallID": id, "toolName": name, "text": text, "isError": isError,
-      ]), kind: .toolResult, part: 0)
+      let unit = evidence(
+        try toolText([
+          "toolCallID": id, "toolName": name, "text": text, "isError": isError,
+        ]), kind: .toolResult, part: 0)
       return (.primaryEvidence([unit.id]), [unit], [], nil)
     }
     if role == "user" {
@@ -883,7 +923,9 @@ private struct PreparedRecord {
     if let details = message["details"] as? [String: Any],
       let status = details["status"] as? String,
       ["policy-guidance", "automatic-policy-guidance"].contains(status)
-    { return excluded(.generatedV1) }
+    {
+      return excluded(.generatedV1)
+    }
     guard let details = message["details"] as? [String: Any],
       let status = details["status"] as? String,
       ["answered", "cancelled", "invalid", "unavailable"].contains(status)
@@ -1054,7 +1096,8 @@ extension SessionReader {
       }
       let extracted = try raw.extract(
         session: session, snippets: snippets, templates: templates,
-        isToolEvidenceIncluded: provenance.isToolEvidenceIncluded, agentContext: {
+        isToolEvidenceIncluded: provenance.isToolEvidenceIncluded,
+        agentContext: {
           batch.evidence.first { $0.witness == record.witness }?.agentContext
         })
       switch (record.disposition, extracted.disposition) {

@@ -48,7 +48,9 @@ struct Fixture {
   func cli(_ arguments: [String], input: Data = Data(), environment: [String: String] = [:]) throws
     -> CommandResult
   {
-    let path = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+    let path = try #require(
+      ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+        ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
     #expect(FileManager.default.isExecutableFile(atPath: path))
     return try runCommand(
       executable: URL(fileURLWithPath: path), arguments: arguments,

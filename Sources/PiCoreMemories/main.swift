@@ -16,6 +16,7 @@ func execute() throws -> Int32 {
   }
   if command == "dream-worker" { return executeDreamWorker(arguments: arguments) }
   if command == "memory-review-worker" { return executeMemoryReviewWorker(arguments: arguments) }
+  if command == "memory-queue-worker" { return executeMemoryQueueWorker(arguments: arguments) }
   if command == "memory-prepare-worker" {
     return try executeMemoryPrepareWorker(arguments: arguments)
   }

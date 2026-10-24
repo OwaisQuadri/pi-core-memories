@@ -25,6 +25,7 @@ package struct DreamFreshSources: Sendable {
   package let memory: URL
   package let snippets: URL?
   package let prompts: URL?
+  package var admittedViews: [DreamAdmittedView] = []
 }
 
 package enum PromptRelocationAuthorization: String, Codable, Sendable {

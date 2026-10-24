@@ -13,7 +13,9 @@ final class DreamWorkerProcess {
   private let deadline = Date().addingTimeInterval(20)
 
   init(arguments: [String] = ["dream-worker"]) throws {
-    let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+    let binary = try #require(
+      ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+        ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
     process.executableURL = URL(fileURLWithPath: binary)
     process.arguments = arguments
     process.environment = [
@@ -55,16 +57,29 @@ final class DreamWorkerProcess {
   func closeInput() throws { try input.fileHandleForWriting.close() }
 
   var progressFrames: [[String: Any]] = []
+  var isProtectingAutomatically = true
+  var protectionTransform: ([String]) -> [String] = { $0 }
 
   func frame() throws -> [String: Any] {
     while true {
       if let newline = buffered.firstIndex(of: 10) {
         let bytes = buffered[..<newline]
         buffered.removeSubrange(...newline)
-        let frame = try #require(try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any])
+        let frame = try #require(
+          try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any])
+        if frame["type"] as? String == "sourceProtectionRequest", isProtectingAutomatically {
+          try send(
+            workerProtectionReply(frame, pieces: protectionTransform(frame["pieces"] as! [String])))
+          continue
+        }
         if frame["type"] as? String == "progress" {
           progressFrames.append(frame)
-          #expect(Set(frame.keys) == ["version", "type", "invocationID", "backlogBytes", "backlogLimitBytes", "plannedBytes", "completedBytes", "undreamtBytes", "nextBytes", "repeatedRecords", "estimateSeconds"])
+          #expect(
+            Set(frame.keys) == [
+              "version", "type", "invocationID", "backlogBytes", "backlogLimitBytes",
+              "plannedBytes", "completedBytes", "undreamtBytes", "nextBytes", "repeatedRecords",
+              "estimateSeconds",
+            ])
           continue
         }
         return frame
@@ -105,7 +120,7 @@ private func workerBytes(_ object: [String: Any]) throws -> Data {
     withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]) + Data([10])
 }
 
-private func workerStart(
+func workerStart(
   _ fixture: TransactionFixture, resume: String = "inspectOrContinue", sessions: URL? = nil,
   snippets: URL? = nil, isStripping: Bool = true
 ) -> [String: Any] {
@@ -124,7 +139,17 @@ private func workerStart(
   ]
 }
 
-private func workerReply(_ request: [String: Any], text: String? = nil, category: String? = nil)
+func workerProtectionReply(_ request: [String: Any], pieces: [String]? = nil) -> [String: Any] {
+  let checked = pieces ?? (request["pieces"] as! [String])
+  return [
+    "version": 1, "type": "sourceProtectionResult", "invocationID": request["invocationID"]!,
+    "requestID": request["requestID"]!, "inputDigest": request["inputDigest"]!,
+    "status": "checked", "policy": "pi-credentials/redact-v1", "pieces": checked,
+    "outputDigest": DreamSourceProtection.digest(checked).rawValue,
+  ]
+}
+
+func workerReply(_ request: [String: Any], text: String? = nil, category: String? = nil)
   -> [String: Any]
 {
   var reply: [String: Any] = [
@@ -141,7 +166,7 @@ private func workerReply(_ request: [String: Any], text: String? = nil, category
   return reply
 }
 
-private func workerDecision(_ request: [String: Any], isProposal: Bool = false) throws -> String {
+func workerDecision(_ request: [String: Any], isProposal: Bool = false) throws -> String {
   let messages = try #require(request["messages"] as? [[String: Any]])
   let text = try #require(messages.first?["text"] as? String)
   let context = try #require(

@@ -5,6 +5,7 @@ The Pi integration loads approved memory and runs inspectable dreams.
 The Swift core uses Foundation, CryptoKit, and system Git without external Swift dependencies.
 
 See [build and setup](docs/native-app.md) for the app, command runtime, and Pi package.
+The [native finding queue protocol](docs/native-queue.md) defines durable conversational review, private choices, and blocked migration inventory.
 
 ## Store and documents
 

@@ -126,6 +126,7 @@ package final class MemoryReviewController {
         sourceBinding: try sources.reviewSourceBinding().rawValue, state: stateRoot.path,
         stateVolumeUUID: try MemoryReviewEncoding.volumeUUID(at: stateRoot),
         stateInode: UInt64(stateStatus.st_ino))
+      try MemoryQueueAuthority.verifyReview(git: Git(repo: repo, environment: environment), review: binding)
       let bytes = try MemoryReviewEncoding.encode(binding)
       if try directory.isPresent("root.json") {
         let existing = try directory.read(
@@ -755,6 +756,7 @@ package final class MemoryReviewController {
       try root.read("root.json", maximum: MemoryReviewEncoding.maximumFileBytes)
         == MemoryReviewEncoding.encode(binding)
     else { throw DreamRunError.unsafeState }
+    try MemoryQueueAuthority.verifyReview(git: store.reviewGit, review: binding)
     _ = try root.retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
   }
 

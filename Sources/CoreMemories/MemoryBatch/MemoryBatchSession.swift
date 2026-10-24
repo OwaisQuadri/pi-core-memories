@@ -174,8 +174,7 @@ package final class MemoryBatchSession {
   package func save() throws -> MemoryBatchSaveResult {
     try drafts.saveBatch(
       persistenceSnapshot, expectedDigest: expectedDurableDigest,
-      review: draft.batch!.isManualOnly ? nil : review,
-      checkout: checkout,
+      review: review, checkout: checkout,
       authorized: Set(items.filter(isAuthorized).map(\.itemID)),
       didPersist: { self.expectedDurableDigest = $0 })
   }

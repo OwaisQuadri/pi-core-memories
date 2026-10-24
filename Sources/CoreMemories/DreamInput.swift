@@ -95,7 +95,7 @@ public struct DreamProgress: Equatable, Sendable {
 }
 
 public enum PrimaryTextKind: String, Sendable {
-  case typed, typedSkillArguments, answered
+  case typed, typedSkillArguments, answered, toolCall, toolResult
 }
 
 public struct PrimaryTextID: Hashable, Sendable {
@@ -117,6 +117,7 @@ public struct PrimaryTextEvidence: Sendable {
   public let exactText: String
   public let witness: RecordWitness
   public let agentContext: String?
+  public var originalWitness: RecordWitness? = nil
 }
 
 public struct SelectionContext: Sendable {
@@ -129,6 +130,7 @@ public enum ExclusionReason: String, Sendable {
   case metadataV1, childV1, infrastructureV1, generatedV1, assistantV1, toolOutputV1
   case summaryV1, attachmentOnlyV1, skillOnlyV1, snippetOnlyV1, acknowledgementV1, emptyV1
   case selectionsOnlyV1, unansweredV1, unknownMarkupV1
+  case protectedSourceV1
 }
 
 public enum RecordDisposition: Sendable {
@@ -228,30 +230,65 @@ extension SessionReader {
     progress: DreamProgress, limits: DreamInputLimits,
     modifiedAfter: Date = Date().addingTimeInterval(-dreamWindow),
     maximumBacklogBytes: UInt64 = dreamBacklogBytes,
+    isToolEvidenceIncluded: Bool = false, isSourceScrubbed: Bool = false,
     backlog: (DreamBacklog) -> Void = { _ in },
     isCancelled: () -> Bool = { false }
   ) throws -> PreparedSessionBatch {
     try prepare(
       progress: progress, limits: limits, modifiedAfter: modifiedAfter,
-      maximumBacklogBytes: maximumBacklogBytes, beforeRead: { _ in }, backlog: backlog,
+      maximumBacklogBytes: maximumBacklogBytes,
+      isToolEvidenceIncluded: isToolEvidenceIncluded, isSourceScrubbed: isSourceScrubbed,
+      beforeRead: { _ in }, backlog: backlog,
       isCancelled: isCancelled)
+  }
+
+  package func prepareProtected(
+    progress: DreamProgress, limits: DreamInputLimits,
+    protect: @escaping ([String]) throws -> Void,
+    admit: @escaping ([String]) throws -> [String],
+    priorViews: [DreamAdmittedView] = [],
+    excludedSessionIDs: Set<String> = [],
+    backlog: (DreamBacklog) -> Void = { _ in },
+    isCancelled: () -> Bool = { false }
+  ) throws -> PreparedSessionBatch {
+    try prepare(
+      progress: progress, limits: limits,
+      modifiedAfter: Date().addingTimeInterval(-Self.dreamWindow),
+      maximumBacklogBytes: Self.dreamBacklogBytes, protect: protect, admit: admit,
+      priorViews: priorViews, excludedSessionIDs: excludedSessionIDs,
+      beforeRead: { _ in }, backlog: backlog, isCancelled: isCancelled)
   }
 
   func prepare(
     progress: DreamProgress, limits: DreamInputLimits, modifiedAfter: Date = .distantPast,
     maximumBacklogBytes: UInt64 = .max,
+    isToolEvidenceIncluded: Bool = false, isSourceScrubbed: Bool = false,
+    protect: (([String]) throws -> Void)? = nil,
+    admit: (([String]) throws -> [String])? = nil,
+    priorViews: [DreamAdmittedView] = [],
+    excludedSessionIDs: Set<String> = [],
     beforeRead: (URL) throws -> Void,
     backlog: (DreamBacklog) -> Void = { _ in },
     isCancelled: () -> Bool = { false }
   ) throws -> PreparedSessionBatch {
+    guard !isToolEvidenceIncluded || isSourceScrubbed else {
+      throw MemoryError("tool evidence requires caller-scrubbed source input")
+    }
     func checkedRead(_ url: URL) throws {
       if isCancelled() { throw CancellationError() }
       try beforeRead(url)
     }
-    let stripping = try preparationStrippingInputs(beforeRead: checkedRead)
+    let stripping = try preparationStrippingInputs(beforeRead: checkedRead, admit: admit)
+    if let protect {
+      try protect(
+        try stripping.inputs.flatMap { [$0.name, try DreamSourceProtection.text($0.bytes)] })
+    }
     var modified: [SourceRelativePath: Date] = [:]
-    let tracked = Dictionary(uniqueKeysWithValues: progress.positions.map { ($0.relativePath, $0) })
+    var tracked = Dictionary(uniqueKeysWithValues: progress.positions.map { ($0.relativePath, $0) })
     var captured: [CapturedSession] = []
+    var views: [DreamAdmittedView] = []
+    var originalData: [SourceRelativePath: Data] = [:]
+    var isUnadmittedBacklog = false
     var identities: Set<SessionIdentifier> = []
     var discovered: Set<SourceRelativePath> = []
     var tails: [UnfinishedSessionTail] = []
@@ -266,7 +303,23 @@ extension SessionReader {
         discovered.insert(path)
         guard modified[path] != nil else { continue }
         try checkedRead(file.directory.url.appendingPathComponent(file.name))
+        var header: Data?
+        if !excludedSessionIDs.isEmpty {
+          let bytes = try file.directory.capture(file.name, isHeaderOnly: true)
+          guard let object = try Self.decodeRecord(bytes) as? [String: Any],
+            object["type"] as? String == "session", let id = object["id"] as? String
+          else { throw MemoryError("invalid session header") }
+          _ = try SessionIdentifier(id)
+          if excludedSessionIDs.contains(id) {
+            modified[path] = nil
+            continue
+          }
+          header = bytes
+        }
         let data = try file.directory.capture(file.name)
+        guard header == nil || data.starts(with: header!) else {
+          throw MemoryError("session header changed during capture")
+        }
         let complete = data.lastIndex(of: 0x0A).map { $0 + 1 } ?? 0
         if complete < data.count {
           tails.append(
@@ -282,7 +335,23 @@ extension SessionReader {
           else { throw MemoryError("session prefix changed: \(path.rawValue)") }
         }
         guard complete > 0 else { continue }
-        let session = try CapturedSession(path: path, bytes: data, completeBytes: complete)
+        var session = try CapturedSession(path: path, bytes: data, completeBytes: complete)
+        if let admit {
+          try protect?([path.rawValue])
+          let prior = priorViews.first { $0.path == path.rawValue }
+          let view = try session.admitting(
+            prior: prior, cursor: tracked[path]?.completeBytes ?? 0, admit: admit)
+          isUnadmittedBacklog = isUnadmittedBacklog || view.originalCompleteBytes < UInt64(complete)
+          views.append(view)
+          originalData[path] = data
+          session = try CapturedSession(
+            path: path, bytes: view.bytes, completeBytes: view.bytes.count, admittedView: view)
+        } else if let protect {
+          try session.requireAdmissibleReadProvenance()
+          try protect(
+            [path.rawValue] + (try session.records.map { try DreamSourceProtection.text($0.bytes) })
+          )
+        }
         guard identities.insert(session.id).inserted else {
           throw MemoryError("duplicate session identity: \(session.id.rawValue)")
         }
@@ -305,6 +374,11 @@ extension SessionReader {
     guard Set(tracked.keys).isSubset(of: discovered) else {
       throw MemoryError("missing tracked session file")
     }
+    tracked = try Dictionary(
+      uniqueKeysWithValues: tracked.map { path, position in
+        (path, try views.first(where: { $0.path == path.rawValue })?.project(position) ?? position)
+      })
+    let isIncludingTools = isToolEvidenceIncluded || protect != nil
     captured.sort {
       modified[$0.path]! != modified[$1.path]!
         ? modified[$0.path]! > modified[$1.path]! : $0.path.rawValue < $1.path.rawValue
@@ -343,6 +417,7 @@ extension SessionReader {
         let parent = record.object["parentId"] as? String
         let extracted = try record.extract(
           session: session, snippets: stripping.snippets, templates: stripping.templates,
+          isToolEvidenceIncluded: isIncludingTools,
           agentContext: { PreparedChainLink.context(parent: parent, chain: chain) })
         if let id = record.object["id"] as? String {
           chain[id] = PreparedChainLink(parent: parent, text: extracted.agentText)
@@ -382,6 +457,10 @@ extension SessionReader {
                 && ($0.agentContext?.utf8.count ?? 0) <= limits.maximumEvidenceBytes
             })
           else { throw MemoryError("oversized dream evidence: \(session.path.rawValue)") }
+          guard
+            !extracted.evidence.contains(where: { $0.kind == .toolCall || $0.kind == .toolResult })
+              || kept <= limits.maximumBatchBytes
+          else { throw MemoryError("oversized dream tool record: \(session.path.rawValue)") }
           guard record.bytes.count <= limits.maximumRecordBytes else {
             throw MemoryError("oversized dream record: \(session.path.rawValue)")
           }
@@ -413,13 +492,20 @@ extension SessionReader {
       predecessorGeneration: progress.generation,
       readerSchemaVersion: Self.preparationSchemaVersion,
       strippingInputHash: stripping.hash,
-      positionsAfter: positions.values.sorted {
-        $0.relativePath.rawValue < $1.relativePath.rawValue
-      },
+      positionsAfter: try positions.values.map { position in
+        guard let view = views.first(where: { $0.path == position.relativePath.rawValue }),
+          let data = originalData[position.relativePath]
+        else { return position }
+        let offset = try view.originalOffset(admitted: position.completeBytes)
+        return SourcePosition(
+          relativePath: position.relativePath, sessionID: position.sessionID,
+          completeBytes: offset, prefixHash: SourceDigest(bytes: data.prefix(Int(offset))),
+          classificationHash: position.classificationHash)
+      }.sorted { $0.relativePath.rawValue < $1.relativePath.rawValue },
       exactSourceRecords: records, evidence: evidence, selections: selections,
-      unfinishedTails: tails, isBacklog: isBacklog,
+      unfinishedTails: tails, isBacklog: isBacklog || isUnadmittedBacklog,
       provenance: PreparationProvenance(
-        stripping: stripping.inputs,
+        isToolEvidenceIncluded: isIncludingTools, admittedViews: views, stripping: stripping.inputs,
         sessions: captured.filter { session in
           records.contains { $0.witness.relativePath == session.path }
         }.map { session in
@@ -434,7 +520,9 @@ extension SessionReader {
         }))
   }
 
-  private func preparationStrippingInputs(beforeRead: (URL) throws -> Void) throws -> (
+  private func preparationStrippingInputs(
+    beforeRead: (URL) throws -> Void, admit: (([String]) throws -> [String])? = nil
+  ) throws -> (
     snippets: [String], templates: [String], hash: SourceDigest,
     inputs: [PreparationStrippingInput]
   ) {
@@ -448,13 +536,21 @@ extension SessionReader {
       var bodies: [String] = []
       for name in try directory.names() where name.lowercased().hasSuffix(".md") {
         try beforeRead(folder.appendingPathComponent(name))
-        let bytes = try directory.capture(name, isFollowingLinks: true)
+        guard !DreamSourceProtection.isProtectedPath(folder.appendingPathComponent(name).path)
+        else {
+          throw DreamSourceProtectionError.blocked
+        }
+        var bytes = try directory.capture(name, isFollowingLinks: true)
+        let originalHash = admit == nil ? nil : SourceDigest(bytes: bytes)
+        if let admit { bytes = Data(try admit([DreamSourceProtection.text(bytes)])[0].utf8) }
         guard let raw = String(data: bytes, encoding: .utf8) else {
           throw MemoryError("invalid stripping input UTF-8")
         }
         binding.append(Data("\(name.utf8.count):\(name)\(bytes.count):".utf8))
         binding.append(bytes)
-        inputs.append(PreparationStrippingInput(kind: kind, name: name, bytes: bytes))
+        inputs.append(
+          PreparationStrippingInput(
+            kind: kind, name: name, bytes: bytes, originalHash: originalHash))
         let body = kind == "snippets" ? Self.snippetBody(raw) : Self.templateBody(raw)
         if let body { bodies.append(body) }
       }
@@ -617,7 +713,7 @@ final class PreparationDirectory {
 
   func capture(
     _ name: String, isFollowingLinks: Bool = false, maximumBytes: Int = Int.max,
-    isCheckingStability: Bool = false
+    isCheckingStability: Bool = false, isHeaderOnly: Bool = false
   ) throws -> Data {
     let flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC | (isFollowingLinks ? 0 : O_NOFOLLOW)
     let file = openat(descriptor, name, flags)
@@ -635,6 +731,13 @@ final class PreparationDirectory {
         !chunk.isEmpty
       else { throw MemoryError("session shrank during capture") }
       data.append(chunk)
+      if isHeaderOnly {
+        if let end = data.firstIndex(of: 10) {
+          guard end < 1_048_576 else { throw MemoryError("oversized session header") }
+          return data.prefix(end + 1)
+        }
+        guard data.count < 1_048_576 else { throw MemoryError("oversized session header") }
+      }
     }
     if isCheckingStability {
       var after = stat()
@@ -669,8 +772,16 @@ private struct CapturedSession {
   let sessionClass: SessionClass
   let classificationHash: SourceDigest
   let projectScope: String
+  let admittedView: DreamAdmittedView?
 
-  init(path: SourceRelativePath, bytes: Data, completeBytes: Int) throws {
+  func requireAdmissibleReadProvenance() throws {
+    try DreamSourceProtection.requireAdmissibleReadProvenance(records.map(\.object))
+  }
+
+  init(
+    path: SourceRelativePath, bytes: Data, completeBytes: Int,
+    admittedView: DreamAdmittedView? = nil
+  ) throws {
     var records: [PreparedRecord] = []
     var start = 0
     var ids: Set<String> = []
@@ -697,7 +808,17 @@ private struct CapturedSession {
     let parentPath = parent as? String
     var sessionClass = parentPath == nil ? SessionClass.primary : .child
     var names: [String] = []
-    for record in records.dropFirst() {
+    let classificationRecords = records.dropFirst().sorted { left, right in
+      guard let admittedView else { return left.range.lowerBound < right.range.lowerBound }
+      let lhs =
+        admittedView.records.first { $0.admittedStart == left.range.lowerBound }?.originalStart
+        ?? left.range.lowerBound
+      let rhs =
+        admittedView.records.first { $0.admittedStart == right.range.lowerBound }?.originalStart
+        ?? right.range.lowerBound
+      return lhs < rhs
+    }
+    for record in classificationRecords {
       guard record.object["type"] as? String != "session" else {
         throw MemoryError("repeated session header")
       }
@@ -722,6 +843,7 @@ private struct CapturedSession {
       withJSONObject: ["class": sessionClass.rawValue, "parent": parentPath ?? "", "names": names],
       options: [.sortedKeys])
     self.path = path
+    self.admittedView = admittedView
     self.id = id
     self.bytes = bytes
     self.records = records
@@ -765,7 +887,7 @@ private struct PreparedRecord {
 
   func extract(
     session: CapturedSession, snippets: [String], templates: [String],
-    agentContext: () -> String?
+    isToolEvidenceIncluded: Bool, agentContext: () -> String?
   ) throws -> (
     disposition: RecordDisposition, evidence: [PrimaryTextEvidence],
     selections: [SelectionContext], agentText: String?
@@ -774,6 +896,11 @@ private struct PreparedRecord {
       RecordDisposition, [PrimaryTextEvidence], [SelectionContext], String?
     ) {
       (.excluded(reason), [], [], agentText)
+    }
+    if session.admittedView?.records.first(where: { $0.admittedStart == range.lowerBound })?
+      .isOmitted == true
+    {
+      return excluded(.protectedSourceV1)
     }
     let type = object["type"] as? String ?? ""
     switch type {
@@ -794,12 +921,14 @@ private struct PreparedRecord {
     case "user", "assistant", "toolResult": break
     default: throw MemoryError("unknown message role")
     }
-    if role == "assistant" {
+    if role == "assistant", !isToolEvidenceIncluded || session.sessionClass != .primary {
       return excluded(.assistantV1, agentText: try textContent(message["content"], isHuman: false))
     }
     if session.sessionClass == .child { return excluded(.childV1) }
     if session.sessionClass == .infrastructure { return excluded(.infrastructureV1) }
-    if role == "toolResult", message["toolName"] as? String != "ask_user_question" {
+    if role == "toolResult", !isToolEvidenceIncluded,
+      message["toolName"] as? String != "ask_user_question"
+    {
       return excluded(.toolOutputV1)
     }
     guard let time = object["timestamp"] as? String, let timestamp = SessionReader.date(time) else {
@@ -812,10 +941,58 @@ private struct PreparedRecord {
       let source = recordWitness ?? witness(path: session.path)
       if recordWitness == nil { context = agentContext() }
       recordWitness = source
-      return PrimaryTextEvidence(
+      var value = PrimaryTextEvidence(
         id: PrimaryTextID(citation: citation, part: part), kind: kind, timestamp: timestamp,
         projectScope: session.projectScope, exactText: text, witness: source,
         agentContext: context)
+      if let relation = session.admittedView?.records.first(where: {
+        $0.admittedStart == range.lowerBound && $0.admittedEnd == range.upperBound
+      }) {
+        value.originalWitness = RecordWitness(
+          relativePath: session.path, byteRange: relation.originalStart..<relation.originalEnd,
+          rawRecordHash: try! SourceDigest(relation.originalHash))
+      }
+      return value
+    }
+    func toolText(_ fields: [String: Any]) throws -> String {
+      String(
+        decoding: try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
+        as: UTF8.self)
+    }
+    if role == "assistant" {
+      guard let blocks = message["content"] as? [[String: Any]] else {
+        return excluded(
+          .assistantV1, agentText: try textContent(message["content"], isHuman: false))
+      }
+      var units: [PrimaryTextEvidence] = []
+      for (part, block) in blocks.enumerated() where block["type"] as? String == "toolCall" {
+        guard let id = block["id"] as? String, !id.isEmpty,
+          let name = block["name"] as? String, !name.isEmpty,
+          let arguments = block["arguments"] as? [String: Any]
+        else { throw MemoryError("invalid primary tool call") }
+        units.append(
+          evidence(
+            try toolText([
+              "toolCallID": id, "toolName": name, "arguments": arguments,
+            ]), kind: .toolCall, part: part))
+      }
+      let agentText = try textContent(message["content"], isHuman: false)
+      return units.isEmpty
+        ? excluded(.assistantV1, agentText: agentText)
+        : (.primaryEvidence(units.map(\.id)), units, [], agentText)
+    }
+    if role == "toolResult", message["toolName"] as? String != "ask_user_question" {
+      guard let id = message["toolCallId"] as? String, !id.isEmpty,
+        let name = message["toolName"] as? String, !name.isEmpty,
+        let isError = message["isError"] as? Bool
+      else { throw MemoryError("invalid primary tool result") }
+      let text = try textContent(message["content"], isHuman: false)
+      guard !text.isEmpty else { return excluded(.attachmentOnlyV1) }
+      let unit = evidence(
+        try toolText([
+          "toolCallID": id, "toolName": name, "text": text, "isError": isError,
+        ]), kind: .toolResult, part: 0)
+      return (.primaryEvidence([unit.id]), [unit], [], nil)
     }
     if role == "user" {
       let raw = try textContent(message["content"], isHuman: true)
@@ -832,6 +1009,12 @@ private struct PreparedRecord {
       case .acknowledgement: return excluded(.acknowledgementV1)
       case .empty: return excluded(raw.isEmpty ? .emptyV1 : .attachmentOnlyV1)
       }
+    }
+    if let details = message["details"] as? [String: Any],
+      let status = details["status"] as? String,
+      ["policy-guidance", "automatic-policy-guidance"].contains(status)
+    {
+      return excluded(.generatedV1)
     }
     guard let details = message["details"] as? [String: Any],
       let status = details["status"] as? String,
@@ -890,6 +1073,7 @@ struct PreparationStrippingInput: Sendable {
   let kind: String
   let name: String
   let bytes: Data
+  var originalHash: SourceDigest? = nil
 }
 
 struct PreparationClassificationRecord: Sendable {
@@ -903,12 +1087,16 @@ struct PreparationClassificationWitness: Sendable {
 }
 
 struct PreparationProvenance: Sendable {
+  var isToolEvidenceIncluded: Bool = false
+  var admittedViews: [DreamAdmittedView] = []
   let stripping: [PreparationStrippingInput]
   let sessions: [PreparationClassificationWitness]
 }
 
 extension SessionReader {
-  static func verifyPreparation(_ batch: PreparedSessionBatch) throws {
+  static func verifyPreparation(_ supplied: PreparedSessionBatch, isProjected: Bool = false) throws
+  {
+    let batch = try isProjected ? supplied : supplied.admittedProjection()
     guard let provenance = batch.provenance else {
       throw MemoryError("missing preparation provenance")
     }
@@ -969,8 +1157,11 @@ extension SessionReader {
         previousEnd = record.witness.byteRange.upperBound
         bytes.append(record.bytes)
       }
+      let view = provenance.admittedViews.first { $0.path == witness.path.rawValue }
+      let classificationBytes = view?.bytes ?? bytes
       let session = try CapturedSession(
-        path: witness.path, bytes: bytes, completeBytes: bytes.count)
+        path: witness.path, bytes: classificationBytes, completeBytes: classificationBytes.count,
+        admittedView: view)
       guard let position = batch.positionsAfter.first(where: { $0.relativePath == witness.path }),
         position.sessionID == session.id, position.classificationHash == session.classificationHash
       else {
@@ -1002,6 +1193,7 @@ extension SessionReader {
       }
       let extracted = try raw.extract(
         session: session, snippets: snippets, templates: templates,
+        isToolEvidenceIncluded: provenance.isToolEvidenceIncluded,
         agentContext: {
           batch.evidence.first { $0.witness == record.witness }?.agentContext
         })
@@ -1024,7 +1216,7 @@ extension SessionReader {
           == supplied.timestamp.timeIntervalSinceReferenceDate.bitPattern,
         derived.projectScope.map({ Data($0.utf8) }) == supplied.projectScope.map({ Data($0.utf8) }),
         Data(derived.exactText.utf8) == Data(supplied.exactText.utf8),
-        derived.witness == supplied.witness,
+        derived.witness == supplied.witness, derived.originalWitness == supplied.originalWitness,
         derived.agentContext.map({ Data($0.utf8) }) == supplied.agentContext.map({ Data($0.utf8) })
       else {
         throw MemoryError("derived primary catalogue")
@@ -1039,5 +1231,187 @@ extension SessionReader {
         throw MemoryError("derived selection catalogue")
       }
     }
+  }
+}
+
+extension CapturedSession {
+  fileprivate func admitting(
+    prior: DreamAdmittedView?, cursor: UInt64, admit: ([String]) throws -> [String]
+  ) throws
+    -> DreamAdmittedView
+  {
+    if let prior {
+      try prior.validate()
+      guard prior.path == path.rawValue, prior.originalCompleteBytes <= UInt64(bytes.count),
+        SourceDigest(bytes: bytes.prefix(Int(prior.originalCompleteBytes))).rawValue
+          == prior.originalPrefixHash
+      else { throw DreamSourceProtectionError.invalidReply }
+    }
+    if let prior,
+      cursor < prior.originalCompleteBytes
+        || records.last?.range.upperBound == prior.originalCompleteBytes
+    {
+      return prior
+    }
+    if prior?.window != nil || records.count > 128 || bytes.count > 524_288 {
+      return try admittingWindow(prior: prior, cursor: cursor, admit: admit)
+    }
+    let omissions = try DreamSourceProtection.omittedReadResults(records.map(\.object))
+    let oldCount = prior?.records.count ?? 0
+    guard records.count <= DreamSourceProtection.maximumPieces, oldCount <= records.count else {
+      throw DreamSourceProtectionError.limitExceeded
+    }
+    let pending = try records.enumerated().dropFirst(oldCount).map { index, record in
+      try DreamSourceProtection.text(
+        omissions.contains(index) ? DreamAdmittedView.omitted(record.bytes) : record.bytes)
+    }
+    let checked = pending.isEmpty ? [] : try admit(pending)
+    guard checked.count == pending.count else { throw DreamSourceProtectionError.invalidReply }
+    var admitted = prior?.bytes ?? Data()
+    var relations = prior?.records ?? []
+    for (offset, record) in records.dropFirst(oldCount).enumerated() {
+      let index = oldCount + offset
+      let original =
+        omissions.contains(index) ? try DreamAdmittedView.omitted(record.bytes) : record.bytes
+      let safe = Data(checked[offset].utf8)
+      let identity = try DreamAdmittedView.identity(original)
+      guard safe.last == 10, !safe.dropLast().contains(10),
+        try DreamAdmittedView.identity(safe) == identity
+      else { throw DreamSourceProtectionError.invalidReply }
+      let start = UInt64(admitted.count)
+      admitted.append(safe)
+      guard admitted.count <= DreamSourceProtection.maximumInputBytes else {
+        throw DreamSourceProtectionError.limitExceeded
+      }
+      relations.append(
+        DreamAdmittedView.Record(
+          originalStart: record.range.lowerBound, originalEnd: record.range.upperBound,
+          originalHash: SourceDigest(bytes: record.bytes).rawValue,
+          originalPrefixHash: SourceDigest(bytes: bytes.prefix(Int(record.range.upperBound)))
+            .rawValue,
+          admittedStart: start, admittedEnd: UInt64(admitted.count),
+          admittedHash: SourceDigest(bytes: safe).rawValue,
+          identityHash: identity, isOmitted: omissions.contains(index)))
+    }
+    let complete = records.last!.range.upperBound
+    let view = try DreamAdmittedView(
+      version: 1, extractionVersion: SessionReader.preparationSchemaVersion,
+      path: path.rawValue, originalCompleteBytes: complete,
+      originalPrefixHash: SourceDigest(bytes: bytes.prefix(Int(complete))).rawValue,
+      admittedHash: SourceDigest(bytes: admitted).rawValue, relationHash: "", bytes: admitted,
+      records: relations
+    ).sealed()
+    try view.validate()
+    return view
+  }
+}
+
+extension CapturedSession {
+  fileprivate func admittingWindow(
+    prior: DreamAdmittedView?, cursor: UInt64, admit: ([String]) throws -> [String]
+  ) throws -> DreamAdmittedView {
+    let omissions = try DreamSourceProtection.omittedReadResults(records.map(\.object))
+    var selected: [Int] = []
+    var rawBytes = 0
+    for (index, record) in records.enumerated() where record.range.upperBound > cursor {
+      if selected.count >= 128 || (!selected.isEmpty && rawBytes + record.bytes.count > 524_288) {
+        break
+      }
+      selected.append(index)
+      rawBytes += record.bytes.count
+    }
+    guard let last = selected.last else { throw DreamSourceProtectionError.invalidReply }
+    let complete = records[last].range.upperBound
+    let selectedSet = Set(selected)
+    let classification = records.indices.filter {
+      $0 == 0
+        || (["session", "session_info"].contains(records[$0].object["type"] as? String ?? "")
+          && !selectedSet.contains($0))
+    }
+    guard classification.count <= 64 else { throw DreamSourceProtectionError.limitExceeded }
+    let context = records.indices.filter { index in
+      records[index].range.upperBound <= cursor && !classification.contains(index)
+        && prior?.records.contains(where: { $0.originalStart == records[index].range.lowerBound })
+          == true
+    }.suffix(64)
+    let prefix = classification + context
+    let windowRecords = selected.filter { !classification.contains($0) }
+    let ordered = prefix + windowRecords
+    var safeByIndex: [Int: Data] = [:]
+    var pendingIndices: [Int] = []
+    var pending: [String] = []
+    for index in ordered {
+      let raw = records[index]
+      if let prior,
+        let cached = prior.records.first(where: {
+          $0.originalStart == raw.range.lowerBound && $0.originalEnd == raw.range.upperBound
+            && $0.originalHash == SourceDigest(bytes: raw.bytes).rawValue
+        })
+      {
+        safeByIndex[index] = prior.bytes.subdata(
+          in: Int(cached.admittedStart)..<Int(cached.admittedEnd))
+      } else {
+        pendingIndices.append(index)
+        pending.append(
+          try DreamSourceProtection.text(
+            omissions.contains(index) ? DreamAdmittedView.omitted(raw.bytes) : raw.bytes))
+      }
+    }
+    let checked = pending.isEmpty ? [] : try admit(pending)
+    guard checked.count == pendingIndices.count else {
+      throw DreamSourceProtectionError.invalidReply
+    }
+    for (index, text) in zip(pendingIndices, checked) { safeByIndex[index] = Data(text.utf8) }
+    var admitted = Data()
+    var relations: [DreamAdmittedView.Record] = []
+    var admittedStart: UInt64 = 0
+    for (offset, index) in ordered.enumerated() {
+      if offset == prefix.count { admittedStart = UInt64(admitted.count) }
+      let raw = records[index]
+      let original =
+        omissions.contains(index) ? try DreamAdmittedView.omitted(raw.bytes) : raw.bytes
+      guard let safe = safeByIndex[index], safe.last == 10, !safe.dropLast().contains(10),
+        try DreamAdmittedView.identity(safe) == DreamAdmittedView.identity(original)
+      else { throw DreamSourceProtectionError.invalidReply }
+      let start = UInt64(admitted.count)
+      admitted.append(safe)
+      relations.append(
+        DreamAdmittedView.Record(
+          originalStart: raw.range.lowerBound, originalEnd: raw.range.upperBound,
+          originalHash: SourceDigest(bytes: raw.bytes).rawValue,
+          originalPrefixHash: SourceDigest(bytes: bytes.prefix(Int(raw.range.upperBound))).rawValue,
+          admittedStart: start, admittedEnd: UInt64(admitted.count),
+          admittedHash: SourceDigest(bytes: safe).rawValue,
+          identityHash: try DreamAdmittedView.identity(original),
+          isOmitted: omissions.contains(index)))
+    }
+    if windowRecords.isEmpty { admittedStart = 0 }
+    let view = try DreamAdmittedView(
+      version: 2, extractionVersion: SessionReader.preparationSchemaVersion,
+      path: path.rawValue, originalCompleteBytes: complete,
+      originalPrefixHash: SourceDigest(bytes: bytes.prefix(Int(complete))).rawValue,
+      admittedHash: SourceDigest(bytes: admitted).rawValue, relationHash: "", bytes: admitted,
+      records: relations,
+      window: DreamAdmittedView.Window(
+        originalStart: cursor,
+        originalPrefixHash: SourceDigest(bytes: bytes.prefix(Int(cursor))).rawValue,
+        admittedStart: admittedStart, predecessorRelationHash: prior?.relationHash)
+    ).sealed()
+    try view.validate()
+    return view
+  }
+}
+
+extension PreparedSessionBatch {
+  package func requireNoExcludedSessions(_ ids: Set<String>) throws {
+    let paths = Set(
+      exactSourceRecords.map { $0.witness.relativePath.rawValue }
+        + admittedViews.map(\.path)
+        + (provenance?.sessions.map { $0.path.rawValue } ?? []))
+    guard
+      !positionsAfter.contains(where: {
+        paths.contains($0.relativePath.rawValue) && ids.contains($0.sessionID.rawValue)
+      })
+    else { throw MemoryError("live session excluded from dream intake") }
   }
 }

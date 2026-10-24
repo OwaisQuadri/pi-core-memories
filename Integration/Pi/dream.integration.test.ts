@@ -9,11 +9,18 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { DreamCoverage, DreamRequest, DreamStart } from "./dream.ts";
 
 import { sdkURL, aiURL } from "./test/host.ts";
-const dream = await import("./dream.ts");
+const nativeDream = await import("./dream.ts");
+const { protectDreamSources, sourceProtectionDigest } = await import("./source-protection.ts");
+const { sourceProtectionFixture } = await import("./test/source-protection.ts");
+const dream = {
+	...nativeDream,
+	runDreamWorker: (...args: Parameters<typeof nativeDream.runDreamWorker>) => nativeDream.runDreamWorker(args[0], args[1], args[2], args[3], args[4] ?? ((value, signal) => protectDreamSources(sourceProtectionFixture(), args[0].invocationID, value, signal))),
+	registerDream: (pi: ExtensionAPI) => nativeDream.registerDream(sourceProtectionFixture(pi)),
+};
 const { default: coreMemories } = await import("./index.ts");
 const sdk = await import(sdkURL) as typeof import("@earendil-works/pi-coding-agent");
 const ai = await import(aiURL) as typeof import("@earendil-works/pi-ai");
-const binary = process.env.PI_CORE_MEMORIES_BIN;
+const binary = process.env.PI_CORE_MEMORIES_BIN ?? process.env.PI_CORE_MEMORIES_EXECUTABLE;
 assert.ok(binary, "Set PI_CORE_MEMORIES_BIN to the verified release command");
 
 async function fixture(t: TestContext, isPrimary = true) {
@@ -94,7 +101,7 @@ test("interrupted call stays pending, explicit retry uses exact saved input afte
 	assert.equal(completed.status, "completed"); assert.equal(completed.generation, "1");
 });
 
-test("real worker forwards provider stream errors, saves no response, and calls again only on explicit retry", async (t) => {
+test("real worker withholds provider error text, saves no response, and calls again only on explicit retry", async (t) => {
 	const f = await fixture(t); let saved: DreamRequest | undefined; let calls = 0;
 	const model = { provider: f.start.selection.provider, id: f.start.selection.modelID, api: "offline" } as Parameters<typeof dream.callDreamModel>[2];
 	const memoryBefore = f.cli("render", "--repo", f.repo, "--cwd", f.root);
@@ -108,7 +115,7 @@ test("real worker forwards provider stream errors, saves no response, and calls 
 		return dream.callDreamModel(request, { modelRegistry: registry as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, f.start.selection, signal);
 	}, new AbortController().signal);
 	assert.equal(report.status, "pending"); assert.equal(report.reason, "callbackFailure"); assert.equal(report.generation, "0"); assert.equal(calls, 1);
-	assert.equal(report.detail, "Model call: Dream model call failed: provider error: fixture provider quota exceeded");
+	assert.equal(report.detail, "The dream model call did not complete.");
 	const display = dream.dreamReviewText(report);
 	assert.ok(display.includes(`Cause: ${report.detail}`)); assert.ok(display.includes("Use /dream retry only")); assert.ok(!display.includes("PRIVATE PARTIAL RESPONSE"));
 	const directory = join(f.roots.state, "runs", report.runID!);
@@ -356,7 +363,7 @@ test("installed SDK command lifecycle captures selection and stores review outsi
 		const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
 	};
 	const settingsManager = sdk.SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off", compaction: { enabled: false } });
-	const loader = new sdk.DefaultResourceLoader({ cwd: f.root, agentDir: f.agent, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [(pi: ExtensionAPI) => coreMemories(pi, async () => "CURRENT LOADER MUST NOT BE APPENDED")] });
+	const loader = new sdk.DefaultResourceLoader({ cwd: f.root, agentDir: f.agent, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [(pi: ExtensionAPI) => coreMemories(sourceProtectionFixture(pi), async () => "CURRENT LOADER MUST NOT BE APPENDED")] });
 	await loader.reload();
 	const manager = sdk.SessionManager.inMemory(f.root); manager.appendMessage({ role: "user", content: "ACTIVE CONVERSATION MUST NOT BE MINED", timestamp: 0 });
 	const { session } = await sdk.createAgentSession({ cwd: f.root, agentDir: f.agent, resourceLoader: loader, modelRuntime: runtime, model, thinkingLevel: "off", settingsManager, sessionManager: manager, tools: [] });
@@ -378,10 +385,12 @@ function contentHash(context: Context): string {
 	return payload.contextHash as string;
 }
 
-async function scriptedWorker(t: TestContext, script: string): Promise<void> {
+async function scriptedWorker(t: TestContext, script: string, isProtected = false): Promise<void> {
 	const root = await mkdtemp("/private/tmp/dream-protocol-"); const old = process.env.PI_CORE_MEMORIES_EXECUTABLE;
 	t.after(async () => { if (old === undefined) delete process.env.PI_CORE_MEMORIES_EXECUTABLE; else process.env.PI_CORE_MEMORIES_EXECUTABLE = old; await rm(root, { recursive: true, force: true }); });
-	await writeFile(join(root, "pi-core-memories"), `#!${process.execPath}\nif (process.argv[2] === "scope") { process.stdout.write(JSON.stringify({ deviceKey: null, projectBindings: {} }) + "\\n"); process.exit(0); }\n${script}\n`, { mode: 0o755 }); await chmod(join(root, "pi-core-memories"), 0o755);
+	const protection = { version: 1, type: "sourceProtectionRequest", invocationID: "invocation", requestID: "fixture-source", inputDigest: sourceProtectionDigest(["safe fixture"]), pieces: ["safe fixture"] };
+	const body = isProtected ? `let initial; function protect(bytes) { if (!initial) { initial = bytes; process.stdout.write(JSON.stringify(${JSON.stringify(protection)}) + '\\n'); } else { process.stdin.off('data', protect); ${script}; process.stdin.emit('data', initial); } } process.stdin.on('data', protect);` : script;
+	await writeFile(join(root, "pi-core-memories"), `#!${process.execPath}\nif (process.argv[2] === "scope") { process.stdout.write(JSON.stringify({ deviceKey: null, projectBindings: {} }) + "\\n"); process.exit(0); }\n${body}\n`, { mode: 0o755 }); await chmod(join(root, "pi-core-memories"), 0o755);
 	process.env.PI_CORE_MEMORIES_EXECUTABLE = join(root, "pi-core-memories");
 }
 const protocolStart: DreamStart = { version: 1, type: "start", invocationID: "invocation", roots: { state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }, selection: { provider: "fixture", modelID: "selected", thinkingLevel: "off" }, resume: "inspectOrContinue", batchTextBytes: 262_144 };
@@ -410,9 +419,9 @@ test("client failure keeps the worker exit and stderr cause", async (t) => {
 test("client keeps a failed model call as the pending report cause", async (t) => {
 	const request = { version: 1, type: "modelRequest", invocationID: "invocation", requestID: "run:" + "a".repeat(64), runID: "run", generation: "3", inputHash: "b".repeat(64), contextHash: "c".repeat(64), requestHash: "a".repeat(64), selection: protocolStart.selection, systemPrompt: "saved", messages: [{ role: "user", text: "text", timestampMilliseconds: 0 }] };
 	const pending = { ...protocolFinal, status: "pending", generation: "3", runID: "run", base: "b".repeat(40), reason: "callbackFailure" };
-	await scriptedWorker(t, `let count = 0; process.stdin.on('data',()=>{ if (count++ === 0) process.stdout.write(${JSON.stringify(JSON.stringify(request) + "\n")}); else { process.stdout.write(${JSON.stringify(JSON.stringify(pending) + "\n")}); process.stdin.destroy(); } });`);
+	await scriptedWorker(t, `let count = 0; process.stdin.on('data',()=>{ if (count++ === 0) process.stdout.write(${JSON.stringify(JSON.stringify(request) + "\n")}); else { process.stdout.write(${JSON.stringify(JSON.stringify(pending) + "\n")}); process.stdin.destroy(); } });`, true);
 	const report = await dream.runDreamWorker(protocolStart, async () => { throw new Error("provider quota exceeded"); }, new AbortController().signal);
-	assert.equal(report.detail, "Model call: provider quota exceeded");
+	assert.equal(report.detail, "The dream model call did not complete.");
 });
 
 test("dream all runs every batch until the backlog ends", async (t) => {
@@ -435,7 +444,7 @@ process.stdout.write(JSON.stringify({ version: 1, type: "final", invocationID: s
 test("client rejects duplicate or wrong-bound requests before a second registry call", async (t) => {
 	const request = { version: 1, type: "modelRequest", invocationID: "invocation", requestID: "run:" + "a".repeat(64), runID: "run", generation: "0", inputHash: "b".repeat(64), contextHash: "c".repeat(64), requestHash: "a".repeat(64), selection: protocolStart.selection, systemPrompt: "saved", messages: [{ role: "user", text: "café 🌱", timestampMilliseconds: 0 }] };
 	const bytes = JSON.stringify(request) + "\n";
-	await scriptedWorker(t, `process.stdin.once('data',()=>{process.stdout.write(${JSON.stringify(bytes + bytes)});process.stdin.destroy();});`);
+	await scriptedWorker(t, `process.stdin.once('data',()=>{process.stdout.write(${JSON.stringify(bytes + bytes)});process.stdin.destroy();});`, true);
 	let calls = 0;
 	await assert.rejects(dream.runDreamWorker(protocolStart, async () => { calls++; return "{}"; }, new AbortController().signal));
 	assert.equal(calls, 1);

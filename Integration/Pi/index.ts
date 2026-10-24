@@ -6,6 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { buildCommand, clearBuildResult, commandPath, commandReady, isCommandMissing } from "./command.ts";
 import { escapeDreamDisplay, registerDream } from "./dream.ts";
 import { registerReview } from "./review.ts";
+import { registerQueuedRuntime } from "./queued-runtime.ts";
 import { registerMemoryManagement, reviewCatalog } from "./management.ts";
 import { filterMemoryMessages, isSnapshotOnBranch, memoryMessage, withSavedSnapshot, type MemoryScope } from "./policy.ts";
 
@@ -44,6 +45,7 @@ export default function coreMemories(pi: ExtensionAPI, render: Render = renderAp
 	const abortDream = registerDream(pi);
 	const abortReview = registerReview(pi);
 	const abortManagement = registerMemoryManagement(pi);
+	const abortQueue = registerQueuedRuntime(pi);
 	let controller: AbortController | undefined;
 	let warnedSessionId: string | undefined;
 	let reminder: AbortController | undefined;
@@ -87,7 +89,7 @@ export default function coreMemories(pi: ExtensionAPI, render: Render = renderAp
 		controller?.abort();
 		reminder?.abort();
 		controller = undefined;
-		return Promise.all([abortDream(), abortReview(), abortManagement()]).then(() => {});
+		return Promise.all([abortDream(), abortReview(), abortManagement(), abortQueue()]).then(() => {});
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {

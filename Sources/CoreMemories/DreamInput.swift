@@ -247,6 +247,7 @@ extension SessionReader {
     protect: @escaping ([String]) throws -> Void,
     admit: @escaping ([String]) throws -> [String],
     priorViews: [DreamAdmittedView] = [],
+    excludedSessionIDs: Set<String> = [],
     backlog: (DreamBacklog) -> Void = { _ in },
     isCancelled: () -> Bool = { false }
   ) throws -> PreparedSessionBatch {
@@ -254,7 +255,7 @@ extension SessionReader {
       progress: progress, limits: limits,
       modifiedAfter: Date().addingTimeInterval(-Self.dreamWindow),
       maximumBacklogBytes: Self.dreamBacklogBytes, protect: protect, admit: admit,
-      priorViews: priorViews,
+      priorViews: priorViews, excludedSessionIDs: excludedSessionIDs,
       beforeRead: { _ in }, backlog: backlog, isCancelled: isCancelled)
   }
 
@@ -265,6 +266,7 @@ extension SessionReader {
     protect: (([String]) throws -> Void)? = nil,
     admit: (([String]) throws -> [String])? = nil,
     priorViews: [DreamAdmittedView] = [],
+    excludedSessionIDs: Set<String> = [],
     beforeRead: (URL) throws -> Void,
     backlog: (DreamBacklog) -> Void = { _ in },
     isCancelled: () -> Bool = { false }
@@ -301,7 +303,23 @@ extension SessionReader {
         discovered.insert(path)
         guard modified[path] != nil else { continue }
         try checkedRead(file.directory.url.appendingPathComponent(file.name))
+        var header: Data?
+        if !excludedSessionIDs.isEmpty {
+          let bytes = try file.directory.capture(file.name, isHeaderOnly: true)
+          guard let object = try Self.decodeRecord(bytes) as? [String: Any],
+            object["type"] as? String == "session", let id = object["id"] as? String
+          else { throw MemoryError("invalid session header") }
+          _ = try SessionIdentifier(id)
+          if excludedSessionIDs.contains(id) {
+            modified[path] = nil
+            continue
+          }
+          header = bytes
+        }
         let data = try file.directory.capture(file.name)
+        guard header == nil || data.starts(with: header!) else {
+          throw MemoryError("session header changed during capture")
+        }
         let complete = data.lastIndex(of: 0x0A).map { $0 + 1 } ?? 0
         if complete < data.count {
           tails.append(
@@ -695,7 +713,7 @@ final class PreparationDirectory {
 
   func capture(
     _ name: String, isFollowingLinks: Bool = false, maximumBytes: Int = Int.max,
-    isCheckingStability: Bool = false
+    isCheckingStability: Bool = false, isHeaderOnly: Bool = false
   ) throws -> Data {
     let flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC | (isFollowingLinks ? 0 : O_NOFOLLOW)
     let file = openat(descriptor, name, flags)
@@ -713,6 +731,13 @@ final class PreparationDirectory {
         !chunk.isEmpty
       else { throw MemoryError("session shrank during capture") }
       data.append(chunk)
+      if isHeaderOnly {
+        if let end = data.firstIndex(of: 10) {
+          guard end < 1_048_576 else { throw MemoryError("oversized session header") }
+          return data.prefix(end + 1)
+        }
+        guard data.count < 1_048_576 else { throw MemoryError("oversized session header") }
+      }
     }
     if isCheckingStability {
       var after = stat()
@@ -1374,5 +1399,19 @@ extension CapturedSession {
     ).sealed()
     try view.validate()
     return view
+  }
+}
+
+extension PreparedSessionBatch {
+  package func requireNoExcludedSessions(_ ids: Set<String>) throws {
+    let paths = Set(
+      exactSourceRecords.map { $0.witness.relativePath.rawValue }
+        + admittedViews.map(\.path)
+        + (provenance?.sessions.map { $0.path.rawValue } ?? []))
+    guard
+      !positionsAfter.contains(where: {
+        paths.contains($0.relativePath.rawValue) && ids.contains($0.sessionID.rawValue)
+      })
+    else { throw MemoryError("live session excluded from dream intake") }
   }
 }

@@ -152,13 +152,33 @@ private struct WorkerStart {
   let batchTextBytes: Int
   let deviceKey: String?
   let projectBindings: [String: String]
+  let excludedSessionIDs: Set<String>
 
   init(_ object: [String: Any]) throws {
-    let optional = Set(object.keys).intersection(["deviceKey", "projectBindings"])
+    let optional = Set(object.keys).intersection([
+      "deviceKey", "projectBindings", "excludedSessionIDs",
+    ])
     try WorkerJSON.fields(
       object,
       Set(["version", "type", "invocationID", "roots", "selection", "resume", "batchTextBytes"])
         .union(optional))
+    if let raw = object["excludedSessionIDs"] {
+      guard let ids = raw as? [String], ids.count <= 64, ids == ids.sorted(),
+        Set(ids).count == ids.count
+      else { throw WorkerError.protocolFailure }
+      for id in ids {
+        let checked = try WorkerJSON.identifier(["id": id], "id")
+        let alphanumeric = CharacterSet(
+          charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        guard !checked.contains(":"),
+          checked.unicodeScalars.first.map({ alphanumeric.contains($0) }) == true,
+          checked.unicodeScalars.last.map({ alphanumeric.contains($0) }) == true
+        else { throw WorkerError.protocolFailure }
+      }
+      excludedSessionIDs = Set(ids)
+    } else {
+      excludedSessionIDs = []
+    }
     deviceKey = try object["deviceKey"].map { _ in
       try WorkerJSON.text(object, "deviceKey", maximum: 64)
     }
@@ -606,7 +626,7 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
           progress: progress, limits: DreamInputLimits(maximumBatchBytes: start.batchTextBytes),
           protect: { try input.protect($0, invocationID: start.invocationID) },
           admit: { try input.check($0, invocationID: start.invocationID) },
-          priorViews: sources.admittedViews,
+          priorViews: sources.admittedViews, excludedSessionIDs: start.excludedSessionIDs,
           backlog: { backlog = $0 }, isCancelled: { input.isCancelled })
       },
       call: { request in
@@ -634,6 +654,7 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
         }
       },
       observe: { progress, batch, isRepeated, estimate in
+        try batch.requireNoExcludedSessions(start.excludedSessionIDs)
         let frame: [String: Any] = [
           "version": 1, "type": "progress", "invocationID": start.invocationID,
           "backlogBytes": backlog.map { $0.backlogBytes as Any } ?? NSNull(),

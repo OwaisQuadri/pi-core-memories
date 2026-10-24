@@ -1,13 +1,14 @@
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { binaryPath, ensureBuilt, isBuildNeeded, progressBar, type BuildSpec } from "pi-compiled";
+import { binaryPath, ensureBuilt, progressBar, type BuildSpec } from "pi-compiled";
 
 export const commandBuild: BuildSpec = {
 	packageRoot: fileURLToPath(new URL("../..", import.meta.url)),
 	binary: "target/release/pi-core-memories",
 	buildCommand: ["/bin/zsh", "-f", "build.zsh"],
 	inputs: ["Package*.swift", "Sources", "build.zsh"],
+	cleanupPaths: ["target/build"],
 	overrideEnv: "PI_CORE_MEMORIES_EXECUTABLE",
 	isUpstreamRequired: true,
 };
@@ -48,7 +49,6 @@ export function clearBuildResult(ctx: ExtensionContext): void {
 async function build(ctx: ExtensionContext): Promise<void> {
 	const show = (text: string) => { try { if (ctx.hasUI) ctx.ui.setWidget("pi-core-memories-build", [`pi-core-memories command: ${text}`]); } catch {} };
 	try {
-		if (!(await isBuildNeeded(commandBuild))) return;
 		show("starting the build");
 		await ensureBuilt(commandBuild, { onProgress: (progress) => show(progressBar(progress)) });
 		show("built. Memory tools use it now.");

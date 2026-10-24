@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+export default sourceProtectionFixture;
+
 export function sourceProtectionFixture(pi?: ExtensionAPI): ExtensionAPI {
 	function provide(value: unknown) {
 		const request = value as { provide(service: unknown): void };

@@ -210,6 +210,7 @@ private struct WorkerStart {
 private final class WorkerInput: @unchecked Sendable {
   static let maximumStartBytes = 65_536
   static let maximumReplyBytes = DreamSourceProtection.maximumOutputBytes * 6 + 8192
+  static let maximumModelReplyBytes = 262_144 * 6 + 8192
   static let maximumProtectionRequests = 16
   static let maximumAggregateBytes =
     maximumStartBytes + maximumReplyBytes * maximumProtectionRequests + 262_144 * 6 + 8192
@@ -446,7 +447,10 @@ private final class WorkerInput: @unchecked Sendable {
         if start != nil && protectionRequest == nil && (request == nil || isReplyReceived) {
           isCancelledFlag = true
         }
-        let maximum = start == nil ? Self.maximumStartBytes : Self.maximumReplyBytes
+        let maximum =
+          start == nil
+          ? Self.maximumStartBytes
+          : (protectionRequest == nil ? Self.maximumModelReplyBytes : Self.maximumReplyBytes)
         guard frame.count < maximum else { throw WorkerError.protocolFailure }
         frame.append(byte)
       }

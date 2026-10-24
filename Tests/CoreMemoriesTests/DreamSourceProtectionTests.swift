@@ -63,7 +63,7 @@ func sourceProtectionFailureNeverFreezesInputOrDispatchesModel(mode: String) thr
     })
 }
 
-@Test(arguments: ["source", "owner"])
+@Test(arguments: ["source", "owner", "approved"])
 func sourceProtectionChangedRawOrAuthorityBytesBlockBeforeFreeze(target: String) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
@@ -71,6 +71,14 @@ func sourceProtectionChangedRawOrAuthorityBytesBlockBeforeFreeze(target: String)
     target == "source" ? "SYNTHETIC_SECRET preference." : "Use green buttons."
   ])
   var start = workerStart(fixture)
+  if target == "approved" {
+    let document = fixture.memory.appendingPathComponent("MEMORY.md")
+    let before = try String(contentsOf: document, encoding: .utf8)
+    try fixture.write(before + "\nSYNTHETIC_SECRET approved authority.\n", file: document)
+    let git = Git(repo: fixture.memory, environment: [:])
+    _ = try git.data(["add", "MEMORY.md"])
+    _ = try git.data(["commit", "-m", "Synthetic authority"], additions: Git.proposalIdentity)
+  }
   if target == "owner" {
     let owner = fixture.root.appendingPathComponent("AGENTS.md")
     try fixture.write("SYNTHETIC_SECRET owner policy.", file: owner)
@@ -167,4 +175,26 @@ func sourceProtectionProtectedReadNeverSendsBodyToHostOrFreezesIt(path: String) 
   }
   try worker.finish()
   #expect(!(try fixture.snapshot(fixture.state)).keys.contains { $0.hasSuffix("input.json") })
+}
+
+@Test func sourceProtectionReadResultCannotRenameItsToolToBypassCallProvenance() throws {
+  let call: [String: Any] = [
+    "message": [
+      "role": "assistant",
+      "content": [
+        [
+          "type": "toolCall", "id": "protected", "name": "read", "arguments": ["path": ".env"],
+        ]
+      ],
+    ]
+  ]
+  let result: [String: Any] = [
+    "message": [
+      "role": "toolResult", "toolCallId": "protected", "toolName": "other",
+      "content": "SYNTHETIC_BODY",
+    ]
+  ]
+  #expect(throws: DreamSourceProtectionError.blocked) {
+    try DreamSourceProtection.requireAdmissibleReadProvenance([call, result])
+  }
 }

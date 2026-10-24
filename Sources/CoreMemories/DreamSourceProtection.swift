@@ -66,10 +66,12 @@ package enum DreamSourceProtection {
           }
         }
       }
-      if message["role"] as? String == "toolResult", message["toolName"] as? String == "read" {
-        guard let id = message["toolCallId"] as? String,
-          let call = calls[id], call.name == "read", !call.isProtected
-        else { throw DreamSourceProtectionError.blocked }
+      if message["role"] as? String == "toolResult" {
+        let call = (message["toolCallId"] as? String).flatMap { calls[$0] }
+        guard call?.isProtected != true else { throw DreamSourceProtectionError.blocked }
+        if message["toolName"] as? String == "read" {
+          guard call?.name == "read" else { throw DreamSourceProtectionError.blocked }
+        }
       }
     }
   }

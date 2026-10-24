@@ -12,10 +12,12 @@ import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding
 import type { Component } from "@earendil-works/pi-tui";
 
 import { sdkURL } from "./test/host.ts";
+import { protectDreamSources } from "./source-protection.ts";
+import { sourceProtectionFixture } from "./test/source-protection.ts";
 const dream = await import("./dream.ts");
 const review = await import("./review.ts");
 const sdk = await import(sdkURL) as typeof import("@earendil-works/pi-coding-agent");
-const binary = process.env.PI_CORE_MEMORIES_BIN;
+const binary = process.env.PI_CORE_MEMORIES_BIN ?? process.env.PI_CORE_MEMORIES_EXECUTABLE;
 assert.ok(binary, "Set PI_CORE_MEMORIES_BIN to the verified release command");
 
 async function fixture(t: TestContext) {
@@ -41,7 +43,7 @@ async function fixture(t: TestContext) {
 	const report = await dream.runDreamWorker({ version: 1, type: "start", invocationID: "fixture", roots, selection: { provider: "fixture", modelID: "selected", thinkingLevel: "off" }, resume: "inspectOrContinue", batchTextBytes: 262_144 }, async (request) => {
 		const source = JSON.parse(request.messages[0].text).primaryEvidence[0].source;
 		return JSON.stringify({ schemaVersion: 1, contextHash: request.contextHash, decisions: ["Keep A café 🌱.", "Keep B."].map((text) => ({ kind: "add", scope: { kind: "global" }, text, sources: [source], contradictions: [], reason: "Keep separate preferences." })) });
-	}, new AbortController().signal);
+	}, new AbortController().signal, undefined, (value, signal) => protectDreamSources(sourceProtectionFixture(), "fixture", value, signal));
 	assert.equal(report.status, "completed");
 	const git = (...args: string[]) => execFileSync("/usr/bin/git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 	return { root, roots, repo, home, git, start: { version: 1, type: "start", invocationID: "review-fixture", roots, reviewState: join(home, ".local", "state", "pi-core-memories-review") } };

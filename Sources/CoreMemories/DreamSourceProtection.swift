@@ -126,6 +126,10 @@ package enum DreamSourceProtection {
     return pieces
   }
 
+  static func rejectedPredecessors(_ predecessors: [DreamRejectedPredecessor]) -> [String] {
+    predecessors.flatMap { [$0.revision, $0.path, $0.priorClaim] + $0.sourceSessions }
+  }
+
   static func authority(_ snapshot: ApprovedDecisionSnapshot, owners: [PinnedOwnerInput]) throws
     -> [String]
   {

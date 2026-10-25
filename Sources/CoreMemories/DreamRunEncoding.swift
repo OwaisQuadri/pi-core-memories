@@ -569,8 +569,8 @@ enum DreamRunEncoding {
     }
   }
 
-  static func protectionPieces(batchBytes: Data) throws -> [String] {
-    try DreamSourceProtection.pieces(JSONDecoder().decode(Batch.self, from: batchBytes).domain())
+  static func retainedBatch(bytes: Data) throws -> PreparedSessionBatch {
+    try JSONDecoder().decode(Batch.self, from: bytes).domain()
   }
 
   static func batchBinding(_ batch: PreparedSessionBatch, maximumBytes: Int) throws -> Data {
@@ -929,6 +929,7 @@ extension DreamRunEncoding {
 
   private struct ContextPayload: Decodable {
     let relatedBatches: [Data]?
+    let rejectedPredecessors: [DreamRejectedPredecessor]?
     let deviceKey: String?
     let projectBindings: [String: String]?
     let schemaVersion: Int
@@ -1093,9 +1094,8 @@ extension DreamRunEncoding {
         owners: payload.owners.map { try $0.domain() }, addedDate: payload.date,
         limits: limits, limitations: payload.limitations, deviceKey: payload.deviceKey,
         projectBindings: payload.projectBindings ?? [:],
-        relatedBatches: try (payload.relatedBatches ?? []).map {
-          try JSONDecoder().decode(Batch.self, from: $0).domain()
-        })
+        relatedBatches: try (payload.relatedBatches ?? []).map { try retainedBatch(bytes: $0) },
+        rejectedPredecessors: payload.rejectedPredecessors ?? [])
       guard context.canonicalBytes == bytes else { throw DreamRunError.corruption }
       return context
     } catch let error as DreamRunError { throw error } catch { throw DreamRunError.corruption }

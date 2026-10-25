@@ -234,6 +234,13 @@ public struct DreamOwnerAnchor: Equatable, Sendable {
   }
 }
 
+public struct DreamRejectedPredecessor: Codable, Sendable {
+  public let revision: String
+  public let path: String
+  public let priorClaim: String
+  public let sourceSessions: [String]
+}
+
 public struct DreamDecisionContext: Sendable {
   public let deviceKey: String?
   public let projectBindings: [String: String]
@@ -247,6 +254,7 @@ public struct DreamDecisionContext: Sendable {
   public let contextHash: SourceDigest
   public let primaryCatalogue: [PrimaryTextEvidence]
   public let connectedEvidence: ConnectedDreamEvidence?
+  public let rejectedPredecessors: [DreamRejectedPredecessor]
   public let memoryCatalogue: [DreamMemoryAnchor]
   public let ownerCatalogue: [DreamOwnerAnchor]
   public let limitations: [String]
@@ -259,7 +267,8 @@ public struct DreamDecisionContext: Sendable {
     owners: [PinnedOwnerInput], addedDate: String,
     limits: DreamDecisionLimits = try! DreamDecisionLimits(), limitations: [String] = [],
     deviceKey: String? = nil, projectBindings: [String: String] = [:],
-    relatedBatches: [PreparedSessionBatch] = []
+    relatedBatches: [PreparedSessionBatch] = [],
+    rejectedPredecessors: [DreamRejectedPredecessor] = []
   ) throws {
     try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     guard limitations.count <= limits.maximumOwners + limits.maximumProjectKeys,
@@ -321,6 +330,25 @@ public struct DreamDecisionContext: Sendable {
             end: block.range.upperBound, before: before, isEligible: block.isEligible))
       }
     }
+    let admittedPaths = Set(run.batch.admittedViews.map(\.path))
+    let admittedSessions = Set(
+      run.batch.positionsAfter.filter {
+        admittedPaths.contains($0.relativePath.rawValue)
+      }.map { $0.sessionID.rawValue })
+    try limits.check(rejectedPredecessors.count, maximum: 64)
+    guard Set(rejectedPredecessors.map(\.revision)).count == rejectedPredecessors.count,
+      rejectedPredecessors.allSatisfy({
+        MemoryDocument.isMatch(#"\A[0-9a-f]{64}\z"#, $0.revision)
+          && paths.contains($0.path) && !$0.priorClaim.isEmpty
+          && $0.priorClaim.utf8.count <= limits.maximumBeforeBytes
+          && !$0.sourceSessions.isEmpty && $0.sourceSessions.count <= 1_000
+          && Set($0.sourceSessions).count == $0.sourceSessions.count
+          && $0.sourceSessions.allSatisfy(MemoryQueueRequest.isIdentifier)
+          && Set($0.sourceSessions).isSubset(of: admittedSessions)
+      })
+    else { throw DreamDecisionError.context("rejected predecessor catalogue") }
+    let predecessorBytes = try DreamRunEncoding.encode(rejectedPredecessors)
+    try limits.check(predecessorBytes.count, maximum: limits.maximumMetadataBytes)
     try limits.check(owners.count, maximum: limits.maximumOwners)
     guard Set(owners.map(\.key)).count == owners.count else {
       throw DreamDecisionError.context("duplicate owner")
@@ -377,6 +405,9 @@ public struct DreamDecisionContext: Sendable {
       contextFields["relatedBatches"] = .array(
         connected.relatedBatchBytes.map { .string($0.base64EncodedString()) })
     }
+    if !rejectedPredecessors.isEmpty {
+      contextFields["rejectedPredecessors"] = try DecisionJSON.parse(predecessorBytes)
+    }
     if let deviceKey { contextFields["deviceKey"] = .string(deviceKey) }
     if !projectBindings.isEmpty {
       contextFields["projectBindings"] = .object(projectBindings.mapValues { .string($0) })
@@ -398,6 +429,7 @@ public struct DreamDecisionContext: Sendable {
     self.limitations = limitations
     self.primaryCatalogue = catalogue.sorted { isSourceOrdered($0.id, $1.id) }
     self.connectedEvidence = connected
+    self.rejectedPredecessors = rejectedPredecessors
     self.memoryCatalogue = memoryCatalogue
     self.ownerCatalogue = sortedOwners.filter { !$0.bytes.isEmpty }.map {
       DreamOwnerAnchor(
@@ -1293,7 +1325,7 @@ extension DreamDecisionContext {
         "diagnostics": .array($0.diagnostics.map { .string($0) }),
       ])
     }
-    let payload = DecisionJSON.object([
+    var payloadFields: [String: DecisionJSON] = [
       "schemaVersion": .integer(1), "contextHash": .string(contextHash.rawValue),
       "decisionSchema": decisionSchema,
       "date": .string(addedDate), "policy": .string(Self.policy),
@@ -1321,7 +1353,12 @@ extension DreamDecisionContext {
         }),
       "limitations": .array(limitations.map { .string($0) }),
       "validationLimits": try DecisionJSON.parse(DreamRunEncoding.encode(limits)),
-    ])
+    ]
+    if !rejectedPredecessors.isEmpty {
+      payloadFields["rejectedPredecessorsNotPrimaryEvidence"] = try DecisionJSON.parse(
+        DreamRunEncoding.encode(rejectedPredecessors))
+    }
+    let payload = DecisionJSON.object(payloadFields)
     return [
       DreamRequestMessage(
         role: .user, text: String(decoding: try payload.encoded(), as: UTF8.self),

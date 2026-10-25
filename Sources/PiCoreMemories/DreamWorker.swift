@@ -616,6 +616,7 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
       selection: start.selection, resume: start.resume,
       sourceRoles: DreamSourceRoles(
         isSnippetsPresent: start.snippets != nil, isPromptsPresent: start.prompts != nil),
+      excludedSessionIDs: start.excludedSessionIDs,
       protect: { try input.protect($0, invocationID: start.invocationID) },
       prepare: { progress, sources in
         guard !input.isCancelled else { throw WorkerError.cancelled }
@@ -654,7 +655,6 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
         }
       },
       observe: { progress, batch, isRepeated, estimate in
-        try batch.requireNoExcludedSessions(start.excludedSessionIDs)
         let frame: [String: Any] = [
           "version": 1, "type": "progress", "invocationID": start.invocationID,
           "backlogBytes": backlog.map { $0.backlogBytes as Any } ?? NSNull(),

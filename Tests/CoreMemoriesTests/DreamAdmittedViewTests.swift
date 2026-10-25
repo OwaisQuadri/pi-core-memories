@@ -277,6 +277,7 @@ private func admittedBatch(
       == SourceDigest(bytes: original.prefix(Int(second.positionsAfter[0].completeBytes))))
   let store = try fixture.store()
   var observed: Set<PrimaryTextID> = []
+  var isPriorWindowIncluded = false
   for _ in 0..<2 {
     _ = try transactionCompleted(
       store.run(
@@ -289,7 +290,8 @@ private func admittedBatch(
         call: { request in
           let context = try transactionObject(request)
           let primary = context["primaryEvidence"] as! [[String: Any]]
-          #expect(!primary.isEmpty)
+          #expect(!primary.isEmpty && primary.count <= 1_000)
+          #expect((context["connectedWindowBindings"] as? [String] ?? []).count <= 8)
           #expect(!String(describing: context).contains("SYNTHETIC_SECRET"))
           for item in primary {
             let source = item["source"] as! [String: Any]
@@ -297,9 +299,16 @@ private func admittedBatch(
               citation: Citation(
                 session: source["session"] as! String, entry: source["entry"] as! String),
               part: source["part"] as! Int)
-            #expect(observed.insert(id).inserted)
+            if item["isCurrentWindow"] as? Int == 1 {
+              #expect(observed.insert(id).inserted)
+            } else {
+              isPriorWindowIncluded = true
+              #expect(observed.contains(id))
+            }
           }
           return try transactionNotes(request)
         }))
   }
+  #expect(isPriorWindowIncluded)
+  #expect(observed == Set((first.evidence + second.evidence).map(\.id)))
 }

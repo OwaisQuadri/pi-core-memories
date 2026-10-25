@@ -290,6 +290,7 @@ extension SessionReader {
     var originalData: [SourceRelativePath: Data] = [:]
     var isUnadmittedBacklog = false
     var identities: Set<SessionIdentifier> = []
+    var inspected: Set<SourceRelativePath> = []
     var discovered: Set<SourceRelativePath> = []
     var tails: [UnfinishedSessionTail] = []
     let sessionsDirectory = try PreparationDirectory(url: sessions)
@@ -361,6 +362,18 @@ extension SessionReader {
       }
       guard complete > 0 else { continue }
       var session = try CapturedSession(path: path, bytes: data, completeBytes: complete)
+      guard identities.insert(session.id).inserted else {
+        throw MemoryError("duplicate session identity: \(session.id.rawValue)")
+      }
+      if let saved = tracked[path] {
+        guard saved.sessionID == session.id else {
+          throw MemoryError("session identity changed: \(path.rawValue)")
+        }
+        guard saved.classificationHash == session.classificationHash else {
+          throw MemoryError("session classification changed: \(path.rawValue)")
+        }
+      }
+      inspected.insert(path)
       if let admit {
         let prior = priorViews.first { $0.path == path.rawValue }
         if (tracked[path]?.completeBytes ?? 0) < UInt64(complete) {
@@ -386,21 +399,9 @@ extension SessionReader {
           [path.rawValue] + (try session.records.map { try DreamSourceProtection.text($0.bytes) })
         )
       }
-      guard identities.insert(session.id).inserted else {
-        throw MemoryError("duplicate session identity: \(session.id.rawValue)")
-      }
-      if let saved = tracked[path] {
-        guard saved.sessionID == session.id else {
-          throw MemoryError("session identity changed: \(path.rawValue)")
-        }
-        guard saved.classificationHash == session.classificationHash else {
-          throw MemoryError("session classification changed: \(path.rawValue)")
-        }
-      }
       captured.append(session)
     }
-    let capturedPaths = Set(captured.map(\.path))
-    for saved in progress.positions where !capturedPaths.contains(saved.relativePath) {
+    for saved in progress.positions where !inspected.contains(saved.relativePath) {
       guard identities.insert(saved.sessionID).inserted else {
         throw MemoryError("duplicate session identity: \(saved.sessionID.rawValue)")
       }

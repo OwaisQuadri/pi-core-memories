@@ -557,6 +557,53 @@ func dreamWorkerFreshSessionIntakeAdvancesWithoutExhaustingProtectionExchanges(t
   #expect(try fixture.protectedState() == original)
 }
 
+@Test(arguments: ["duplicate", "classification"])
+func dreamWorkerDeferredSourcesBlockDuplicateIdentityAndChangedSavedClassification(kind: String)
+  throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let generation = kind == "classification" ? 1 : 0
+  if kind == "classification" {
+    let seed = try DreamWorkerProcess()
+    defer { seed.clean() }
+    try seed.send(workerStart(fixture))
+    let request = try seed.frame()
+    try seed.send(workerReply(request, text: workerDecision(request)))
+    #expect(try seed.frame()["status"] as? String == "completed")
+    try seed.finish()
+    try fixture.append(
+      dreamJSON([
+        "type": "session_info", "id": "lateinfo", "timestamp": dreamOld,
+        "name": "worker#abcdef12",
+      ]) + "\n")
+  }
+  let priority = fixture.source.deletingLastPathComponent().appendingPathComponent("priority.jsonl")
+  try fixture.write(
+    dreamHeader(kind == "duplicate" ? "one" : "priority", cwd: fixture.root.path, name: nil)
+      + "\n" + dreamUser("priority-user", nil, dreamOld, "Another session.") + "\n",
+    file: priority)
+  try FileManager.default.setAttributes(
+    [.modificationDate: Date().addingTimeInterval(-3_600)], ofItemAtPath: fixture.source.path)
+  try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: priority.path)
+  let before = try fixture.protectedState()
+  let generations = fixture.state.appendingPathComponent("generations")
+  let saved = kind == "classification" ? try fixture.snapshot(generations) : nil
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  try worker.send(workerStart(fixture))
+  let result = try worker.frame()
+  try #require(result["status"] as? String == "blocked")
+  #expect(result["reason"] as? String == "workerFailure")
+  try worker.finish()
+  #expect(
+    !FileManager.default.fileExists(
+      atPath: generations.appendingPathComponent("\(generation + 1).json").path))
+  if let saved { #expect(try fixture.snapshot(generations) == saved) }
+  #expect(try fixture.protectedState() == before)
+}
+
 @Test(arguments: [
   "duplicate", "unknown", "versionBool", "versionFraction", "unsafeID", "wrongType", "partial",
   "oversize", "budgetMissing", "budgetLow", "budgetHigh", "budgetBool", "budgetFraction",

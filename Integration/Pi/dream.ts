@@ -5,7 +5,7 @@ import { lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
-import { BorderedLoader, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, getAgentDir, type ExtensionAPI, type ExtensionContext, type SubscriptionSimpleStreamOptions } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { commandPath, commandReady } from "./command.ts";
 import { protectDreamSources, SOURCE_PROTECTION_INPUT_BYTES, SOURCE_PROTECTION_REPLY_BYTES, type SourceProtectionResult } from "./source-protection.ts";
@@ -454,6 +454,7 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	}
 	if (signal.aborted) throw new Error("Dream call cancelled.");
 	if (!isSameSelection(request.selection, selection) || model.provider !== selection.provider || model.id !== selection.modelID) modelFailure("model selection does not match the request");
+	if (typeof ctx.modelRegistry.streamSubscriptionSimple !== "function") modelFailure("subscription request guard is unavailable; update Pi before dreaming");
 	const context: Context = { systemPrompt: request.systemPrompt, messages: request.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })) };
 	const reasoning = selection.thinkingLevel === "off" ? undefined : selection.thinkingLevel as "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	const controller = new AbortController();
@@ -464,21 +465,21 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	let isDispatchInvalid = false;
 	controller.signal.addEventListener("abort", () => rejectAbort(new Error(isDispatchInvalid ? "Dream model call failed: physical dispatch changed or was invalid" : "Dream call cancelled.")), { once: true });
 	void cancelled.catch(() => {});
-	const isVirtualSelection = model.api === "pi-virtual";
-	let dispatch = isVirtualSelection ? undefined : { provider: selection.provider, modelID: selection.modelID, api: model.api as string };
-	const onPayload = (_payload: unknown, physicalModel: NonNullable<ExtensionContext["model"]>): undefined => {
+	let dispatch: Parameters<NonNullable<SubscriptionSimpleStreamOptions["onDispatch"]>>[0] | undefined;
+	const onDispatch: NonNullable<SubscriptionSimpleStreamOptions["onDispatch"]> = (physical) => {
 		try {
-			const observed = { provider: text(physicalModel.provider, 256), modelID: text(physicalModel.id, 256), api: text(physicalModel.api, 256) };
-			if (!observed.provider || !observed.modelID || !observed.api || observed.api === "pi-virtual" || (dispatch && (dispatch.provider !== observed.provider || dispatch.modelID !== observed.modelID || dispatch.api !== observed.api))) failure();
+			const observed = { provider: text(physical.provider, 256), modelID: text(physical.modelID, 256), api: text(physical.api, 256) };
+			if (!["openai", "openai-codex", "anthropic"].includes(observed.provider) || !observed.modelID || !observed.api || observed.api === "pi-virtual") failure();
+			if (model.api !== "pi-virtual" && (observed.provider !== model.provider || observed.modelID !== model.id || observed.api !== model.api)) failure();
+			if (dispatch && (dispatch.provider !== observed.provider || dispatch.modelID !== observed.modelID || dispatch.api !== observed.api)) failure();
 			dispatch = observed;
-			return undefined;
-		} catch { isDispatchInvalid = true; controller.abort(); return modelFailure("physical dispatch changed or was invalid"); }
+		} catch { isDispatchInvalid = true; controller.abort(); modelFailure("physical dispatch changed or was invalid"); }
 	};
 	function isExpectedIdentity(message: AssistantMessage): boolean {
 		return !isDispatchInvalid && dispatch !== undefined && message.provider === dispatch.provider && message.model === dispatch.modelID && message.api === dispatch.api;
 	}
 	try {
-	const stream = ctx.modelRegistry.streamSimple(model, context, { signal: controller.signal, reasoning, ...(isVirtualSelection ? { onPayload } : {}) });
+	const stream = ctx.modelRegistry.streamSubscriptionSimple(model, context, { signal: controller.signal, reasoning, onDispatch });
 	let terminal: AssistantMessage | undefined;
 	let isDone = false;
 	const iterator = stream[Symbol.asyncIterator]();

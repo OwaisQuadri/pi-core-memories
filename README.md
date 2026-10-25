@@ -722,7 +722,9 @@ No proposals or progress changes occur before successful validation.
 
 Only `/dream`, `/dream all`, `/dream retry`, and `/dream replace` are accepted. Combined or other
 arguments fail without starting a worker. No model, thinking level, credentials, or routing
-settings change. Pi's registry owns request-time authentication.
+settings change. Dreaming requires Pi's request-time subscription guard and stored
+subscription sign-in. A host without the guard fails before a model call. Ambient
+keys and custom provider transports cannot replace subscription access.
 
 The adapter passes only the worker's saved system prompt and text messages to the
 captured registry. It adds no active conversation, approved-loader snapshot, tools,
@@ -733,12 +735,13 @@ trimming, fence removal, or repair. Tool calls and incomplete results fail.
 
 Pi can route a virtual selection to a physical model. The saved request keeps the
 logical selected model and thinking level. The registry owns the route and its physical
-thinking level. A read-only payload callback records only the dispatched provider,
-model identifier, and interface identifier. It does not inspect or keep the payload.
+thinking level. The guard's read-only dispatch observer records only the physical
+provider, model identifier, and interface identifier. It receives no request payload
+or credentials.
 
 The terminal event and final result must match that observed physical identity.
-Conflicting dispatch identities fail. A virtual route whose provider does not invoke
-the callback also fails; the adapter does not guess its provenance. Physical selections
+Conflicting dispatch identities fail. A route without a dispatch observation also
+fails; the adapter does not guess its provenance. Physical selections
 must match their captured identity. The adapter adds no router, fallback, or second call.
 
 The terminal uses Pi's native progress loader. Escape stops the call at once and

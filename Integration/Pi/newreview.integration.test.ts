@@ -63,6 +63,7 @@ async function nativeCommand(f: Awaited<ReturnType<typeof fixture>>) {
 	let shutdown: () => Promise<void> = async () => {};
 	const runtime = await sdk.ModelRuntime.create({ authPath: join(f.home, "offline-auth.json"), modelsPath: null, modelsStorePath: join(f.home, "offline-models.json"), allowModelNetwork: false, refreshOnCreate: false });
 	runtime.streamSimple = () => assert.fail("Review must not call providers");
+	runtime.streamSubscriptionSimple = () => assert.fail("Review must not call providers");
 	const settingsManager = sdk.SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off", compaction: { enabled: false } });
 	const agentDir = join(f.home, "agent");
 	const loader = new sdk.DefaultResourceLoader({ cwd: f.root, agentDir, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [(pi: ExtensionAPI) => { shutdown = review.registerReview(pi); }] });

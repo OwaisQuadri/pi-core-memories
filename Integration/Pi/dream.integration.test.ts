@@ -45,7 +45,7 @@ async function fixture(t: TestContext, isPrimary = true) {
 		...(isPrimary ? [{ type: "message", id: "entry", parentId: null, timestamp: "1999-01-01T00:00:00.000Z", message: { role: "user", content: "Use green buttons, café 🌱, not blue.", timestamp: 0 } }] : []),
 	].map((entry) => JSON.stringify(entry) + "\n").join(""));
 	const roots = await dream.dreamRoots(agent, root);
-	const selection = { provider: "fixture", modelID: "selected", thinkingLevel: "off" };
+	const selection = { provider: "openai", modelID: "selected", thinkingLevel: "off" };
 	const start: DreamStart = { version: 1, type: "start", invocationID: "synthetic-invocation", roots, selection, resume: "inspectOrContinue", batchTextBytes: 262_144 };
 	return { root, home, agent, repo, bin, roots, start, sessionFile, cli };
 }
@@ -67,7 +67,7 @@ test("real worker publishes exact refs and notes once, saved retry and no-new us
 			assert.ok(review.includes(proposal.base)); assert.match(review, /Use green buttons/); assert.match(review, /HUMAN/);
 		}
 		const forbidden = async () => { assert.fail("No registry call allowed on replay"); };
-		const recovered = await dream.runDreamWorker({ ...f.start, selection: { provider: "other", modelID: "other", thinkingLevel: "high" }, resume: "retryInterruptedCall" }, forbidden, new AbortController().signal);
+		const recovered = await dream.runDreamWorker({ ...f.start, selection: { provider: "anthropic", modelID: "other", thinkingLevel: "high" }, resume: "retryInterruptedCall" }, forbidden, new AbortController().signal);
 		assert.equal(recovered.status, "completed"); assert.equal(recovered.isRecovered, true); assert.deepEqual(recovered.proposals, first.proposals);
 		const next = await dream.runDreamWorker(f.start, forbidden, new AbortController().signal);
 		assert.equal(next.status, "noNewRecords"); assert.equal(next.generation, "1");
@@ -107,11 +107,12 @@ test("real worker withholds provider error text, saves no response, and calls ag
 	const memoryBefore = f.cli("render", "--repo", f.repo, "--cwd", f.root);
 	const report = await dream.runDreamWorker(f.start, async (request, signal) => {
 		saved = request;
-		const registry = { streamSimple(current, _context, _options) {
+		const registry = { streamSubscriptionSimple(current, _context, options) {
 			calls++;
+			options?.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
 			const reply: AssistantMessage = { role: "assistant", api: current.api, provider: current.provider, model: current.id, content: [{ type: "text", text: "PRIVATE PARTIAL RESPONSE" }], stopReason: "error", errorMessage: "fixture provider quota exceeded", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 			const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "error", reason: "error", error: reply }); return stream;
-		} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSimple">;
+		} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSubscriptionSimple">;
 		return dream.callDreamModel(request, { modelRegistry: registry as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, f.start.selection, signal);
 	}, new AbortController().signal);
 	assert.equal(report.status, "pending"); assert.equal(report.reason, "callbackFailure"); assert.equal(report.generation, "0"); assert.equal(calls, 1);
@@ -145,7 +146,7 @@ test("saved owner byte mismatch reports its exact cause and cannot be replaced b
 	assert.equal(first.detail, 'decision(index: 0, category: "owner anchor bytes do not match pinned slice")');
 	const next = await dream.runDreamWorker({ ...start, resume: "retryInterruptedCall" }, async () => { assert.fail("Saved invalid response cannot be replaced"); }, new AbortController().signal);
 	assert.equal(next.reason, "invalidDecision"); assert.equal(next.generation, "0"); assert.equal(next.detail, first.detail);
-	const changed = await dream.runDreamWorker({ ...start, selection: { provider: "other", modelID: "changed", thinkingLevel: "high" } }, async () => { assert.fail("Saved response cannot be replaced"); }, new AbortController().signal);
+	const changed = await dream.runDreamWorker({ ...start, selection: { provider: "anthropic", modelID: "changed", thinkingLevel: "high" } }, async () => { assert.fail("Saved response cannot be replaced"); }, new AbortController().signal);
 	assert.equal(changed.status, "pending"); assert.equal(changed.reason, "invalidDecision"); assert.equal(changed.detail, first.detail);
 	const replacement = await dream.runDreamWorker({ ...start, resume: "replaceInvalidResponse" }, async (request) => {
 		const context = JSON.parse(request.messages[0].text) as { primaryEvidence: { source: unknown }[]; ownerAnchorsNotPrimaryEvidence: Record<string, unknown>[] };
@@ -163,15 +164,16 @@ test("explicit replace command alone dispatches current selection and archives r
 	const shutdown = dream.registerDream({ registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; }, registerEntryRenderer: () => {}, appendEntry: (_name: string, data: { report: import("./dream.ts").DreamReport }) => entries.push(data), getThinkingLevel: () => "off" } as unknown as ExtensionAPI);
 	t.after(shutdown);
 	const calls: { model: unknown; context: Context; reasoning: unknown }[] = [];
-	const current = { provider: "other", id: "current", api: "offline", contextWindow: 262_144 };
-	const registry = { streamSimple(model, context, options) {
+	const current = { provider: "anthropic", id: "current", api: "offline", contextWindow: 262_144 };
+	const registry = { streamSubscriptionSimple(model, context, options) {
 		calls.push({ model, context, reasoning: options?.reasoning });
+		options?.onDispatch?.(Object.freeze({ provider: model.provider, modelID: model.id, api: model.api }));
 		const payload = JSON.parse(context.messages[0].content as string) as { contextHash: string; primaryEvidence: { source: unknown }[] };
 		const text = calls.length === 1 ? " \nInvalid café 🌱 reply\r\n " : JSON.stringify({ schemaVersion: 1, contextHash: payload.contextHash, decisions: payload.primaryEvidence.map((entry) => ({ kind: "noChange", sources: [entry.source], reasonCode: "notDurable", explanation: "Offline replacement." })) });
 		const reply: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [{ type: "text", text }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 		const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
-	} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSimple">;
-	const ctx = { cwd: f.root, mode: "rpc", model: { provider: "fixture", id: "selected", api: "offline", contextWindow: 262_144 }, thinkingLevel: "off", waitForIdle: async () => {}, ui: { notify: () => {} }, modelRegistry: registry };
+	} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSubscriptionSimple">;
+	const ctx = { cwd: f.root, mode: "rpc", model: { provider: "openai", id: "selected", api: "offline", contextWindow: 262_144 }, thinkingLevel: "off", waitForIdle: async () => {}, ui: { notify: () => {} }, modelRegistry: registry };
 	const commandContext = ctx as unknown as import("@earendil-works/pi-coding-agent").ExtensionCommandContext;
 	const memoryBefore = f.cli("render", "--repo", f.repo, "--cwd", f.root);
 	await handler("", commandContext);
@@ -203,7 +205,7 @@ test("interrupted replacement needs explicit retry, retains original, and uses c
 	assert.equal(first.reason, "invalidDecision");
 	const directory = join(f.roots.state, "runs", saved!.runID);
 	const original = await readFile(join(directory, "response.json"));
-	const replacing: DreamStart = { ...f.start, resume: "replaceInvalidResponse", selection: { provider: "other", modelID: "current", thinkingLevel: "high" } };
+	const replacing: DreamStart = { ...f.start, resume: "replaceInvalidResponse", selection: { provider: "anthropic", modelID: "current", thinkingLevel: "high" } };
 	const pending = await dream.runDreamWorker(replacing, async (request) => {
 		assert.deepEqual(request, { ...saved, selection: replacing.selection });
 		assert.deepEqual(await readFile(join(directory, "rejected-1.json")), original);
@@ -229,9 +231,9 @@ test("interrupted replacement needs explicit retry, retains original, and uses c
 
 test("resumed worker dispatches current provider, model and thinking with exact frozen context", async (t) => {
 	for (const selection of [
-		{ provider: "other", modelID: "selected", thinkingLevel: "off" },
-		{ provider: "fixture", modelID: "other", thinkingLevel: "off" },
-		{ provider: "fixture", modelID: "selected", thinkingLevel: "high" },
+		{ provider: "anthropic", modelID: "selected", thinkingLevel: "off" },
+		{ provider: "openai", modelID: "other", thinkingLevel: "off" },
+		{ provider: "openai", modelID: "selected", thinkingLevel: "high" },
 	]) {
 		const f = await fixture(t); let saved: DreamRequest | undefined;
 		const first = await dream.runDreamWorker(f.start, async (request) => { saved = request; throw new Error("interrupted"); }, new AbortController().signal);
@@ -245,14 +247,15 @@ test("resumed worker dispatches current provider, model and thinking with exact 
 		let calls = 0;
 		const report = await dream.runDreamWorker(start, async (request, signal) => {
 			assert.deepEqual(request, { ...saved, selection });
-			const registry = { streamSimple(current, context, options) {
+			const registry = { streamSubscriptionSimple(current, context, options) {
+				options?.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
 				calls++; assert.strictEqual(current, model);
 				assert.equal(options?.reasoning, selection.thinkingLevel === "off" ? undefined : "high");
 				assert.equal(context.systemPrompt, saved!.systemPrompt);
 				assert.deepEqual(context.messages, saved!.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })));
 				const reply: AssistantMessage = { role: "assistant", api: current.api, provider: current.provider, model: current.id, content: [{ type: "text", text: decision(request) }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 				const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
-			} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSimple">;
+			} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSubscriptionSimple">;
 			return dream.callDreamModel(request, { modelRegistry: registry as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, selection, signal);
 		}, new AbortController().signal);
 		assert.equal(report.status, "completed"); assert.equal(calls, 1);
@@ -298,8 +301,8 @@ for (const action of ["escape", "shutdown"] as const) test(`native BorderedLoade
 	const shutdown = dream.registerDream(pi);
 	t.after(async () => { await shutdown(); loader?.dispose(); });
 	let isDismissed = false;
-	const ctx = { cwd: f.root, mode: "tui", model: { provider: "fixture", id: "selected", api: "fixture", contextWindow: 262_144 }, thinkingLevel: "off", waitForIdle: async () => {},
-		modelRegistry: { streamSimple(_model: unknown, _context: unknown, options: { signal: AbortSignal }) {
+	const ctx = { cwd: f.root, mode: "tui", model: { provider: "openai", id: "selected", api: "fixture", contextWindow: 262_144 }, thinkingLevel: "off", waitForIdle: async () => {},
+		modelRegistry: { streamSubscriptionSimple(_model: unknown, _context: unknown, options: { signal: AbortSignal }) {
 			signal = options.signal; entered();
 			return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }), result: () => new Promise(() => {}) };
 		} },
@@ -318,19 +321,14 @@ for (const action of ["escape", "shutdown"] as const) test(`native BorderedLoade
 	assert.equal(pending.status, "pending"); assert.equal(pending.reason, "interruptedCall");
 });
 
-test("installed native virtual resolver keeps logical selection and validates observed physical dispatch without payload access", async (t) => {
+test("SDK subscription guard rejects custom virtual transport without changing logical selection", async (t) => {
 	const f = await fixture(t);
 	const runtime = await sdk.ModelRuntime.create({ authPath: join(f.agent, "auth.json"), modelsPath: null, modelsStorePath: join(f.agent, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
 	const baseline = runtime.getModels("openai").find((item) => item.reasoning); assert.ok(baseline);
 	const native: Model<"offline-native-api"> = { provider: "offline-native", id: "physical", name: "Offline physical model", api: "offline-native-api", baseUrl: "https://fixture.invalid", reasoning: true, input: ["text"], cost: { ...baseline.cost }, contextWindow: baseline.contextWindow, maxTokens: baseline.maxTokens };
 	let nativeCalls = 0; let routes = 0;
-	const payload = new Proxy({}, { get: () => assert.fail("Payload must not be inspected"), ownKeys: () => assert.fail("Payload must not be serialized") });
-	const scripted: typeof runtime.streamSimple = (current, _context, options) => {
-		nativeCalls++; assert.equal(current.id, native.id); assert.equal(current.provider, native.provider); assert.equal(options?.reasoning, "high");
-		assert.ok(options?.onPayload); assert.equal(options.onPayload(payload, current), undefined);
-		assert.equal(options.onPayload(payload, current), undefined);
-		const reply: AssistantMessage = { role: "assistant", api: current.api, provider: current.provider, model: current.id, content: [{ type: "text", text: "exact native text" }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-		const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
+	const scripted: typeof runtime.streamSimple = () => {
+		nativeCalls++; throw new Error("Custom transport must not receive subscription-only requests");
 	};
 	runtime.registerNativeProvider(ai.createProvider({ id: native.provider, auth: { apiKey: { name: "Offline fixture", resolve: async () => ({ auth: {}, source: "fixture" }) } }, models: [native], api: { stream: scripted, streamSimple: scripted } }));
 	await runtime.refresh({ allowNetwork: false });
@@ -343,8 +341,8 @@ test("installed native virtual resolver keeps logical selection and validates ob
 	const selection = { provider: captured.provider, modelID: captured.id, thinkingLevel: "medium" };
 	const request = { version: 1, type: "modelRequest", invocationID: "invocation", requestID: "run:" + "a".repeat(64), runID: "run", generation: "0", inputHash: "b".repeat(64), contextHash: "c".repeat(64), requestHash: "a".repeat(64), selection, systemPrompt: "EXACT saved context", messages: [{ role: "user", text: "saved input", timestampMilliseconds: 0 }] } as DreamRequest;
 	const registry = new sdk.ModelRegistry(runtime);
-	assert.equal(await dream.callDreamModel(request, { modelRegistry: registry }, captured, selection, new AbortController().signal), "exact native text");
-	assert.equal(routes, 1); assert.equal(nativeCalls, 1); assert.equal(captured.api, "pi-virtual"); assert.equal(request.selection.thinkingLevel, "medium");
+	await assert.rejects(dream.callDreamModel(request, { modelRegistry: registry }, captured, selection, new AbortController().signal), /Subscription transport could not be established for offline-native\/physical/);
+	assert.equal(routes, 1); assert.equal(nativeCalls, 0); assert.equal(captured.api, "pi-virtual"); assert.equal(request.selection.thinkingLevel, "medium");
 });
 
 test("installed SDK command lifecycle captures selection and stores review outside model and human input", async (t) => {
@@ -352,7 +350,8 @@ test("installed SDK command lifecycle captures selection and stores review outsi
 	const runtime = await sdk.ModelRuntime.create({ authPath: join(f.agent, "auth.json"), modelsPath: null, modelsStorePath: join(f.agent, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
 	const model = runtime.getModels("openai").find((item) => !item.reasoning && item.contextWindow >= 65_536); assert.ok(model);
 	const requests: { model: unknown; context: Context; reasoning: unknown }[] = [];
-	runtime.streamSimple = (current, context, options) => {
+	runtime.streamSubscriptionSimple = (current, context, options) => {
+		options?.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
 		requests.push({ model: current, context, reasoning: options?.reasoning });
 		assert.equal(context.tools, undefined); assert.ok(!JSON.stringify(context).includes("ACTIVE CONVERSATION MUST NOT BE MINED"));
 		assert.ok(!JSON.stringify(context).includes("CURRENT LOADER MUST NOT BE APPENDED"));
@@ -393,7 +392,7 @@ async function scriptedWorker(t: TestContext, script: string, isProtected = fals
 	await writeFile(join(root, "pi-core-memories"), `#!${process.execPath}\nif (process.argv[2] === "scope") { process.stdout.write(JSON.stringify({ deviceKey: null, projectBindings: {} }) + "\\n"); process.exit(0); }\n${body}\n`, { mode: 0o755 }); await chmod(join(root, "pi-core-memories"), 0o755);
 	process.env.PI_CORE_MEMORIES_EXECUTABLE = join(root, "pi-core-memories");
 }
-const protocolStart: DreamStart = { version: 1, type: "start", invocationID: "invocation", roots: { state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }, selection: { provider: "fixture", modelID: "selected", thinkingLevel: "off" }, resume: "inspectOrContinue", batchTextBytes: 262_144 };
+const protocolStart: DreamStart = { version: 1, type: "start", invocationID: "invocation", roots: { state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }, selection: { provider: "openai", modelID: "selected", thinkingLevel: "off" }, resume: "inspectOrContinue", batchTextBytes: 262_144 };
 const protocolFinal = { version: 1, type: "final", invocationID: "invocation", status: "noNewRecords", generation: "0", runID: null, base: null, proposals: [], notes: [], isBacklog: false, isRecovered: false, reason: null, detail: null, unfinishedTails: 0 };
 for (const scenario of ["nonzero", "partial", "duplicate", "extra", "invalidUTF8", "missing", "oversized", "stderr"]) test(`client refuses ${scenario} output and reaps only its worker`, async (t) => {
 	const bytes = JSON.stringify(protocolFinal) + "\n";
@@ -550,7 +549,7 @@ process.stdin.once("data", bytes => {
 		get model() { modelReads++; return modelReads === 1 ? captured : { ...captured, id: "changed" }; },
 		get thinkingLevel() { thinkingReads++; return thinkingReads === 1 ? "medium" : "high"; },
 		waitForIdle: async () => {},
-		modelRegistry: { streamSimple: () => assert.fail("No provider call or retry allowed") },
+		modelRegistry: { streamSubscriptionSimple: () => assert.fail("No provider call or retry allowed") },
 		ui: { notify: (value: string) => notices.push(value), custom: (factory: (...args: unknown[]) => unknown) => new Promise((done) => {
 			loader = factory({ requestRender: () => { if (loader) frames.push(loader.render(100)); } }, { fg: (_name: string, value: string) => value }, {}, done) as typeof loader;
 		}) },

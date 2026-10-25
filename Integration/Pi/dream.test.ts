@@ -3,25 +3,26 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { join } from "node:path";
 import { test } from "node:test";
 import type { AssistantMessage, AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SubscriptionSimpleStreamOptions } from "@earendil-works/pi-coding-agent";
 import type { DreamRequest, DreamSelection, DreamStart } from "./dream.ts";
 
 import { tuiURL } from "./test/host.ts";
 const dream = await import("./dream.ts");
 const { default: coreMemories } = await import("./index.ts");
 const tui = await import(tuiURL) as typeof import("@earendil-works/pi-tui");
-const selection: DreamSelection = { provider: "fixture", modelID: "selected", thinkingLevel: "off" };
+const selection: DreamSelection = { provider: "openai", modelID: "selected", thinkingLevel: "off" };
 const start: DreamStart = { version: 1, type: "start", invocationID: "invocation", roots: { state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }, selection, resume: "inspectOrContinue", batchTextBytes: 262_144 };
 const request: DreamRequest = { version: 1, type: "modelRequest", invocationID: "invocation", requestID: "run:" + "a".repeat(64), runID: "run", generation: "0", inputHash: "b".repeat(64), contextHash: "c".repeat(64), requestHash: "a".repeat(64), selection, systemPrompt: "EXACT pinned system 🌱", messages: [{ role: "user", text: "saved exact\ninput café", timestampMilliseconds: 0 }] };
 const final = { version: 1, type: "final", invocationID: "invocation", status: "noNewRecords", generation: "0", runID: null, base: null, proposals: [], notes: [], isBacklog: false, isRecovered: false, reason: null, detail: null, unfinishedTails: 0 };
-const model = { provider: "fixture", id: "selected", api: "fixture" } as NonNullable<ExtensionContext["model"]>;
+const model = { provider: "openai", id: "selected", api: "openai-responses" } as NonNullable<ExtensionContext["model"]>;
 function message(change: Partial<AssistantMessage> = {}): AssistantMessage {
-	return { role: "assistant", provider: selection.provider, model: selection.modelID, api: "fixture", content: [{ type: "text", text: " {" }, { type: "thinking", thinking: "not decision JSON" }, { type: "text", text: "🌱} \n" }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, ...change };
+	return { role: "assistant", provider: selection.provider, model: selection.modelID, api: "openai-responses", content: [{ type: "text", text: " {" }, { type: "thinking", thinking: "not decision JSON" }, { type: "text", text: "🌱} \n" }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, ...change };
 }
 function registry(events: AssistantMessageEvent[], result = message()) {
 	const calls: { model: unknown; context: Context; options: unknown }[] = [];
-	const ctx = { modelRegistry: { streamSimple(current: unknown, context: Context, options: unknown) {
+	const ctx = { modelRegistry: { streamSubscriptionSimple(current: typeof model, context: Context, options: SubscriptionSimpleStreamOptions) {
 		calls.push({ model: current, context, options });
+		options.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
 		return { async *[Symbol.asyncIterator]() { yield* events; }, result: async () => result };
 	} } } as unknown as ExtensionContext;
 	return { ctx, calls };
@@ -38,7 +39,7 @@ test("invalid saved decision displays its cause and explicit replacement billing
 	assert.ok(dream.dreamReviewText({ ...report, reason: "interruptedCall" }).includes("/dream retry"));
 });
 
-test("direct registry receives only pinned bytes and timestamps, captured model, and transport-only off mapping", async () => {
+test("subscription registry receives only pinned bytes and timestamps, captured model, and transport-only off mapping", async () => {
 	for (const level of ["off", "medium"]) {
 		const captured = { ...selection, thinkingLevel: level };
 		const f = registry([{ type: "done", reason: "stop", message: message() }]);
@@ -46,7 +47,7 @@ test("direct registry receives only pinned bytes and timestamps, captured model,
 		assert.equal(await dream.callDreamModel({ ...request, selection: captured }, f.ctx, model, captured, signal), " {🌱} \n");
 		assert.equal(f.calls.length, 1); assert.strictEqual(f.calls[0].model, model);
 		assert.deepEqual(f.calls[0].context, { systemPrompt: request.systemPrompt, messages: [{ role: "user", content: request.messages[0].text, timestamp: 0 }] });
-		assert.deepEqual(Object.keys(f.calls[0].options as object).sort(), ["reasoning", "signal"]);
+		assert.deepEqual(Object.keys(f.calls[0].options as object).sort(), ["onDispatch", "reasoning", "signal"]);
 		assert.equal((f.calls[0].options as { reasoning?: string }).reasoning, level === "off" ? undefined : level);
 		assert.equal(request.selection.thinkingLevel, "off");
 	}
@@ -125,9 +126,14 @@ test("missing done, mismatched done/result, post-terminal updates, partial tools
 	}
 });
 
+test("missing subscription guard refuses the old ordinary stream before dispatch", async () => {
+	const ctx = { modelRegistry: { streamSimple: () => assert.fail("Ordinary streaming must not substitute for subscription dispatch") } } as unknown as ExtensionContext;
+	await assert.rejects(dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: subscription request guard is unavailable; update Pi before dreaming" });
+});
+
 test("registry cancellation rejects a stalled stream immediately and passes a client-owned signal", async () => {
 	const controller = new AbortController(); let received: AbortSignal | undefined;
-	const ctx = { modelRegistry: { streamSimple(_model: unknown, _context: unknown, options: { signal: AbortSignal }) {
+	const ctx = { modelRegistry: { streamSubscriptionSimple(_model: unknown, _context: unknown, options: { signal: AbortSignal }) {
 		received = options.signal;
 		return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }), result: () => new Promise(() => {}) };
 	} } } as unknown as ExtensionContext;
@@ -137,18 +143,20 @@ test("registry cancellation rejects a stalled stream immediately and passes a cl
 	assert.equal(received?.aborted, true);
 });
 
-for (const scenario of ["missing", "conflict", "eventMismatch", "resultMismatch", "same"] as const) test(`virtual selection native dispatch observer ${scenario}`, async () => {
+for (const scenario of ["missing", "conflict", "unapproved", "eventMismatch", "resultMismatch", "same"] as const) test(`virtual selection subscription dispatch observer ${scenario}`, async () => {
 	const virtualModel = { ...model, api: "pi-virtual" };
-	const physical = { ...model, provider: "native", id: "physical", api: "native-api" };
-	const physicalMessage = message({ provider: physical.provider, model: physical.id, api: physical.api });
-	const payload = new Proxy({}, { get: () => assert.fail("Payload must not be inspected"), ownKeys: () => assert.fail("Payload must not be serialized") });
+	const physical = Object.freeze({ provider: "anthropic", modelID: "physical", api: "anthropic-messages" });
+	const physicalMessage = message({ provider: physical.provider, model: physical.modelID, api: physical.api });
 	let calls = 0;
-	const ctx = { modelRegistry: { streamSimple(current: unknown, context: Context, options: { onPayload: (payload: unknown, model: unknown) => unknown }) {
+	const ctx = { modelRegistry: { streamSubscriptionSimple(current: unknown, context: Context, options: SubscriptionSimpleStreamOptions) {
 		calls++; assert.strictEqual(current, virtualModel); assert.equal(context.systemPrompt, request.systemPrompt);
+		assert.deepEqual(Object.keys(options).sort(), ["onDispatch", "reasoning", "signal"]);
+		assert.ok(options.onDispatch);
 		if (scenario !== "missing") {
-			assert.equal(options.onPayload(payload, physical), undefined);
-			if (scenario === "same") assert.equal(options.onPayload(payload, physical), undefined);
-			if (scenario === "conflict") { try { options.onPayload(payload, { ...physical, id: "changed" }); } catch {} }
+			if (scenario === "unapproved") assert.throws(() => options.onDispatch!({ ...physical, provider: "unsupported" }));
+			else assert.equal(options.onDispatch(physical), undefined);
+			if (scenario === "same") assert.equal(options.onDispatch(physical), undefined);
+			if (scenario === "conflict") { try { options.onDispatch({ ...physical, modelID: "changed" }); } catch {} }
 		}
 		const eventMessage = scenario === "eventMismatch" ? message() : physicalMessage;
 		const resultMessage = scenario === "resultMismatch" ? message() : physicalMessage;
@@ -156,7 +164,7 @@ for (const scenario of ["missing", "conflict", "eventMismatch", "resultMismatch"
 	} } } as unknown as ExtensionContext;
 	const work = dream.callDreamModel(request, ctx, virtualModel, selection, new AbortController().signal);
 	if (scenario === "same") assert.equal(await work, " {🌱} \n");
-	else await assert.rejects(work, { message: `Dream model call failed: ${scenario === "conflict" ? "physical dispatch changed or was invalid" : "response identity does not match the dispatched model"}` });
+	else await assert.rejects(work, { message: `Dream model call failed: ${scenario === "conflict" || scenario === "unapproved" ? "physical dispatch changed or was invalid" : "response identity does not match the dispatched model"}` });
 	assert.equal(calls, 1);
 });
 

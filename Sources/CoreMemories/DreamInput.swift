@@ -292,81 +292,115 @@ extension SessionReader {
     var identities: Set<SessionIdentifier> = []
     var discovered: Set<SourceRelativePath> = []
     var tails: [UnfinishedSessionTail] = []
-    try forEachPreparationFolder { files in
+    let sessionsDirectory = try PreparationDirectory(url: sessions)
+    var sources: [(path: SourceRelativePath, folder: PreparationDirectoryIdentity)] = []
+    try forEachPreparationFolder(root: sessionsDirectory) { files in
       if isCancelled() { throw CancellationError() }
       for file in files {
+        discovered.insert(file.path)
         let date = try file.directory.status(file.name).modified
-        if date > modifiedAfter { modified[file.path] = date }
-      }
-      for file in files {
-        let path = file.path
-        discovered.insert(path)
-        guard modified[path] != nil else { continue }
-        try checkedRead(file.directory.url.appendingPathComponent(file.name))
-        var header: Data?
-        if !excludedSessionIDs.isEmpty {
-          let bytes = try file.directory.capture(file.name, isHeaderOnly: true)
-          guard let object = try Self.decodeRecord(bytes) as? [String: Any],
-            object["type"] as? String == "session", let id = object["id"] as? String
-          else { throw MemoryError("invalid session header") }
-          _ = try SessionIdentifier(id)
-          if excludedSessionIDs.contains(id) {
-            modified[path] = nil
-            continue
-          }
-          header = bytes
+        if date > modifiedAfter {
+          modified[file.path] = date
+          sources.append((file.path, file.directory.identity))
         }
-        let data = try file.directory.capture(file.name)
-        guard header == nil || data.starts(with: header!) else {
-          throw MemoryError("session header changed during capture")
-        }
-        let complete = data.lastIndex(of: 0x0A).map { $0 + 1 } ?? 0
-        if complete < data.count {
-          tails.append(
-            UnfinishedSessionTail(
-              relativePath: path, byteRange: UInt64(complete)..<UInt64(data.count)))
-        }
-        if let saved = tracked[path] {
-          guard saved.completeBytes <= UInt64(complete)
-          else { throw MemoryError("session shrank: \(path.rawValue)") }
-          let offset = Int(saved.completeBytes)
-          guard offset > 0, data[offset - 1] == 0x0A,
-            SourceDigest(bytes: Data(data[..<offset])) == saved.prefixHash
-          else { throw MemoryError("session prefix changed: \(path.rawValue)") }
-        }
-        guard complete > 0 else { continue }
-        var session = try CapturedSession(path: path, bytes: data, completeBytes: complete)
-        if let admit {
-          try protect?([path.rawValue])
-          let prior = priorViews.first { $0.path == path.rawValue }
-          let view = try session.admitting(
-            prior: prior, cursor: tracked[path]?.completeBytes ?? 0, admit: admit)
-          isUnadmittedBacklog = isUnadmittedBacklog || view.originalCompleteBytes < UInt64(complete)
-          views.append(view)
-          originalData[path] = data
-          session = try CapturedSession(
-            path: path, bytes: view.bytes, completeBytes: view.bytes.count, admittedView: view)
-        } else if let protect {
-          try session.requireAdmissibleReadProvenance()
-          try protect(
-            [path.rawValue] + (try session.records.map { try DreamSourceProtection.text($0.bytes) })
-          )
-        }
-        guard identities.insert(session.id).inserted else {
-          throw MemoryError("duplicate session identity: \(session.id.rawValue)")
-        }
-        if let saved = tracked[path] {
-          guard saved.sessionID == session.id else {
-            throw MemoryError("session identity changed: \(path.rawValue)")
-          }
-          guard saved.classificationHash == session.classificationHash else {
-            throw MemoryError("session classification changed: \(path.rawValue)")
-          }
-        }
-        captured.append(session)
       }
     }
-    for saved in progress.positions where modified[saved.relativePath] == nil {
+    if admit != nil {
+      sources.sort {
+        modified[$0.path]! != modified[$1.path]!
+          ? modified[$0.path]! > modified[$1.path]! : $0.path.rawValue < $1.path.rawValue
+      }
+    }
+    var folder: PreparationDirectory?
+    var isPendingSourceSelected = false
+    for source in sources {
+      if isCancelled() { throw CancellationError() }
+      let parts = source.path.rawValue.split(separator: "/")
+      let folderName = String(parts[0])
+      if folder?.url.lastPathComponent != folderName {
+        folder = try PreparationDirectory(
+          url: sessions.appendingPathComponent(folderName), parent: sessionsDirectory)
+      }
+      guard let folder, folder.identity == source.folder else {
+        throw MemoryError("session folder changed: \(folderName)")
+      }
+      let file = PreparationSessionFile(
+        path: source.path, directory: folder, name: String(parts[1]))
+      let path = file.path
+      try checkedRead(file.directory.url.appendingPathComponent(file.name))
+      var header: Data?
+      if !excludedSessionIDs.isEmpty {
+        let bytes = try file.directory.capture(file.name, isHeaderOnly: true)
+        guard let object = try Self.decodeRecord(bytes) as? [String: Any],
+          object["type"] as? String == "session", let id = object["id"] as? String
+        else { throw MemoryError("invalid session header") }
+        _ = try SessionIdentifier(id)
+        if excludedSessionIDs.contains(id) {
+          modified[path] = nil
+          continue
+        }
+        header = bytes
+      }
+      let data = try file.directory.capture(file.name)
+      guard header == nil || data.starts(with: header!) else {
+        throw MemoryError("session header changed during capture")
+      }
+      let complete = data.lastIndex(of: 0x0A).map { $0 + 1 } ?? 0
+      if complete < data.count {
+        tails.append(
+          UnfinishedSessionTail(
+            relativePath: path, byteRange: UInt64(complete)..<UInt64(data.count)))
+      }
+      if let saved = tracked[path] {
+        guard saved.completeBytes <= UInt64(complete)
+        else { throw MemoryError("session shrank: \(path.rawValue)") }
+        let offset = Int(saved.completeBytes)
+        guard offset > 0, data[offset - 1] == 0x0A,
+          SourceDigest(bytes: Data(data[..<offset])) == saved.prefixHash
+        else { throw MemoryError("session prefix changed: \(path.rawValue)") }
+      }
+      guard complete > 0 else { continue }
+      var session = try CapturedSession(path: path, bytes: data, completeBytes: complete)
+      if let admit {
+        let prior = priorViews.first { $0.path == path.rawValue }
+        if (tracked[path]?.completeBytes ?? 0) < UInt64(complete) {
+          if isPendingSourceSelected {
+            isUnadmittedBacklog = true
+            continue
+          }
+          isPendingSourceSelected = true
+          try protect?([path.rawValue])
+        } else if prior == nil {
+          continue
+        }
+        let view = try session.admitting(
+          prior: prior, cursor: tracked[path]?.completeBytes ?? 0, admit: admit)
+        isUnadmittedBacklog = isUnadmittedBacklog || view.originalCompleteBytes < UInt64(complete)
+        views.append(view)
+        originalData[path] = data
+        session = try CapturedSession(
+          path: path, bytes: view.bytes, completeBytes: view.bytes.count, admittedView: view)
+      } else if let protect {
+        try session.requireAdmissibleReadProvenance()
+        try protect(
+          [path.rawValue] + (try session.records.map { try DreamSourceProtection.text($0.bytes) })
+        )
+      }
+      guard identities.insert(session.id).inserted else {
+        throw MemoryError("duplicate session identity: \(session.id.rawValue)")
+      }
+      if let saved = tracked[path] {
+        guard saved.sessionID == session.id else {
+          throw MemoryError("session identity changed: \(path.rawValue)")
+        }
+        guard saved.classificationHash == session.classificationHash else {
+          throw MemoryError("session classification changed: \(path.rawValue)")
+        }
+      }
+      captured.append(session)
+    }
+    let capturedPaths = Set(captured.map(\.path))
+    for saved in progress.positions where !capturedPaths.contains(saved.relativePath) {
       guard identities.insert(saved.sessionID).inserted else {
         throw MemoryError("duplicate session identity: \(saved.sessionID.rawValue)")
       }

@@ -57,6 +57,7 @@ final class DreamWorkerProcess {
   func closeInput() throws { try input.fileHandleForWriting.close() }
 
   var progressFrames: [[String: Any]] = []
+  var protectionCount = 0
   var isProtectingAutomatically = true
   var protectionTransform: ([String]) -> [String] = { $0 }
 
@@ -68,6 +69,7 @@ final class DreamWorkerProcess {
         let frame = try #require(
           try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any])
         if frame["type"] as? String == "sourceProtectionRequest", isProtectingAutomatically {
+          protectionCount += 1
           try send(
             workerProtectionReply(frame, pieces: protectionTransform(frame["pieces"] as! [String])))
           continue
@@ -486,6 +488,73 @@ func dreamWorkerExplicitEmptyStrippingFolderIsBlocked(role: String) throws {
       try worker.finish()
     }
   }
+}
+
+@Test(arguments: [32, 40_000])
+func dreamWorkerFreshSessionIntakeAdvancesWithoutExhaustingProtectionExchanges(textBytes: Int)
+  throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  var expected: [String: UInt64] = [:]
+  for index in 0..<8 {
+    let name = "session-\(index).jsonl"
+    let bytes =
+      dreamHeader("session-\(index)", cwd: fixture.root.path, name: nil) + "\n"
+      + dreamUser("entry-\(index)", nil, dreamOld, String(repeating: "x", count: textBytes)) + "\n"
+    try fixture.write(
+      bytes, file: fixture.source.deletingLastPathComponent().appendingPathComponent(name))
+    expected["--fixture--/" + name] = UInt64(bytes.utf8.count)
+  }
+  let owner = fixture.root.appendingPathComponent("owner.md")
+  try fixture.write("Use clear progress reports.\n", file: owner)
+  let original = try fixture.protectedState()
+  var previous: [String: UInt64] = [:]
+  var generation: UInt64 = 0
+  var isFinished = false
+  for _ in 0...8 {
+    let worker = try DreamWorkerProcess()
+    defer { worker.clean() }
+    var start = workerStart(fixture)
+    var roots = start["roots"] as! [String: Any]
+    roots["globalAgents"] = owner.path
+    start["roots"] = roots
+    start["batchTextBytes"] = 65_536
+    try worker.send(start)
+    let request = try worker.frame()
+    if request["status"] as? String == "noNewRecords" {
+      #expect(previous == expected)
+      #expect(worker.protectionCount <= 16)
+      try worker.finish()
+      isFinished = true
+      break
+    }
+    try #require(request["type"] as? String == "modelRequest", "\(request)")
+    try worker.send(workerReply(request, text: workerDecision(request)))
+    let result = try worker.frame()
+    #expect(result["status"] as? String == "completed")
+    generation += 1
+    #expect(result["generation"] as? String == String(generation))
+    #expect(result["isBacklog"] as? Bool == (generation < 8))
+    #expect(worker.protectionCount <= 16)
+    try worker.finish()
+    let saved = try DreamRunEncoding.decode(
+      DreamRunEncoding.Generation.self,
+      bytes: Data(
+        contentsOf: fixture.state.appendingPathComponent("generations/\(generation).json")))
+    let positions = try saved.progress.domain().positions
+    #expect(positions.filter { $0.completeBytes != previous[$0.relativePath.rawValue] }.count == 1)
+    #expect(Set(previous.keys).isSubset(of: Set(positions.map { $0.relativePath.rawValue })))
+    for position in positions {
+      let path = position.relativePath.rawValue
+      #expect(position.completeBytes >= (previous[path] ?? 0))
+      #expect(position.completeBytes <= (expected[path] ?? 0))
+      previous[path] = position.completeBytes
+    }
+  }
+  #expect(isFinished)
+  if textBytes == 40_000 { #expect(generation > 1) }
+  #expect(try fixture.protectedState() == original)
 }
 
 @Test(arguments: [

@@ -595,8 +595,9 @@ public struct SessionReader: Sendable {
     }
   }
 
-  func forEachPreparationFolder(_ read: ([PreparationSessionFile]) throws -> Void) throws {
-    let root = try PreparationDirectory(url: sessions)
+  func forEachPreparationFolder(
+    root: PreparationDirectory, _ read: ([PreparationSessionFile]) throws -> Void
+  ) throws {
     let folders = try root.names().compactMap {
       name -> (name: String, identity: PreparationDirectoryIdentity)? in
       let entry = try root.entry(name)

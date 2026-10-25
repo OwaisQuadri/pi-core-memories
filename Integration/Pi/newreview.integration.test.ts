@@ -46,12 +46,15 @@ async function fixture(t: TestContext) {
 	}, new AbortController().signal, undefined, (value, signal) => protectDreamSources(sourceProtectionFixture(), "fixture", value, signal));
 	assert.equal(report.status, "completed");
 	const git = (...args: string[]) => execFileSync("/usr/bin/git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-	return { root, roots, repo, home, git, start: { version: 1, type: "start", invocationID: "review-fixture", roots, reviewState: join(home, ".local", "state", "pi-core-memories-review") } };
+	return { root, roots, repo, home, git, report, start: { version: 1, type: "start", invocationID: "review-fixture", roots, reviewState: join(home, ".local", "state", "pi-core-memories-review") } };
 }
 
-async function waitFor(check: () => boolean): Promise<void> {
+async function waitFor(check: () => boolean, diagnostics: () => unknown = () => undefined): Promise<void> {
 	const deadline = Date.now() + 7000;
-	while (!check()) { assert.ok(Date.now() < deadline, "UI state deadline"); await new Promise((done) => setTimeout(done, 10)); }
+	while (!check()) {
+		if (Date.now() >= deadline) assert.fail(`UI state deadline\n${JSON.stringify(diagnostics())?.slice(0, 8192) ?? ""}`);
+		await new Promise((done) => setTimeout(done, 10));
+	}
 }
 
 async function nativeCommand(f: Awaited<ReturnType<typeof fixture>>) {
@@ -160,7 +163,8 @@ for (const attack of ["stdinApprove", "unsolicited", "stale", "duplicate", "unkn
 test("native reject and defer persist without approval, and session shutdown reaps the worker", { timeout: 20000 }, async (t) => {
 	const f = await fixture(t); const before = f.git("rev-parse", "main");
 	const ui = await nativeCommand(f);
-	ui.key("\r"); await waitFor(() => ui.screen().includes("Approve: save to memory"));
+	t.after(() => ui.shutdown());
+	ui.key("\r"); await waitFor(() => ui.screen().includes("Approve: save to memory"), () => ({ worker: f.report, screen: ui.screen(), entries: ui.entries }));
 	ui.key("\u001b[B"); ui.key("\u001b[B"); ui.key("\r"); await waitFor(() => ui.screen().includes("rejected:") && ui.screen().includes("pending ·"));
 	ui.key("\r"); await waitFor(() => ui.screen().includes("Approve: save to memory"));
 	for (let index = 0; index < 3; index++) ui.key("\u001b[B");

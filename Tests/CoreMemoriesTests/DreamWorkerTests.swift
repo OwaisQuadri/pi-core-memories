@@ -557,13 +557,31 @@ func dreamWorkerFreshSessionIntakeAdvancesWithoutExhaustingProtectionExchanges(t
   #expect(try fixture.protectedState() == original)
 }
 
-@Test(arguments: ["duplicate", "classification"])
-func dreamWorkerDeferredSourcesBlockDuplicateIdentityAndChangedSavedClassification(kind: String)
-  throws
-{
+@Test(arguments: ["duplicate", "classification", "content", "role", "answer"])
+func dreamWorkerRejectsInvalidDeferredSourcesBeforeModelRequest(kind: String) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   try fixture.populate()
+  switch kind {
+  case "content":
+    try fixture.append(
+      dreamEntry(
+        "unknown", nil, dreamOld,
+        message: dreamJSON([
+          "role": "user", "content": [["type": "future-human", "text": "Words"]],
+        ])) + "\n")
+  case "role":
+    try fixture.append(
+      dreamEntry(
+        "unknown", nil, dreamOld,
+        message: dreamJSON(["role": "future-role", "content": "Words"])) + "\n")
+  case "answer":
+    try fixture.append(
+      dreamResult(
+        "unknown", nil, call: "c", tool: "ask_user_question", "Words",
+        details: dreamAnswer("answered", [["type": "future-answer", "label": "Words"]])) + "\n")
+  default: break
+  }
   let generation = kind == "classification" ? 1 : 0
   if kind == "classification" {
     let seed = try DreamWorkerProcess()

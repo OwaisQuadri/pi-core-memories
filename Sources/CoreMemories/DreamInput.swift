@@ -313,6 +313,7 @@ extension SessionReader {
       }
     }
     var folder: PreparationDirectory?
+    let isIncludingTools = isToolEvidenceIncluded || protect != nil
     var isPendingSourceSelected = false
     for source in sources {
       if isCancelled() { throw CancellationError() }
@@ -375,6 +376,12 @@ extension SessionReader {
       }
       inspected.insert(path)
       if let admit {
+        for record in session.records {
+          if isCancelled() { throw CancellationError() }
+          _ = try record.extract(
+            session: session, snippets: stripping.snippets, templates: stripping.templates,
+            isToolEvidenceIncluded: isIncludingTools, agentContext: { nil })
+        }
         let prior = priorViews.first { $0.path == path.rawValue }
         if (tracked[path]?.completeBytes ?? 0) < UInt64(complete) {
           if isPendingSourceSelected {
@@ -413,7 +420,6 @@ extension SessionReader {
       uniqueKeysWithValues: tracked.map { path, position in
         (path, try views.first(where: { $0.path == path.rawValue })?.project(position) ?? position)
       })
-    let isIncludingTools = isToolEvidenceIncluded || protect != nil
     captured.sort {
       modified[$0.path]! != modified[$1.path]!
         ? modified[$0.path]! > modified[$1.path]! : $0.path.rawValue < $1.path.rawValue

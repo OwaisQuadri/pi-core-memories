@@ -48,7 +48,7 @@ enum DreamRunEncoding {
       let schema = try decoder.decode(Schema.self, from: bytes)
       guard
         schema.schemaVersion == 2
-          || (type == Completion.self && schema.schemaVersion == 3)
+          || ((type == Completion.self || type == Request.self) && schema.schemaVersion == 3)
           || (type == RecoveryCheckpoint.self && schema.schemaVersion == 1)
       else { throw DreamRunError.unsupportedSchema }
       let value = try decoder.decode(type, from: bytes)
@@ -690,18 +690,32 @@ extension DreamRunEncoding {
     let contextHash: String
     let systemPrompt: String
     let messages: [DreamRequestMessage]
+    var renderingVersion: Int?
+
+    func renderings() throws -> [DreamRequestRendering] {
+      switch (schemaVersion, renderingVersion) {
+      case (2, nil): return [.connectedV3, .legacyV1]
+      case (3, 3): return [.connectedV3]
+      default: throw DreamRunError.unsupportedSchema
+      }
+    }
 
     func domain(run: FrozenDreamRun, context: DreamDecisionContext, bytes: Data) throws
       -> DreamModelRequest
     {
-      guard schemaVersion == 2, runID == run.runID, generation == run.progress.generation,
+      let renderings = try renderings()
+      guard runID == run.runID, generation == run.progress.generation,
         inputHash == run.inputHash.rawValue, contextHash == context.contextHash.rawValue,
-        systemPrompt == context.savedSystemPrompt, messages.count == 1,
-        messages[0].role == .user,
-        messages
-          == (try context.requestMessages(
-            timestampMilliseconds: messages[0].timestampMilliseconds))
+        messages.count == 1, messages[0].role == .user
       else { throw DreamRunError.corruption }
+      let isVerified = try renderings.contains { rendering in
+        guard systemPrompt.utf8.elementsEqual(context.systemPrompt(rendering: rendering).utf8)
+        else { return false }
+        let expected = try context.requestMessages(
+          timestampMilliseconds: messages[0].timestampMilliseconds, rendering: rendering)
+        return messages[0].text.utf8.elementsEqual(expected[0].text.utf8)
+      }
+      guard isVerified else { throw DreamRunError.corruption }
       return DreamModelRequest(
         runID: runID, generation: generation, inputHash: run.inputHash,
         contextHash: context.contextHash, requestHash: SourceDigest(bytes: bytes),

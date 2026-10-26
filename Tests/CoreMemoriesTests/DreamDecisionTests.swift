@@ -205,6 +205,101 @@ private func decisionOwnerNote(_ source: PrimaryTextID, owner: PinnedOwnerInput)
   ]
 }
 
+@Test(arguments: [DreamRequestRendering.legacyV1, .connectedV3])
+func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
+  rendering: DreamRequestRendering
+) throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  let request = DreamRunEncoding.Request(
+    schemaVersion: 2, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+    inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+    systemPrompt: context.systemPrompt(rendering: rendering),
+    messages: try context.requestMessages(timestampMilliseconds: 123, rendering: rendering))
+  let bytes = Data(
+    (" \n" + String(decoding: try DreamRunEncoding.encode(request), as: UTF8.self)).utf8)
+  let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
+  let replay = try saved.domain(run: fixture.run, context: context, bytes: bytes)
+  #expect(replay.requestHash == SourceDigest(bytes: bytes))
+  #expect(replay.systemPrompt.utf8.elementsEqual(request.systemPrompt.utf8))
+  #expect(replay.messages[0].text.utf8.elementsEqual(request.messages[0].text.utf8))
+  if rendering == .legacyV1 {
+    #expect(
+      SourceDigest(bytes: Data(request.systemPrompt.utf8)).rawValue
+        == "76a60a515c0c03b8d810859056a69cb09ea2c1b6e683e149ae3c6bb42a61fd31")
+    let body = try #require(
+      JSONSerialization.jsonObject(with: Data(request.messages[0].text.utf8)) as? [String: Any])
+    #expect(body["connectedWindowBindings"] == nil)
+    let primary = try #require(body["primaryEvidence"] as? [[String: Any]])
+    #expect(
+      Set(try #require(primary.first).keys)
+        == ["source", "kind", "text", "timestampReferenceTimeBits"])
+    let schema = try #require(body["decisionSchema"] as? [String: Any])
+    let properties = try #require(schema["properties"] as? [String: Any])
+    let decisions = try #require(properties["decisions"] as? [String: Any])
+    let items = try #require(decisions["items"] as? [String: Any])
+    let variants = try #require(items["oneOf"] as? [[String: Any]])
+    #expect(
+      Set(try #require(variants.first?["required"] as? [String]))
+        == ["kind", "scope", "text", "sources", "contradictions", "reason"])
+  }
+}
+
+@Test func dreamRequestVersionMarkerRefusesMissingUnknownAndInconsistentFormats() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  for (schema, rendering) in [(3, 3), (3, nil), (3, 2), (2, 3), (4, 4)] as [(Int, Int?)] {
+    let request = DreamRunEncoding.Request(
+      schemaVersion: schema, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      systemPrompt: context.savedSystemPrompt,
+      messages: try context.requestMessages(timestampMilliseconds: 123), renderingVersion: rendering
+    )
+    let bytes = try DreamRunEncoding.encode(request)
+    if schema == 3 && rendering == 3 {
+      let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
+      #expect(
+        try saved.domain(run: fixture.run, context: context, bytes: bytes).requestHash
+          == SourceDigest(bytes: bytes))
+    } else {
+      #expect(throws: DreamRunError.unsupportedSchema) {
+        try request.domain(run: fixture.run, context: context, bytes: bytes)
+      }
+    }
+  }
+}
+
+@Test func dreamRequestMixedHistoricalPromptAndMessageFormatsRemainCorrupt() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  for (prompt, message) in [
+    (DreamRequestRendering.legacyV1, DreamRequestRendering.connectedV3),
+    (.connectedV3, .legacyV1),
+  ] {
+    let request = DreamRunEncoding.Request(
+      schemaVersion: 2, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      systemPrompt: context.systemPrompt(rendering: prompt),
+      messages: try context.requestMessages(timestampMilliseconds: 123, rendering: message))
+    #expect(throws: DreamRunError.corruption) {
+      try request.domain(
+        run: fixture.run, context: context, bytes: DreamRunEncoding.encode(request))
+    }
+  }
+}
+
+@Test func dreamRequestLegacyRenderingCannotOmitToolEvidence() throws {
+  let fixture = try DecisionFixture(isToolEvidenceIncluded: true)
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  #expect(throws: DreamRunError.corruption) {
+    try context.requestMessages(timestampMilliseconds: 123, rendering: .legacyV1)
+  }
+}
+
 @Test func dreamDecisionCorrectsBlueToGreenWithExactBytesAndMetadata() throws {
   let fixture = try DecisionFixture(document: decisionBlue)
   defer { fixture.clean() }

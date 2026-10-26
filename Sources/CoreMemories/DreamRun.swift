@@ -1224,10 +1224,11 @@ public final class DreamRunStore {
         milliseconds < Double(Int64.max)
       else { throw DreamRunError.corruption }
       let request = DreamRunEncoding.Request(
-        schemaVersion: 2, runID: runID, generation: progress.generation,
+        schemaVersion: 3, runID: runID, generation: progress.generation,
         inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
         systemPrompt: context.savedSystemPrompt,
-        messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)))
+        messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)),
+        renderingVersion: DreamRequestRendering.connectedV3.rawValue)
       let requestBytes = try bounded(request)
       let directory = try runs.child(runID, isCreating: true)
       try synchronize(runs, name: "runDirectory")

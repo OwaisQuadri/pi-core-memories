@@ -1276,32 +1276,49 @@ private struct DecisionJSONParser {
   }
 }
 
+enum DreamRequestRendering: Int, Sendable {
+  case legacyV1 = 1
+  case connectedV3 = 3
+}
+
 extension DreamDecisionContext {
-  func requestMessages(timestampMilliseconds: Int64) throws -> [DreamRequestMessage] {
+  func requestMessages(
+    timestampMilliseconds: Int64, rendering: DreamRequestRendering = .connectedV3
+  ) throws -> [DreamRequestMessage] {
+    guard
+      rendering != .legacyV1
+        || (connectedEvidence == nil && rejectedPredecessors.isEmpty
+          && primaryCatalogue.allSatisfy {
+            $0.kind != .toolCall && $0.kind != .toolResult && $0.originalWitness == nil
+          })
+    else { throw DreamRunError.corruption }
     let primary: [DecisionJSON] = primaryCatalogue.map {
       var fields: [String: DecisionJSON] = [
         "source": sourceJSON($0.id), "kind": .string($0.kind.rawValue),
         "text": .string($0.exactText),
-        "contentDigest": .string(SourceDigest(bytes: Data($0.exactText.utf8)).rawValue),
-        "isToolActivity": .boolean($0.kind == .toolCall || $0.kind == .toolResult),
-        "isCurrentWindow": .boolean(connectedEvidence?.currentSourceIDs.contains($0.id) ?? true),
-        "locator": .object([
+        "timestampReferenceTimeBits": .string(
+          String($0.timestamp.timeIntervalSinceReferenceDate.bitPattern)),
+      ]
+      if rendering == .connectedV3 {
+        fields["contentDigest"] = .string(SourceDigest(bytes: Data($0.exactText.utf8)).rawValue)
+        fields["isToolActivity"] = .boolean($0.kind == .toolCall || $0.kind == .toolResult)
+        fields["isCurrentWindow"] = .boolean(
+          connectedEvidence?.currentSourceIDs.contains($0.id) ?? true)
+        fields["locator"] = .object([
           "relativePath": .string($0.witness.relativePath.rawValue),
           "start": .string(String($0.witness.byteRange.lowerBound)),
           "end": .string(String($0.witness.byteRange.upperBound)),
           "rawRecordHash": .string($0.witness.rawRecordHash.rawValue),
-        ]),
-        "timestampReferenceTimeBits": .string(
-          String($0.timestamp.timeIntervalSinceReferenceDate.bitPattern)),
-      ]
-      if let original = $0.originalWitness {
-        fields["admittedLocator"] = fields["locator"]
-        fields["locator"] = .object([
-          "relativePath": .string(original.relativePath.rawValue),
-          "start": .string(String(original.byteRange.lowerBound)),
-          "end": .string(String(original.byteRange.upperBound)),
-          "rawRecordHash": .string(original.rawRecordHash.rawValue),
         ])
+        if let original = $0.originalWitness {
+          fields["admittedLocator"] = fields["locator"]
+          fields["locator"] = .object([
+            "relativePath": .string(original.relativePath.rawValue),
+            "start": .string(String(original.byteRange.lowerBound)),
+            "end": .string(String(original.byteRange.upperBound)),
+            "rawRecordHash": .string(original.rawRecordHash.rawValue),
+          ])
+        }
       }
       return .object(fields)
     }
@@ -1327,11 +1344,9 @@ extension DreamDecisionContext {
     }
     var payloadFields: [String: DecisionJSON] = [
       "schemaVersion": .integer(1), "contextHash": .string(contextHash.rawValue),
-      "decisionSchema": decisionSchema,
+      "decisionSchema": decisionSchema(rendering: rendering),
       "date": .string(addedDate), "policy": .string(Self.policy),
       "primaryEvidence": .array(primary), "agentContextNotEvidence": .array(agents),
-      "connectedWindowBindings": .array(
-        (connectedEvidence?.windowBindings ?? []).map { .string($0.rawValue) }),
       "questionsAndSelectedLabelsNotEvidence": .array(questions),
       "approvedMemoryNotPrimaryEvidence": .array(approved),
       "eligibleMemoryAnchors": .array(memoryCatalogue.filter(\.isEligible).map(\.json)),
@@ -1354,9 +1369,13 @@ extension DreamDecisionContext {
       "limitations": .array(limitations.map { .string($0) }),
       "validationLimits": try DecisionJSON.parse(DreamRunEncoding.encode(limits)),
     ]
-    if !rejectedPredecessors.isEmpty {
-      payloadFields["rejectedPredecessorsNotPrimaryEvidence"] = try DecisionJSON.parse(
-        DreamRunEncoding.encode(rejectedPredecessors))
+    if rendering == .connectedV3 {
+      payloadFields["connectedWindowBindings"] = .array(
+        (connectedEvidence?.windowBindings ?? []).map { .string($0.rawValue) })
+      if !rejectedPredecessors.isEmpty {
+        payloadFields["rejectedPredecessorsNotPrimaryEvidence"] = try DecisionJSON.parse(
+          DreamRunEncoding.encode(rejectedPredecessors))
+      }
     }
     let payload = DecisionJSON.object(payloadFields)
     return [
@@ -1366,7 +1385,7 @@ extension DreamDecisionContext {
     ]
   }
 
-  private var decisionSchema: DecisionJSON {
+  private func decisionSchema(rendering: DreamRequestRendering) -> DecisionJSON {
     func closed(_ fields: [String: DecisionJSON]) -> DecisionJSON {
       .object([
         "type": .string("object"), "additionalProperties": .boolean(false),
@@ -1422,18 +1441,24 @@ extension DreamDecisionContext {
         ]),
       ])
     ])
+    var add: [String: DecisionJSON] = [
+      "kind": literal("add"), "scope": scope, "text": text, "sources": sources,
+      "contradictions": contradictions, "reason": text,
+    ]
+    var update: [String: DecisionJSON] = [
+      "kind": literal("update"), "scope": scope, "anchor": anchor, "text": text,
+      "sources": sources, "contradictions": contradictions, "reason": text,
+    ]
+    if rendering == .connectedV3 {
+      add["conditions"] = conditions
+      add["successor"] = successor
+      update["conditions"] = conditions
+      update["successor"] = successor
+    }
     let decisions = DecisionJSON.object([
       "oneOf": .array([
-        closed([
-          "kind": literal("add"), "scope": scope, "text": text, "sources": sources,
-          "contradictions": contradictions, "conditions": conditions, "successor": successor,
-          "reason": text,
-        ]),
-        closed([
-          "kind": literal("update"), "scope": scope, "anchor": anchor, "text": text,
-          "sources": sources, "contradictions": contradictions, "conditions": conditions,
-          "successor": successor, "reason": text,
-        ]),
+        closed(add),
+        closed(update),
         closed([
           "kind": literal("noChange"), "sources": sources,
           "reasonCode": .object([
@@ -1455,13 +1480,29 @@ extension DreamDecisionContext {
     ])
   }
 
-  var savedSystemPrompt: String {
-    guard let deviceKey else { return Self.systemPrompt }
-    return Self.systemPrompt + "\nDevice-local facts belong only to {kind:\"device\",deviceKey:\""
+  var savedSystemPrompt: String { systemPrompt(rendering: .connectedV3) }
+
+  func systemPrompt(rendering: DreamRequestRendering) -> String {
+    let prompt = rendering == .legacyV1 ? Self.legacySystemPrompt : Self.systemPrompt
+    guard let deviceKey else { return prompt }
+    return prompt + "\nDevice-local facts belong only to {kind:\"device\",deviceKey:\""
       + deviceKey
       + "\"} or {kind:\"deviceProject\",deviceKey:\"" + deviceKey
       + "\",key:\"matching project key\"}. These scopes apply only to this device. General durable facts still use global or project scope. Never infer device specificity without primary support."
   }
+
+  private static let legacySystemPrompt = """
+    Return one JSON object only, with exactly schemaVersion:1, contextHash (the supplied hash), and decisions (an array). Do not use fences or trailing prose. Every primary source needs proposal support or exactly one terminal note, never both. Only primaryEvidence can support a decision. Other sections are labeled context, not human evidence. Owner coverage is incomplete: inspect the supplied limitations. Do not open references or infer authorship from stored roles. Proposals require human review and do not approve memory.
+    Each decision has exactly one of these field sets:
+    add: kind, scope, text, sources, contradictions, reason.
+    update: kind, scope, anchor, text, sources, contradictions, reason.
+    noChange: kind, sources, reasonCode, explanation.
+    ownerNote: kind, sources, owner, contradictions, explanation.
+    kind is the variant name. scope is {kind:"global"} or {kind:"project",key:"64 lowercase hex"}. sources is a nonempty array of exact {session,entry,part} identities from primaryEvidence. text, reason, and explanation are nonempty single-line text, with no controls or source/date annotations. Code adds annotations and the saved date.
+    A memory anchor is exactly {scope,documentHash,start,end,before}; use one complete eligible supplied block with exact UTF-8 byte offsets and before text. An update must include that replaced anchor as a memory contradiction. An owner anchor is exactly {key,ownerHash,start,end,before}; use a nonempty UTF-8-boundary slice of supplied owner bytes. Owner notes do not authorize owner edits.
+    contradictions is an array of {kind:"primary",source,explanation}, {kind:"memory",anchor,explanation}, or {kind:"owner",anchor,explanation}. Use only exact supplied sources and anchors in eligible matching scopes. Empty contradictions means none supplied, not proof of no conflicts.
+    noChange reasonCode is notDurable, alreadyRepresented, insufficientEvidence, or unresolvedScope. Unresolved primary scope permits only unresolvedScope noChange. Empty decisions is valid only for empty primaryEvidence. Do not use selected labels, questions, agent text, approved memory, owners, or limitations as primary support. Do not copy instruction owners into memory when an owner note fits.
+    """
 
   static let systemPrompt = """
     Return one JSON object only, with exactly schemaVersion:1, contextHash (the supplied hash), and decisions (an array). Do not use fences or trailing prose. Every primary source needs proposal support or exactly one terminal note, never both. Only primaryEvidence can support a decision. Other sections are labeled context, not human evidence. Owner coverage is incomplete: inspect the supplied limitations. Do not open references or infer authorship from stored roles. Proposals require human review and do not approve memory.

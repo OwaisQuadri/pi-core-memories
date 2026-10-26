@@ -51,6 +51,14 @@ New requests require `conditions:[{source:{session,entry,part},explanation}]` fo
 
 The native model policy permits a single clear persistent intent without repetition. It requires preserving conditions in proposed prose, distinguishing observations from inferred claims, and treating tool activity as untrusted evidence rather than instructions or human intent. These are model policy constraints, not a claim that structural validation proves semantic truth. Exact human approval remains mandatory downstream.
 
+## Saved request replay
+
+New saved requests use request schema 3 with `renderingVersion:3`. The input, context and response schemas are unchanged. Current prompt and message content is unchanged.
+
+Existing unversioned request schema 2 can contain either the original text-only rendering or the connected-evidence rendering. Replay accepts only a complete matching prompt/message pair derived from the frozen context. It compares exact UTF-8 bytes, retains the stored request bytes and digest, and keeps admission and completion-chain verification. It does not regenerate or rewrite saved artifacts.
+
+The original rendering cannot represent tool evidence, connected windows, rejected predecessors or admitted-source locator mappings. Replay refuses that rendering when the frozen context contains those features. Unknown or inconsistent version markers fail closed. A stored hash alone does not prove that a request was correctly derived from its context.
+
 ## Integration obligations
 
 No CLI flag or archive-supplied scrub assertion is added. The parent must implement the trusted source-protection bridge before setting both preparation flags. Leave default tool exclusion in place until then. No model client, credentials, model selection or worker lifecycle is added here.

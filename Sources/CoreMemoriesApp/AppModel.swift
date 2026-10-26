@@ -322,8 +322,9 @@ import Foundation
     } catch { failure = String(describing: error) }
   }
 
-  func run(_ operation: DreamControlOperation) {
-    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+  @discardableResult
+  func run(_ operation: DreamControlOperation) -> Task<Void, Never>? {
+    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return nil }
     savedRecovery = nil
     isDreamRunning = true
     dreamPhase = "Starting"
@@ -364,6 +365,7 @@ import Foundation
       self.control = nil
       await refresh()
     }
+    return dreamTask
   }
 
   func receive(_ bytes: Data) {

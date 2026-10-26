@@ -21,7 +21,8 @@
   "pi": {
     "extensions": [
       "./Integration/Pi/index.ts"
-    ]
+    ],
+    "compile": ["node", "Integration/Pi/compile.ts"]
   },
   "files": [
     "Integration/Pi/*.ts",
@@ -34,6 +35,6 @@
     "typescript": "7.0.2"
   },
   "dependencies": {
-    "pi-compiled": "github:OwaisQuadri/pi-compiled"
+    "pi-compiled": "git+https://github.com/OwaisQuadri/pi-compiled.git#c3328f892a1efb5eb080ecd77dfa4977d7f17314"
   }
 }

@@ -36,7 +36,8 @@ func missingApprovedBlobNeverFetches(noFetchValue: String?) throws {
     reason: "Complete partial store")
   #expect(try store.review(commit: proposal.commit).contains("Complete local candidate"))
   #expect(try store.render(cwd: fixture.root) == "# Memory\n")
-  let binary = try #require(environment["PI_CORE_MEMORIES_BIN"])
+  let binary = try #require(
+    environment["PI_CORE_MEMORIES_BIN"] ?? environment["PI_CORE_MEMORIES_EXECUTABLE"])
   for command in ["render", "check"] {
     let arguments =
       [command, "--repo", fixture.repo.path]

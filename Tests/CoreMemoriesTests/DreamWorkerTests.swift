@@ -13,7 +13,9 @@ final class DreamWorkerProcess {
   private let deadline = Date().addingTimeInterval(20)
 
   init(arguments: [String] = ["dream-worker"]) throws {
-    let binary = try #require(ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"])
+    let binary = try #require(
+      ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_BIN"]
+        ?? ProcessInfo.processInfo.environment["PI_CORE_MEMORIES_EXECUTABLE"])
     process.executableURL = URL(fileURLWithPath: binary)
     process.arguments = arguments
     process.environment = [
@@ -55,16 +57,31 @@ final class DreamWorkerProcess {
   func closeInput() throws { try input.fileHandleForWriting.close() }
 
   var progressFrames: [[String: Any]] = []
+  var protectionCount = 0
+  var isProtectingAutomatically = true
+  var protectionTransform: ([String]) -> [String] = { $0 }
 
   func frame() throws -> [String: Any] {
     while true {
       if let newline = buffered.firstIndex(of: 10) {
         let bytes = buffered[..<newline]
         buffered.removeSubrange(...newline)
-        let frame = try #require(try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any])
+        let frame = try #require(
+          try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any])
+        if frame["type"] as? String == "sourceProtectionRequest", isProtectingAutomatically {
+          protectionCount += 1
+          try send(
+            workerProtectionReply(frame, pieces: protectionTransform(frame["pieces"] as! [String])))
+          continue
+        }
         if frame["type"] as? String == "progress" {
           progressFrames.append(frame)
-          #expect(Set(frame.keys) == ["version", "type", "invocationID", "backlogBytes", "backlogLimitBytes", "plannedBytes", "completedBytes", "undreamtBytes", "nextBytes", "repeatedRecords", "estimateSeconds"])
+          #expect(
+            Set(frame.keys) == [
+              "version", "type", "invocationID", "backlogBytes", "backlogLimitBytes",
+              "plannedBytes", "completedBytes", "undreamtBytes", "nextBytes", "repeatedRecords",
+              "estimateSeconds",
+            ])
           continue
         }
         return frame
@@ -105,7 +122,7 @@ private func workerBytes(_ object: [String: Any]) throws -> Data {
     withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]) + Data([10])
 }
 
-private func workerStart(
+func workerStart(
   _ fixture: TransactionFixture, resume: String = "inspectOrContinue", sessions: URL? = nil,
   snippets: URL? = nil, isStripping: Bool = true
 ) -> [String: Any] {
@@ -124,7 +141,17 @@ private func workerStart(
   ]
 }
 
-private func workerReply(_ request: [String: Any], text: String? = nil, category: String? = nil)
+func workerProtectionReply(_ request: [String: Any], pieces: [String]? = nil) -> [String: Any] {
+  let checked = pieces ?? (request["pieces"] as! [String])
+  return [
+    "version": 1, "type": "sourceProtectionResult", "invocationID": request["invocationID"]!,
+    "requestID": request["requestID"]!, "inputDigest": request["inputDigest"]!,
+    "status": "checked", "policy": "pi-credentials/redact-v1", "pieces": checked,
+    "outputDigest": DreamSourceProtection.digest(checked).rawValue,
+  ]
+}
+
+func workerReply(_ request: [String: Any], text: String? = nil, category: String? = nil)
   -> [String: Any]
 {
   var reply: [String: Any] = [
@@ -141,7 +168,7 @@ private func workerReply(_ request: [String: Any], text: String? = nil, category
   return reply
 }
 
-private func workerDecision(_ request: [String: Any], isProposal: Bool = false) throws -> String {
+func workerDecision(_ request: [String: Any], isProposal: Bool = false) throws -> String {
   let messages = try #require(request["messages"] as? [[String: Any]])
   let text = try #require(messages.first?["text"] as? String)
   let context = try #require(
@@ -461,6 +488,138 @@ func dreamWorkerExplicitEmptyStrippingFolderIsBlocked(role: String) throws {
       try worker.finish()
     }
   }
+}
+
+@Test(arguments: [32, 40_000])
+func dreamWorkerFreshSessionIntakeAdvancesWithoutExhaustingProtectionExchanges(textBytes: Int)
+  throws
+{
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  var expected: [String: UInt64] = [:]
+  for index in 0..<8 {
+    let name = "session-\(index).jsonl"
+    let bytes =
+      dreamHeader("session-\(index)", cwd: fixture.root.path, name: nil) + "\n"
+      + dreamUser("entry-\(index)", nil, dreamOld, String(repeating: "x", count: textBytes)) + "\n"
+    try fixture.write(
+      bytes, file: fixture.source.deletingLastPathComponent().appendingPathComponent(name))
+    expected["--fixture--/" + name] = UInt64(bytes.utf8.count)
+  }
+  let owner = fixture.root.appendingPathComponent("owner.md")
+  try fixture.write("Use clear progress reports.\n", file: owner)
+  let original = try fixture.protectedState()
+  var previous: [String: UInt64] = [:]
+  var generation: UInt64 = 0
+  var isFinished = false
+  for _ in 0...8 {
+    let worker = try DreamWorkerProcess()
+    defer { worker.clean() }
+    var start = workerStart(fixture)
+    var roots = start["roots"] as! [String: Any]
+    roots["globalAgents"] = owner.path
+    start["roots"] = roots
+    start["batchTextBytes"] = 65_536
+    try worker.send(start)
+    let request = try worker.frame()
+    if request["status"] as? String == "noNewRecords" {
+      #expect(previous == expected)
+      #expect(worker.protectionCount <= 16)
+      try worker.finish()
+      isFinished = true
+      break
+    }
+    try #require(request["type"] as? String == "modelRequest", "\(request)")
+    try worker.send(workerReply(request, text: workerDecision(request)))
+    let result = try worker.frame()
+    #expect(result["status"] as? String == "completed")
+    generation += 1
+    #expect(result["generation"] as? String == String(generation))
+    #expect(result["isBacklog"] as? Bool == (generation < 8))
+    #expect(worker.protectionCount <= 16)
+    try worker.finish()
+    let saved = try DreamRunEncoding.decode(
+      DreamRunEncoding.Generation.self,
+      bytes: Data(
+        contentsOf: fixture.state.appendingPathComponent("generations/\(generation).json")))
+    let positions = try saved.progress.domain().positions
+    #expect(positions.filter { $0.completeBytes != previous[$0.relativePath.rawValue] }.count == 1)
+    #expect(Set(previous.keys).isSubset(of: Set(positions.map { $0.relativePath.rawValue })))
+    for position in positions {
+      let path = position.relativePath.rawValue
+      #expect(position.completeBytes >= (previous[path] ?? 0))
+      #expect(position.completeBytes <= (expected[path] ?? 0))
+      previous[path] = position.completeBytes
+    }
+  }
+  #expect(isFinished)
+  if textBytes == 40_000 { #expect(generation > 1) }
+  #expect(try fixture.protectedState() == original)
+}
+
+@Test(arguments: ["duplicate", "classification", "content", "role", "answer"])
+func dreamWorkerRejectsInvalidDeferredSourcesBeforeModelRequest(kind: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  switch kind {
+  case "content":
+    try fixture.append(
+      dreamEntry(
+        "unknown", nil, dreamOld,
+        message: dreamJSON([
+          "role": "user", "content": [["type": "future-human", "text": "Words"]],
+        ])) + "\n")
+  case "role":
+    try fixture.append(
+      dreamEntry(
+        "unknown", nil, dreamOld,
+        message: dreamJSON(["role": "future-role", "content": "Words"])) + "\n")
+  case "answer":
+    try fixture.append(
+      dreamResult(
+        "unknown", nil, call: "c", tool: "ask_user_question", "Words",
+        details: dreamAnswer("answered", [["type": "future-answer", "label": "Words"]])) + "\n")
+  default: break
+  }
+  let generation = kind == "classification" ? 1 : 0
+  if kind == "classification" {
+    let seed = try DreamWorkerProcess()
+    defer { seed.clean() }
+    try seed.send(workerStart(fixture))
+    let request = try seed.frame()
+    try seed.send(workerReply(request, text: workerDecision(request)))
+    #expect(try seed.frame()["status"] as? String == "completed")
+    try seed.finish()
+    try fixture.append(
+      dreamJSON([
+        "type": "session_info", "id": "lateinfo", "timestamp": dreamOld,
+        "name": "worker#abcdef12",
+      ]) + "\n")
+  }
+  let priority = fixture.source.deletingLastPathComponent().appendingPathComponent("priority.jsonl")
+  try fixture.write(
+    dreamHeader(kind == "duplicate" ? "one" : "priority", cwd: fixture.root.path, name: nil)
+      + "\n" + dreamUser("priority-user", nil, dreamOld, "Another session.") + "\n",
+    file: priority)
+  try FileManager.default.setAttributes(
+    [.modificationDate: Date().addingTimeInterval(-3_600)], ofItemAtPath: fixture.source.path)
+  try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: priority.path)
+  let before = try fixture.protectedState()
+  let generations = fixture.state.appendingPathComponent("generations")
+  let saved = kind == "classification" ? try fixture.snapshot(generations) : nil
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  try worker.send(workerStart(fixture))
+  let result = try worker.frame()
+  try #require(result["status"] as? String == "blocked")
+  #expect(result["reason"] as? String == "workerFailure")
+  try worker.finish()
+  #expect(
+    !FileManager.default.fileExists(
+      atPath: generations.appendingPathComponent("\(generation + 1).json").path))
+  if let saved { #expect(try fixture.snapshot(generations) == saved) }
+  #expect(try fixture.protectedState() == before)
 }
 
 @Test(arguments: [

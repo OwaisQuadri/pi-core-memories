@@ -5,21 +5,22 @@ import { lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
-import { BorderedLoader, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, getAgentDir, type ExtensionAPI, type ExtensionContext, type SubscriptionSimpleStreamOptions } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { commandPath, commandReady } from "./command.ts";
+import { protectDreamSources, SOURCE_PROTECTION_INPUT_BYTES, SOURCE_PROTECTION_REPLY_BYTES, type SourceProtectionResult } from "./source-protection.ts";
 
 export const DREAM_REVIEW_TYPE = "core-memory-dream-review";
 export const MAXIMUM_FRAME_BYTES = 32 * 1_048_576 * 6 + 65_536;
 const maximumTextBytes = 262_144;
 const maximumReplyBytes = maximumTextBytes * 6 + 8192;
-const maximumAggregateBytes = MAXIMUM_FRAME_BYTES * 2 + 2;
+const maximumAggregateBytes = MAXIMUM_FRAME_BYTES * 2 + SOURCE_PROTECTION_INPUT_BYTES * 16 + 18;
 
 type ObjectValue = Record<string, unknown>;
 export type DreamSelection = { provider: string; modelID: string; thinkingLevel: string };
 export type DreamRoots = { state: string; sessions: string; memory: string; snippets: string | null; prompts: string | null; globalAgents: string | null };
 export type DreamScopeOptions = { deviceKey?: string; projectBindings?: Record<string, string> };
-export type DreamStart = { version: 1; type: "start"; invocationID: string; roots: DreamRoots; selection: DreamSelection; resume: "inspectOrContinue" | "retryInterruptedCall" | "replaceInvalidResponse"; batchTextBytes: number } & DreamScopeOptions;
+export type DreamStart = { version: 1; type: "start"; invocationID: string; roots: DreamRoots; selection: DreamSelection; resume: "inspectOrContinue" | "retryInterruptedCall" | "replaceInvalidResponse"; batchTextBytes: number; excludedSessionIDs?: string[] } & DreamScopeOptions;
 export type DreamRequest = { version: 1; type: "modelRequest"; invocationID: string; requestID: string; runID: string; generation: string; inputHash: string; contextHash: string; requestHash: string; selection: DreamSelection; systemPrompt: string; messages: { role: "system" | "user"; text: string; timestampMilliseconds: number }[] };
 type DreamSource = { sessionID: string; entryID: string; partIndex: number };
 type DreamProposal = { ref: string; commit: string; base: string; path: string; sources: DreamSource[]; contradictions: string };
@@ -85,6 +86,7 @@ export function dreamBatchTextBytes(contextWindow: unknown): number | null {
 	return Math.min(contextWindow, 1_048_576);
 }
 export type DreamCall = (request: DreamRequest, signal: AbortSignal) => Promise<string>;
+export type DreamSourceProtectionCall = (request: unknown, signal: AbortSignal) => Promise<SourceProtectionResult>;
 
 function failure(): never {
 	const frames = (new Error().stack ?? "").split("\n").slice(2, 4).map((frame) => frame.trim().replace(/\(.*\//, "("));
@@ -297,7 +299,7 @@ export function workerEnvironment(environment: NodeJS.ProcessEnv = process.env):
 	return Object.fromEntries(["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL"].flatMap((key) => environment[key] === undefined ? [] : [[key, environment[key]]]));
 }
 
-export async function runDreamWorker(start: DreamStart, call: DreamCall, signal: AbortSignal, onProgress: (coverage: DreamCoverage) => void = () => {}): Promise<DreamReport> {
+export async function runDreamWorker(start: DreamStart, call: DreamCall, signal: AbortSignal, onProgress: (coverage: DreamCoverage) => void = () => {}, protect?: DreamSourceProtectionCall): Promise<DreamReport> {
 	if (signal.aborted) throw new Error("Dream cancelled.");
 	if (!process.env.PI_CORE_MEMORIES_DREAM_EXECUTABLE) await commandReady(signal).catch(() => undefined);
 	if (signal.aborted) throw new Error("Dream cancelled.");
@@ -308,6 +310,10 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 	let final: DreamReport | undefined;
 	let coverage: DreamCoverage | undefined;
 	let progressFrames = 0;
+	let protectionExchanges = 0;
+	let isProtecting = false;
+	let isProtectionChecked = false;
+	let isProtectionBlocked = false;
 	let request: DreamRequest | undefined;
 	let isReplySent = false;
 	let isCancelled = false;
@@ -329,14 +335,14 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 			kill = setTimeout(() => { if (!isClosed) worker.kill("SIGKILL"); }, 1000);
 		}, 1000);
 	}
-	function rejectTransport(cause: unknown): void {
-		error ??= new Error(`Dream worker failed: ${message(cause)}`);
+	function rejectTransport(_cause: unknown): void {
+		error ??= new Error("Dream worker private protocol failed.");
 		controller.abort();
 		worker.stdin.destroy(); stop();
 	}
-	function send(value: unknown): void {
+	function send(value: unknown, limit = maximumReplyBytes): void {
 		const bytes = Buffer.from(JSON.stringify(value) + "\n");
-		if (bytes.length > maximumReplyBytes || isClosed || worker.stdin.destroyed) return rejectTransport("reply could not be sent");
+		if (bytes.length > limit || isClosed || worker.stdin.destroyed) return rejectTransport("reply could not be sent");
 		worker.stdin.write(bytes, (writeError) => { if (writeError) rejectTransport(writeError); });
 	}
 	function cancel(): void {
@@ -353,24 +359,40 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 			if (controller.signal.aborted) return;
 			if (!result || !isWellFormedText(result) || Buffer.byteLength(result) > maximumTextBytes) failure();
 			response = { ...binding, type: "modelResponse", text: result };
-		} catch (callError) {
+		} catch {
 			if (controller.signal.aborted) return;
-			modelError = `Model call: ${message(callError)}`;
+			modelError = "The dream model call did not complete.";
 			response = { ...binding, type: "modelFailure", category: "incomplete" };
 		}
 		if (final || isClosed || error || isReplySent) return rejectTransport("model reply arrived after the run ended");
 		isReplySent = true; send(response);
 	}
+	async function answerProtection(value: unknown): Promise<void> {
+		try {
+			if (!protect) throw new Error("Source protection is unavailable.");
+			const result = await protect(value, controller.signal);
+			if (controller.signal.aborted) return;
+			if (final || isClosed || error) return rejectTransport("Source protection ended too late.");
+			isProtectionChecked = result.status === "checked";
+			isProtectionBlocked ||= result.status === "blocked";
+			isProtecting = false;
+			send(result, SOURCE_PROTECTION_REPLY_BYTES);
+		} catch (cause) { rejectTransport(cause); }
+	}
 	function consume(bytes: Buffer): void {
 		const value = parseDreamJSON(bytes);
 		const item = object(value);
-		if (final || error) failure();
-		if (item.type === "progress") {
+		if (final || error || isProtecting) failure();
+		if (item.type === "sourceProtectionRequest") {
+			if (isCancelled || (request && !isReplySent) || ++protectionExchanges > 16) failure();
+			isProtecting = true;
+			void answerProtection(value);
+		} else if (item.type === "progress") {
 			const next = dreamCoverage(value, start);
 			if (++progressFrames > 2 || (progressFrames === 1 && (request || next.completedBytes !== 0)) || (progressFrames === 2 && request && !isReplySent && !isCancelled) || (coverage && (next.completedBytes !== next.plannedBytes || JSON.stringify({ ...next, completedBytes: 0 }) !== JSON.stringify({ ...coverage, completedBytes: 0 })))) failure();
 			coverage = next; onProgress(next);
 		} else if (item.type === "modelRequest") {
-			if (request || isCancelled) failure();
+			if (request || isCancelled || !isProtectionChecked || isProtectionBlocked) failure();
 			request = dreamRequest(value, start);
 			void answer(request);
 		} else {
@@ -409,7 +431,7 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 			if (kill) clearTimeout(kill);
 			if (finishTimer) clearTimeout(finishTimer);
 			signal.removeEventListener("abort", cancel);
-			const output = stderr.trim() ? ` · stderr: ${stderr.trim().slice(-500)}` : "";
+			const output = stderr.trim() === "dream-worker: dream storage limit exceeded" ? " · stderr: dream-worker: dream storage limit exceeded" : stderr.trim() ? " · worker wrote a private diagnostic" : "";
 			if (error) fail(new Error(error.message + output));
 			else if (code !== 0 || exitSignal || frameBytes || !final) fail(new Error(`Dream worker exited (${exitSignal ?? `code ${code}`}) without a final report${output}`));
 			else done(final);
@@ -432,6 +454,7 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	}
 	if (signal.aborted) throw new Error("Dream call cancelled.");
 	if (!isSameSelection(request.selection, selection) || model.provider !== selection.provider || model.id !== selection.modelID) modelFailure("model selection does not match the request");
+	if (typeof ctx.modelRegistry.streamSubscriptionSimple !== "function") modelFailure("subscription request guard is unavailable; update Pi before dreaming");
 	const context: Context = { systemPrompt: request.systemPrompt, messages: request.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })) };
 	const reasoning = selection.thinkingLevel === "off" ? undefined : selection.thinkingLevel as "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	const controller = new AbortController();
@@ -442,21 +465,21 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	let isDispatchInvalid = false;
 	controller.signal.addEventListener("abort", () => rejectAbort(new Error(isDispatchInvalid ? "Dream model call failed: physical dispatch changed or was invalid" : "Dream call cancelled.")), { once: true });
 	void cancelled.catch(() => {});
-	const isVirtualSelection = model.api === "pi-virtual";
-	let dispatch = isVirtualSelection ? undefined : { provider: selection.provider, modelID: selection.modelID, api: model.api as string };
-	const onPayload = (_payload: unknown, physicalModel: NonNullable<ExtensionContext["model"]>): undefined => {
+	let dispatch: Parameters<NonNullable<SubscriptionSimpleStreamOptions["onDispatch"]>>[0] | undefined;
+	const onDispatch: NonNullable<SubscriptionSimpleStreamOptions["onDispatch"]> = (physical) => {
 		try {
-			const observed = { provider: text(physicalModel.provider, 256), modelID: text(physicalModel.id, 256), api: text(physicalModel.api, 256) };
-			if (!observed.provider || !observed.modelID || !observed.api || observed.api === "pi-virtual" || (dispatch && (dispatch.provider !== observed.provider || dispatch.modelID !== observed.modelID || dispatch.api !== observed.api))) failure();
+			const observed = { provider: text(physical.provider, 256), modelID: text(physical.modelID, 256), api: text(physical.api, 256) };
+			if (!["openai", "openai-codex", "anthropic"].includes(observed.provider) || !observed.modelID || !observed.api || observed.api === "pi-virtual") failure();
+			if (model.api !== "pi-virtual" && (observed.provider !== model.provider || observed.modelID !== model.id || observed.api !== model.api)) failure();
+			if (dispatch && (dispatch.provider !== observed.provider || dispatch.modelID !== observed.modelID || dispatch.api !== observed.api)) failure();
 			dispatch = observed;
-			return undefined;
-		} catch { isDispatchInvalid = true; controller.abort(); return modelFailure("physical dispatch changed or was invalid"); }
+		} catch { isDispatchInvalid = true; controller.abort(); modelFailure("physical dispatch changed or was invalid"); }
 	};
 	function isExpectedIdentity(message: AssistantMessage): boolean {
 		return !isDispatchInvalid && dispatch !== undefined && message.provider === dispatch.provider && message.model === dispatch.modelID && message.api === dispatch.api;
 	}
 	try {
-	const stream = ctx.modelRegistry.streamSimple(model, context, { signal: controller.signal, reasoning, ...(isVirtualSelection ? { onPayload } : {}) });
+	const stream = ctx.modelRegistry.streamSubscriptionSimple(model, context, { signal: controller.signal, reasoning, onDispatch });
 	let terminal: AssistantMessage | undefined;
 	let isDone = false;
 	const iterator = stream[Symbol.asyncIterator]();
@@ -668,7 +691,7 @@ export function registerDream(pi: ExtensionAPI): () => Promise<void> {
 							phase = "model call"; update();
 							try { return await callDreamModel(request, ctx, model, selection, signal); }
 							finally { phase = "saving"; update(); }
-						}, current.signal, (next) => { coverage = next; update(); });
+						}, current.signal, (next) => { coverage = next; update(); }, (value, signal) => protectDreamSources(pi, start.invocationID, value, signal));
 						report = await workerCompletion;
 						if (isShuttingDown) return report;
 						pi.appendEntry(DREAM_REVIEW_TYPE, { report, memory: roots.memory, ...(coverage ? { coverage, elapsedSeconds: (Date.now() - batchStarted) / 1000 } : {}) });

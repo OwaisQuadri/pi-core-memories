@@ -3,6 +3,8 @@ import { isAbsolute } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { callDreamModel, dreamBatchTextBytes, dreamRoots, dreamScopeOptions, escapeDreamDisplay, parseDreamJSON, readDreamScope, runDreamWorker, type DreamRoots, type DreamScopeOptions, type DreamSelection, type DreamStart } from "./dream.ts";
 
+import { protectDreamSources } from "./source-protection.ts";
+
 type ControlRequest = { operation: "start" | "all" | "retry" | "replace"; roots: DreamRoots | null } & DreamScopeOptions;
 
 export function parseControlRequest(text: string): ControlRequest {
@@ -107,7 +109,8 @@ export function registerDreamControl(
 						emit(ctx, "phase", { phase: "modelCall" });
 						try { return await call(saved, ctx, model, selection, signal); }
 						finally { if (!current.signal.aborted) emit(ctx, "phase", { phase: "saving" }); }
-					}, current.signal, (coverage) => emit(ctx, "progress", { coverage }));
+					}, current.signal, (coverage) => emit(ctx, "progress", { coverage }),
+						(value, signal) => protectDreamSources(pi, start.invocationID, value, signal));
 					const isContinuing = request.operation === "all" && report.status === "completed" && report.isBacklog && !current.signal.aborted;
 					const displayed = report.detail === null ? report : { ...report, detail: detail(report.detail) };
 					emit(ctx, isContinuing ? "batchReport" : "report", { report: displayed });

@@ -26,7 +26,7 @@ test("real Pi RPC handshake uses its absolute worker without PATH lookup or a mo
 			streamSimple() { throw new Error("Model calls are forbidden in this fixture"); }
 		});
 	}`);
-	const child = spawn(process.execPath, [join(sdkRoot, "dist/cli.js"), "--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--extension", resolve(import.meta.dirname, "control.ts"), "--extension", provider, "--no-mcp", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--provider", "memory-control-fixture", "--model", "offline", "--models", "memory-control-fixture/offline", "--thinking", "off"], {
+	const child = spawn(process.execPath, [join(sdkRoot, "dist/cli.js"), "--offline", "--mode", "rpc", "--no-session", "--no-extensions", "--extension", resolve(import.meta.dirname, "control.ts"), "--extension", resolve(import.meta.dirname, "test/source-protection.ts"), "--extension", provider, "--no-mcp", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--provider", "memory-control-fixture", "--model", "offline", "--models", "memory-control-fixture/offline", "--thinking", "off"], {
 		cwd: root,
 		env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: agent, PI_CORE_MEMORIES_DREAM_EXECUTABLE: resolve(binary), PATH: "/usr/bin:/bin" },
 		stdio: "pipe",

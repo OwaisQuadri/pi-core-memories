@@ -1125,3 +1125,103 @@ func dreamInputUnvisitedFolderReplacementCannotRedirectCapture(_ replacement: St
   }
   #expect(checks == 3)
 }
+
+@Test func dreamInputToolEvidenceRequiresScrubbedCallerAndRetainsMultipartWitnesses() throws {
+  let fixture = try DreamInputFixture()
+  defer { fixture.clean() }
+  let call = dreamAssistant("calls", nil, dreamOld, [
+    dreamText("Not human intent."), dreamCall("c1", "read", ["path": "src/A.swift"]),
+    dreamCall("c2", "read", ["path": "src/B.swift"]),
+  ])
+  let result = dreamResult("result", "calls", call: "c1", tool: "read", "Synthetic result")
+  try fixture.write([fixture.header(), call, result].joined(separator: "\n") + "\n",
+    to: fixture.file())
+  #expect(try fixture.prepare().evidence.isEmpty)
+  let reader = try fixture.reader()
+  #expect(throws: (any Error).self) {
+    try reader.prepare(progress: DreamProgress(), limits: DreamInputLimits(),
+      isToolEvidenceIncluded: true)
+  }
+  let batch = try reader.prepare(progress: DreamProgress(), limits: DreamInputLimits(),
+    isToolEvidenceIncluded: true, isSourceScrubbed: true)
+  #expect(batch.evidence.map(\.kind) == [.toolCall, .toolCall, .toolResult])
+  #expect(batch.evidence.map { $0.id.part } == [1, 2, 0])
+  #expect(batch.evidence[0].witness == batch.evidence[1].witness)
+  #expect(batch.evidence[0].witness.rawRecordHash == SourceDigest(bytes: Data((call + "\n").utf8)))
+  let fields = try #require(try JSONSerialization.jsonObject(
+    with: Data(batch.evidence[2].exactText.utf8)) as? [String: Any])
+  #expect(fields["toolCallID"] as? String == "c1")
+  #expect(fields["text"] as? String == "Synthetic result")
+  try SessionReader.verifyPreparation(batch)
+  #expect(try reader.prepare(progress: fixture.checkpoint(batch), limits: DreamInputLimits(),
+    isToolEvidenceIncluded: true, isSourceScrubbed: true).evidence.isEmpty)
+  #expect(throws: (any Error).self) {
+    try reader.prepare(progress: DreamProgress(), limits: DreamInputLimits(maximumBatchBytes: 10),
+      isToolEvidenceIncluded: true, isSourceScrubbed: true)
+  }
+}
+
+@Test func dreamInputPolicyGuidanceNeverBecomesAnsweredEvidence() throws {
+  let fixture = try DreamInputFixture()
+  defer { fixture.clean() }
+  let lines = ["policy-guidance", "automatic-policy-guidance"].enumerated().map { index, status in
+    dreamResult("r\(index)", nil, call: "c", tool: "ask_user_question", "Generated guidance",
+      details: dreamAnswer(status, [["type": "text", "label": "Not human"]]))
+  }
+  try fixture.write(([fixture.header()] + lines).joined(separator: "\n") + "\n", to: fixture.file())
+  let batch = try fixture.prepare()
+  #expect(batch.evidence.isEmpty && batch.selections.isEmpty)
+  try SessionReader.verifyPreparation(batch)
+}
+
+@Test func connectedDreamEvidenceDeduplicatesOverlapWithoutLosingContradictionsOrCursors() throws {
+  let fixture = try DreamInputFixture()
+  defer { fixture.clean() }
+  try fixture.write(fixture.header() + "\n"
+    + dreamUser("old", nil, dreamOld, "Use green unless offline.") + "\n", to: fixture.file())
+  let prior = try fixture.prepare()
+  try fixture.append(dreamUser("new", "old", dreamNew, "Use blue instead when offline.") + "\n",
+    to: fixture.file())
+  let current = try fixture.prepare(try fixture.checkpoint(prior))
+  let overlap = try fixture.prepare()
+  let window = try ConnectedDreamEvidence(current: current, relatedBatches: [prior, overlap])
+  #expect(window.evidence.count == 2)
+  #expect(Set(window.evidence.map(\.exactText)) == [
+    "Use green unless offline.", "Use blue instead when offline.",
+  ])
+  #expect(window.currentSourceIDs == Set(current.evidence.map(\.id)))
+  #expect(window.evidence.first { $0.id == prior.evidence[0].id }?.witness == prior.evidence[0].witness)
+  #expect(try fixture.prepare(try fixture.checkpoint(current)).evidence.isEmpty)
+  #expect(throws: (any Error).self) {
+    try ConnectedDreamEvidence(current: current, relatedBatches: [prior],
+      limits: DreamInputLimits(maximumBatchBytes: 1))
+  }
+  #expect(throws: (any Error).self) {
+    try ConnectedDreamEvidence(current: current, relatedBatches: Array(repeating: prior, count: 8))
+  }
+  #expect(throws: (any Error).self) {
+    try ConnectedDreamEvidence(current: current, relatedBatches: [prior], maximumBytes: 1)
+  }
+}
+
+@Test func connectedDreamEvidenceRejectsChangedIdentityAndDisconnectedSources() throws {
+  let fixture = try DreamInputFixture()
+  defer { fixture.clean() }
+  try fixture.write(fixture.header() + "\n" + dreamUser("same", nil, dreamOld, "First intent.") + "\n",
+    to: fixture.file())
+  let first = try fixture.prepare()
+  try fixture.write(fixture.header() + "\n" + dreamUser("same", nil, dreamOld, "Changed bytes.") + "\n",
+    to: fixture.file())
+  let changed = try fixture.prepare()
+  #expect(throws: (any Error).self) {
+    try ConnectedDreamEvidence(current: first, relatedBatches: [changed])
+  }
+  let other = try DreamInputFixture()
+  defer { other.clean() }
+  try other.write(other.header("other") + "\n"
+    + dreamUser("unrelated", nil, dreamOld, "Other intent.") + "\n", to: other.file())
+  let disconnected = try other.prepare()
+  #expect(throws: (any Error).self) {
+    try ConnectedDreamEvidence(current: first, relatedBatches: [disconnected])
+  }
+}

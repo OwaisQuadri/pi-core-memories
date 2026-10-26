@@ -8,7 +8,7 @@ export const commandBuild: BuildSpec = {
 	binary: "target/release/pi-core-memories",
 	buildCommand: ["/bin/zsh", "-f", "build.zsh"],
 	inputs: ["Package*.swift", "Sources", "build.zsh"],
-	cleanupPaths: ["target/build"],
+	cleanupPaths: [],
 	overrideEnv: "PI_CORE_MEMORIES_EXECUTABLE",
 	isUpstreamRequired: true,
 };

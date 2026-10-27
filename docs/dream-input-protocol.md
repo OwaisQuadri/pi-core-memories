@@ -53,11 +53,15 @@ The native model policy permits a single clear persistent intent without repetit
 
 ## Saved request replay
 
-New saved requests use request schema 3 with `renderingVersion:3`. The input, context and response schemas are unchanged. Current prompt and message content is unchanged.
+New saved requests use request schema 3 with `renderingVersion:3`. Their input, context and baseline response schemas are unchanged. Current prompt and message content is unchanged.
 
-Existing unversioned request schema 2 can contain either the original text-only rendering or the connected-evidence rendering. Replay accepts only a complete matching prompt/message pair derived from the frozen context. It compares exact UTF-8 bytes, retains the stored request bytes and digest, and keeps admission and completion-chain verification. It does not regenerate or rewrite saved artifacts.
+Existing unversioned request schema 2 can contain three renderings: the original text-only format, the scope-contract format, or the connected-evidence format. Replay accepts only a complete matching prompt/message pair derived from the frozen context. It compares exact bytes, retains the stored request bytes and digest, and keeps admission and completion-chain verification. It does not regenerate or rewrite saved artifacts.
 
-The original rendering cannot represent tool evidence, connected windows, rejected predecessors or admitted-source locator mappings. Replay refuses that rendering when the frozen context contains those features. Unknown or inconsistent version markers fail closed. A stored hash alone does not prove that a request was correctly derived from its context.
+Request schema 3 with `renderingVersion:2` requires the scope-contract pair. Rendering version 3 requires the connected-evidence pair. Unknown, missing or inconsistent version markers fail closed.
+
+The original and scope-contract renderings cannot represent tool evidence, connected windows, rejected predecessors or admitted-source locator mappings. Replay refuses those renderings when the frozen context contains those features. A stored hash alone does not prove that a request was correctly derived from its context.
+
+Read-only replay also verifies historical feedback retries against the verified request rendering. The baseline call and response use envelope schema 2; a feedback replacement, its call and its response use schema 3. Verification checks the actual prior rejection, exact rejected archive, derived feedback, predecessor call, attempt number, selected call, effective-call hash and response binding. Inspection uses that same attempt verifier and the verified response contract. The current pending-run writer does not create this historical retry format.
 
 ## Integration obligations
 

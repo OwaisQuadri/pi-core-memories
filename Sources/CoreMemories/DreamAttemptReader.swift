@@ -112,7 +112,6 @@ struct DreamAttemptReader {
           intent.rejectedCallIntentHash == nil, intent.feedback == nil, intent.feedbackHash == nil
         else { throw DreamRunError.corruption }
       case 3:
-        guard rendering == .scopeV2 else { throw DreamRunError.unsupportedSchema }
         let feedback = DreamReplacementFeedback(failure: rejection.failure, rendering: rendering)
         guard intent.attemptNumber == number, intent.rejectedAttemptNumber == number - 1,
           intent.rejectedCallIntentHash == previous.callIntentHash?.rawValue,

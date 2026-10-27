@@ -1,14 +1,13 @@
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
-import { BorderedLoader, getAgentDir, type ExtensionAPI, type ExtensionContext, type SubscriptionSimpleStreamOptions } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SubscriptionSimpleStreamOptions } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { commandPath, commandReady } from "./command.ts";
-import { protectDreamSources, SOURCE_PROTECTION_INPUT_BYTES, SOURCE_PROTECTION_REPLY_BYTES, type SourceProtectionResult } from "./source-protection.ts";
+import { SOURCE_PROTECTION_INPUT_BYTES, SOURCE_PROTECTION_REPLY_BYTES, type SourceProtectionResult } from "./source-protection.ts";
 
 export const DREAM_REVIEW_TYPE = "core-memory-dream-review";
 export const MAXIMUM_FRAME_BYTES = 32 * 1_048_576 * 6 + 65_536;
@@ -613,12 +612,12 @@ export function dreamReviewText(report: DreamReport): string {
 	const lines = [`Dream: ${report.status} · generation ${report.generation}${report.isRecovered ? " · recovered" : ""}`];
 	if (report.reason) lines.push(dreamReasons[report.reason] ?? escapeDreamDisplay(report.reason));
 	if (report.detail) lines.push(`Cause: ${escapeDreamDisplay(report.detail)}`);
-	if (report.status === "completed") lines.push(report.proposals.length ? `${plural(report.proposals.length, "proposal")} saved. Run /mem-review to approve or reject.` : "No proposals this time.");
+	if (report.status === "completed") lines.push(report.proposals.length ? `${plural(report.proposals.length, "proposal")} saved for review in conversation. Memory is unchanged.` : "No proposals this time.");
 	if (report.status === "pending") {
-		if (report.reason === "invalidDecision") lines.push("Memory was not changed. Run /dream to inspect saved work. Use /dream replace to retain the rejected reply and request a new reply for the saved batch; it can bill again.");
-		else lines.push("Memory was not changed. Run /dream to inspect saved work. Use /dream retry only to repeat the interrupted model call; it can bill again.");
+		if (report.reason === "invalidDecision") lines.push("Memory was not changed. The saved reply did not pass validation. Discuss the retained work in conversation before requesting a replacement model call.");
+		else lines.push("Memory was not changed. The interrupted call and saved work are retained. Discuss recovery in conversation before another model call.");
 	}
-	if (report.isBacklog) lines.push("More sessions remain. Use /dream for one batch or /dream all for every remaining batch.");
+	if (report.isBacklog) lines.push("More sessions remain in the background intake queue.");
 	if (report.unfinishedTails) lines.push(`Sessions still in progress, skipped for now: ${report.unfinishedTails}`);
 	function cited(items: DreamSource[]): string { return `${plural(items.length, "source")} in ${plural(new Set(items.map((source) => source.sessionID)).size, "session")}`; }
 	for (const proposal of report.proposals) {
@@ -641,10 +640,7 @@ export function dreamReviewText(report: DreamReport): string {
 	return lines.join("\n");
 }
 
-export function registerDream(pi: ExtensionAPI): () => Promise<void> {
-	let controller: AbortController | undefined;
-	let workerCompletion: Promise<DreamReport> | undefined;
-	let isShuttingDown = false;
+export function registerDreamHistory(pi: ExtensionAPI): void {
 	pi.registerEntryRenderer<{ report: DreamReport; memory: string; coverage?: DreamCoverage; elapsedSeconds?: number }>(DREAM_REVIEW_TYPE, (entry) => {
 		try {
 			if (!entry.data) return undefined;
@@ -655,73 +651,4 @@ export function registerDream(pi: ExtensionAPI): () => Promise<void> {
 			return progressComponent((width) => dreamReviewText(report) + (coverage ? "\n" + dreamProgressText(coverage, elapsedSeconds, report.status, width) : ""));
 		} catch { return new Text("Dream review unavailable.", 0, 0); }
 	});
-	pi.registerCommand("dream", {
-		description: "Propose memories; retry an interrupted call or replace a saved invalid reply explicitly",
-		handler: async (args, ctx) => {
-			const argument = args.trim();
-			if (argument !== "" && argument !== "retry" && argument !== "all" && argument !== "replace") { ctx.ui.notify("Use /dream, /dream all, /dream retry, or /dream replace.", "error"); return; }
-			if (isShuttingDown) return;
-			if (controller) { ctx.ui.notify("Dream is busy.", "warning"); return; }
-			const current = new AbortController(); controller = current;
-			let savedReports = 0;
-			try {
-				await ctx.waitForIdle();
-				const model = ctx.model;
-				if (!model) { ctx.ui.notify("Dream needs the current selected model.", "error"); return; }
-				const batchTextBytes = dreamBatchTextBytes(model.contextWindow);
-				if (batchTextBytes === null) { ctx.ui.notify("Dream needs a model with at least 65,536 tokens of context.", "error"); return; }
-				const selection = selected({ provider: model.provider, modelID: model.id, thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel() });
-				const agentDir = getAgentDir();
-				const roots = await dreamRoots(agentDir, ctx.cwd);
-				const scope = await readDreamScope(current.signal);
-				let batch = 0;
-				let coverage: DreamCoverage | undefined;
-				let phase = "planning";
-				let update = () => {};
-				const started = Date.now();
-				const run = async (): Promise<DreamReport | undefined> => {
-					let report: DreamReport | undefined;
-					do {
-						if (current.signal.aborted || isShuttingDown) return report;
-						batch++; coverage = undefined; phase = "planning";
-						const batchStarted = Date.now();
-						const start: DreamStart = { version: 1, type: "start", invocationID: randomUUID(), roots, selection, resume: argument === "replace" ? "replaceInvalidResponse" : argument === "retry" ? "retryInterruptedCall" : "inspectOrContinue", batchTextBytes, ...scope };
-						update();
-						workerCompletion = runDreamWorker(start, async (request, signal) => {
-							phase = "model call"; update();
-							try { return await callDreamModel(request, ctx, model, selection, signal); }
-							finally { phase = "saving"; update(); }
-						}, current.signal, (next) => { coverage = next; update(); }, (value, signal) => protectDreamSources(pi, start.invocationID, value, signal));
-						report = await workerCompletion;
-						if (isShuttingDown) return report;
-						pi.appendEntry(DREAM_REVIEW_TYPE, { report, memory: roots.memory, ...(coverage ? { coverage, elapsedSeconds: (Date.now() - batchStarted) / 1000 } : {}) });
-						savedReports++;
-						if (ctx.mode !== "tui") ctx.ui.notify(dreamReviewText(report), report.status === "blocked" ? "error" : "info");
-					} while (argument === "all" && report.status === "completed" && report.isBacklog);
-					return report;
-				};
-				let work: Promise<DreamReport | undefined> | undefined;
-				const displayed = ctx.mode === "tui" ? await ctx.ui.custom<DreamReport | undefined>((tui, theme, _keys, done) => {
-					const loader = new BorderedLoader(tui, theme, `Dream · ${escapeDreamDisplay(selection.provider)}/${escapeDreamDisplay(selection.modelID)} · ${escapeDreamDisplay(selection.thinkingLevel)}`);
-					loader.signal.addEventListener("abort", () => current.abort(), { once: true });
-					loader.onAbort = () => { current.abort(); done(undefined); };
-					const paint: Paint = (color, text) => theme.fg(color, text);
-					const progress = progressComponent((width) => dreamProgressText(coverage, (Date.now() - started) / 1000, argument === "all" ? `all · batch ${batch || 1} · ${phase}` : phase, width, paint));
-					loader.addChild(progress);
-					update = () => tui.requestRender();
-					update();
-					const timer = setInterval(update, 1000);
-					work = run();
-					void work.then(done, () => done(undefined)).finally(() => clearInterval(timer));
-					return loader;
-				}) : await run();
-				const report = displayed ?? await work;
-				if (!report) throw new Error("Dream worker failed.");
-			} catch (error) {
-				if (isShuttingDown) return;
-				ctx.ui.notify(current.signal.aborted ? "Dream cancelled. Saved work can be inspected with /dream; retry is explicit." : `${savedReports ? "Dream failed. Earlier batch reports remain saved." : "Dream failed. No completed report was accepted."}\nCause: ${escapeDreamDisplay(message(error))}`, "error");
-			} finally { if (controller === current) { controller = undefined; workerCompletion = undefined; } }
-		},
-	});
-	return async () => { isShuttingDown = true; controller?.abort(); await workerCompletion?.catch(() => {}); };
 }

@@ -1,5 +1,9 @@
 # Bounded dream evidence
 
+This is the internal evidence protocol for background dreaming, not a manual
+extension command or separate review workflow. Findings are unapproved input to
+ordinary conversation. Native validation does not establish the user's consent.
+
 ## Native preparation
 
 `SessionReader.prepare(progress:limits:modifiedAfter:maximumBacklogBytes:isToolEvidenceIncluded:isSourceScrubbed:backlog:isCancelled:) throws -> PreparedSessionBatch` adds two default-false Boolean parameters. Existing callers remain text-only. Requesting tool evidence without the scrub attestation fails before reading source files with `tool evidence requires caller-scrubbed source input`.

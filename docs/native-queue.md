@@ -1,8 +1,10 @@
 # Native finding queue protocol
 
-`memory-queue-worker` is the native review facade for a trusted foreground host. It does not schedule intake, run a model, or establish that an input came from a human. The host owns request identity, exact visible rendering, and the live interactive callback. Pending findings are not approved memories.
+`memory-queue-worker` is the internal storage and approval protocol for the foreground conversation. It is not a slash command, review mode, or user-operated queue. It does not schedule intake, run a model, or establish that an input came from a human. The host owns request identity, exact visible chat rendering, and the later explicit user reply. Pending findings are not approved memories.
 
-## Command and roots
+The ordinary-chat approval transport remains incomplete. The host must establish a trusted original user submission and bind it to the exact displayed proposal. Model text, an interactive source label, restored messages, and autonomous guidance do not establish that authority. Until the transport can prove it, writes remain blocked. A separate dialog or manual command is not an alternate route.
+
+## Internal worker and roots
 
 The command accepts no arguments:
 
@@ -24,13 +26,11 @@ First verified queue access pins the actual review/source/repository binding and
 
 Direct `manage` mutations and legacy manual draft Save have no review-profile proof and cannot publish after binding. List/get and checked historical recovery remain available. A supported matching-profile path is `MemoryBatchSession(repository:drafts:review:...)` with the actual verified controller, fresh per-item authorization, and `save()`. It supports requested additions, updates, deletions, and confirm-reviewed changes through the existing batch types. The private management operations below expose that matching-profile path; legacy `manage` mutation remains fenced.
 
-## Isolated foreground review
+## Conversation and background ownership
 
-Start Pi with `--memory-queue-review-config /absolute/path/config.json` to select a separate configuration for foreground memory review. This host-owned flag is not a model-facing tool parameter. [The runtime](../Integration/Pi/queued-runtime.ts) captures it at the first session start and keeps that selection across session changes.
+[The runtime](../Integration/Pi/queued-runtime.ts) connects ordinary interactive sessions to shared background membership. There is no review-only launch flag or alternate Pi review configuration.
 
-An explicit profile keeps interactive review available but does not join background membership or schedule intake. Invalid explicit values fail closed; a rejected profile never falls back to the default configuration. Without the flag, the existing foreground and background paths stay unchanged.
-
-The approved-memory loader has a separate `PI_CORE_MEMORIES_REPO` selection. For an isolated review process, point that variable at the same fixture repository. The review flag alone does not redirect that loader or change saved settings.
+Native configuration and migration APIs remain available to the internal worker and isolated protocol tests. They do not create a user-facing mode or authorize model calls. The approved-memory loader uses `PI_CORE_MEMORIES_REPO` independently; verification must isolate every affected store without changing personal settings or bypassing host approval.
 
 ## Transport and ownership
 
@@ -68,7 +68,7 @@ Every row below adds fields to `{version:1,type,invocationID}`. Fields are exact
 
 `offset` is a canonical nonnegative decimal string of at most ten characters and cannot exceed the current row count. A page contains at most 64 rows. `nextOffset` is a decimal string or null. Pages are current projections, not a frozen listing transaction. Claims revalidate the exact revision regardless of a previous page.
 
-`sessionID` and `requestID` form the suppression identity. The host must retain both for a resumed request, including retries, tools, compaction, and restart. A fresh runtime incarnation is not permission to invent a new request. Before a genuinely different request, branch change, reload, or amendment, the host must release the old claim and invalidate its callback.
+`sessionID` and `requestID` form the suppression identity. The host must retain both for a resumed request, including retries, tools, compaction, and restart. A fresh runtime incarnation is not permission to invent a new request. Before a genuinely different request, branch change, reload, or amendment, the host must release the old claim and invalidate its live reply authority.
 
 A row has `finding`, `disposition`, and optional `blockReason`. Dispositions are the existing native pending/deferred/rejected/approved/blocked projection. Block reasons include `already-presented-for-request`, `outcome-unresolved`, the native target limitation, and `blocked-successor: rejected evidence or claim requires a versioned changed-evidence successor`.
 
@@ -104,7 +104,7 @@ claimID, sequence, revision, previewDigest, displayDigest, sessionID, requestID
 
 Every value must exactly match the current presentation. Native accepts only one outstanding phase at a time. A queued premature choice, stale tuple, or foreign request closes the invocation.
 
-`presented` adds `messageReference`. The host sends it only after installing the exact visible payload. Native persists the reference and emits `presented` with `displayDigest`. The host waits for that acknowledgement before enabling the live choice.
+`presented` adds `messageReference`. The host sends it only after installing the exact visible payload. Native persists the reference and emits `presented` with `displayDigest`. The host waits for that acknowledgement before accepting a later explicit user reply for the exact displayed proposal.
 
 `choice` adds `action`, `decisionID`, `responseReference`, and Boolean `isInteractive:true`. Actions are `approve`, `reject`, `defer`, or `detach`. The response reference must differ from the display-message reference. `isInteractive` is a trusted host attestation, not native proof of human origin. The private endpoint and claim must never enter model context or background-worker inputs.
 
@@ -136,7 +136,7 @@ Offsets are native numeric UTF-8 byte offsets. Expected/replacement values are e
 
 The management `display` is a flat object containing `claimID`, decimal `sequence`, `request:{sessionID,requestID}`, `operation`, `reason`, scope `path`, `currentBase`, base64 effect `before`/`after`, base64 full-document `documentBefore`/final `replacement`, `previewDigest`, `isDetachRequired`, `checkoutCommit`, `checkoutDigest`, and `displayDigest`. `displayBytes` is the canonical sorted-key, unescaped-slash JSON object with **only `displayDigest` removed**. SHA-256(decoded displayBytes) equals displayDigest. Verify these native bytes rather than recreating JSON. Display all exact decoded before/final/annotation/scope bytes and reason before enabling the choice. Base64 alone, truncation, paraphrase, partial text, or hidden attachments do not constitute publication.
 
-Descriptor 3 accepts `manage-presented` with the common header, the full queue tuple (`revision` is **currentBase**, not a candidate digest), and `messageReference`. After exact installation and native `manage-presented` acknowledgement, a new live callback may send `manage-choice` with the same tuple plus `action`, `decisionID`, `responseReference`, and Boolean `isInteractive:true`. Action is `approve` or separately `detach`. An attached checkout cannot approve. Detach cannot save memory: after its checked receipt, obtain a new preview/publication and explicit decision. `release`, finish, either EOF, and helper death invalidate active preview authority. There is only one active inferred or management presentation.
+Descriptor 3 accepts `manage-presented` with the common header, the full queue tuple (`revision` is **currentBase**, not a candidate digest), and `messageReference`. After exact chat presentation and native `manage-presented` acknowledgement, a fresh verified user reply may authorize `manage-choice` with the same tuple plus `action`, `decisionID`, `responseReference`, and Boolean `isInteractive:true`. Action is `approve` or separately `detach`. An attached checkout cannot approve. Detach cannot save memory: after its checked receipt, obtain a new preview/publication and explicit decision. `release`, finish, either EOF, and helper death invalidate active preview authority. There is only one active inferred or management presentation.
 
 `manage-decision.receipt` has `decisionID`, `displayDigest`, `status`, and optional `commit`/`auditRef`. Only `approved` with a checked native batch receipt proves saved memory. `detached` is checkout preparation only; `outcome-unresolved` does not prove mutation. Intent files (`management-<decisionID>.json`) preserve the exact display, native draft, action and opaque live response reference before mutation. Recovery verifies the native journal/publication or detach outcome and never reconstructs approval. On stale base, changed configuration/checkout/bytes, or failed publication, release and obtain a fresh exact preview and explicit decision. Recovered drafts or model/stdin frames cannot approve.
 

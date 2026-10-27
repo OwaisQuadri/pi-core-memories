@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { join } from "node:path";
 import { test } from "node:test";
 import type { AssistantMessage, AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SubscriptionSimpleStreamOptions } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SubscriptionSimpleStreamOptions } from "@earendil-works/pi-coding-agent";
 import type { DreamRequest, DreamSelection, DreamStart } from "./dream.ts";
 
 import { tuiURL } from "./test/host.ts";
@@ -28,15 +28,16 @@ function registry(events: AssistantMessageEvent[], result = message()) {
 	return { ctx, calls };
 }
 
-test("invalid saved decision displays its cause and explicit replacement billing warning", () => {
+test("invalid saved decision explains retained recovery in conversation without commands", () => {
 	const detail = 'decision(index: 5, category: "owner anchor bytes do not match pinned slice")';
 	const report = dream.dreamReport({ ...final, status: "pending", runID: "run", base: "b".repeat(40), reason: "invalidDecision", detail }, start);
 	const output = dream.dreamReviewText(report);
 	assert.ok(output.includes("The saved model reply failed validation."));
 	assert.ok(output.includes(`Cause: ${detail}`));
-	assert.ok(output.includes("Use /dream replace to retain the rejected reply and request a new reply for the saved batch; it can bill again."));
-	assert.ok(!output.includes("/dream retry"));
-	assert.ok(dream.dreamReviewText({ ...report, reason: "interruptedCall" }).includes("/dream retry"));
+	assert.ok(output.includes("Memory was not changed. The saved reply did not pass validation."));
+	assert.ok(output.includes("Discuss the retained work in conversation before requesting a replacement model call."));
+	assert.ok(!output.includes("/dream"));
+	assert.ok(dream.dreamReviewText({ ...report, reason: "interruptedCall" }).includes("Discuss recovery in conversation"));
 });
 
 test("subscription registry receives only pinned bytes and timestamps, captured model, and transport-only off mapping", async () => {
@@ -190,7 +191,7 @@ test("report escapes controls and bidirectional text, speaks plainly, and native
 	const output = dream.dreamReviewText(report);
 	assert.ok(output.includes("\\u{1B}")); assert.ok(output.includes("\\u{202E}"));
 	assert.ok(!output.includes("$'\\x")); assert.ok(!output.includes("refs/heads")); assert.ok(!output.includes("session:entry"));
-	assert.ok(output.includes("1 proposal saved. Run /mem-review")); assert.ok(output.includes("1 source in 1 session")); assert.ok(output.includes("not a durable preference: 1"));
+	assert.ok(output.includes("1 proposal saved for review in conversation. Memory is unchanged.")); assert.ok(output.includes("1 source in 1 session")); assert.ok(output.includes("not a durable preference: 1"));
 	const pending = dream.dreamReport({ ...final, status: "pending", generation: "0", runID: "run", base: "b".repeat(40), reason: "callbackFailure" }, start);
 	assert.ok(dream.dreamReviewText(pending).includes("The model call failed before its reply was saved."));
 	assert.ok(!output.includes("\u001b"));
@@ -201,17 +202,15 @@ test("report escapes controls and bidirectional text, speaks plainly, and native
 	}
 });
 
-function commandFixture() {
-	const notices: string[] = []; const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
-	const renderers = new Map(); const entries: unknown[] = []; let idle = 0;
-	const pi = { registerCommand: (name: string, value: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) => commands.set(name, value), registerEntryRenderer: (name: string, renderer: unknown) => renderers.set(name, renderer), appendEntry: (_name: string, data: unknown) => entries.push(data), getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
-	const ctx = { mode: "rpc", cwd: "/unused", model: undefined, waitForIdle: async () => { idle++; }, ui: { notify: (value: string) => notices.push(value) } } as unknown as ExtensionCommandContext;
-	dream.registerDream(pi);
-	return { notices, entries, commands, renderers, ctx, get idle() { return idle; } };
+function historyFixture() {
+	const renderers = new Map();
+	const pi = { registerCommand: () => assert.fail("History must not register commands"), registerEntryRenderer: (name: string, renderer: unknown) => renderers.set(name, renderer) } as unknown as ExtensionAPI;
+	dream.registerDreamHistory(pi);
+	return { renderers };
 }
 
 test("saved coverage renders actual elapsed or unknown for older entries and rejects invalid metadata", () => {
-	const f = commandFixture();
+	const f = historyFixture();
 	const renderer = f.renderers.get(dream.DREAM_REVIEW_TYPE);
 	const coverage = { archiveBytes: 500, processedBytes: 250, plannedBytes: 100, completedBytes: 100, undreamtBytes: 250, nextBytes: 100, repeatedRecords: 0, estimateSeconds: null };
 	const render = (metadata: object) => renderer({ data: { report: final, memory: "/memory", coverage, ...metadata } }).render(200).join("\n");
@@ -227,7 +226,7 @@ test("saved coverage renders actual elapsed or unknown for older entries and rej
 });
 
 test("prior saved coverage preserves report and batch without inventing archive coverage or elapsed", () => {
-	const renderer = commandFixture().renderers.get(dream.DREAM_REVIEW_TYPE);
+	const renderer = historyFixture().renderers.get(dream.DREAM_REVIEW_TYPE);
 	const coverage = { plannedBytes: 100, completedBytes: 100, undreamtBytes: 250, nextBytes: 100, repeatedRecords: 2, estimateSeconds: null };
 	const report = { ...final, status: "completed", generation: "1", runID: "run", base: "b".repeat(40), proposals: [{ ref: `refs/heads/proposals/${"a".repeat(40)}`, commit: "a".repeat(40), base: "b".repeat(40), path: "MEMORY.md", sources: [{ sessionID: "session", entryID: "entry", partIndex: 0 }], contradictions: "" }] };
 	const render = (savedCoverage: object) => renderer({ data: { report, memory: "/memory", coverage: savedCoverage } }).render(200).join("\n");
@@ -241,30 +240,22 @@ test("prior saved coverage preserves report and batch without inventing archive 
 	assert.throws(() => dream.dreamCoverage({ ...coverage, version: 1, type: "progress", invocationID: start.invocationID }, start));
 });
 
-test("batch text follows the model context window and small models are refused before a worker starts", async () => {
+test("batch text follows the model context window and small models are refused before a worker starts", () => {
 	assert.deepEqual([undefined, 32_768, 65_535, 65_536, 262_144, 2_000_000].map(dream.dreamBatchTextBytes), [null, null, null, 65_536, 262_144, 1_048_576]);
-	const f = commandFixture();
-	await f.commands.get("dream")!.handler("", { ...f.ctx, model: { ...model, contextWindow: 32_768 } } as unknown as ExtensionCommandContext);
-	assert.match(f.notices.at(-1)!, /at least 65,536 tokens of context/);
-	assert.deepEqual(f.entries, []);
 });
 
-test("factory registers only, command rejects unknown args and missing selection before roots/process", async () => {
-	const f = commandFixture();
-	assert.deepEqual([...f.commands.keys()], ["dream"]); assert.deepEqual([...f.renderers.keys()], [dream.DREAM_REVIEW_TYPE]);
-	for (const argument of ["approve", "all retry", "retry all", "all extra"]) await f.commands.get("dream")!.handler(argument, f.ctx);
-	assert.equal(f.idle, 0);
-	await f.commands.get("dream")!.handler("", f.ctx); assert.equal(f.idle, 1);
-	assert.deepEqual(f.entries, []); assert.match(f.notices.at(-1)!, /current selected model/);
-});
-
-test("warm imports and two full factories register under 50 ms without starting work", async (t) => {
-	const pi = { on: () => {}, registerFlag: () => {}, registerCommand: () => {}, registerEntryRenderer: () => {}, registerTool: () => {} } as unknown as ExtensionAPI;
+test("warm imports and full factories register tools but no commands or review modes under 50 ms", async (t) => {
+	const names: string[] = [];
+	const pi = { on: () => {}, registerFlag: () => assert.fail("Memory must not register an alternate review mode"), registerCommand: () => assert.fail("Memory must not register commands"), registerEntryRenderer: () => {}, registerTool: (tool: { name: string }) => names.push(tool.name) } as unknown as ExtensionAPI;
+	const expected = ["memory_add", "memory_delete", "memory_get", "memory_list", "memory_queue", "memory_update"];
 	coreMemories(pi);
+	assert.deepEqual(names.sort(), expected);
 	for (let run = 0; run < 2; run++) {
+		names.length = 0;
 		const before = performance.now(); await import("./index.ts"); coreMemories(pi);
 		const elapsed = performance.now() - before;
 		t.diagnostic(`warm import + factory ${run + 1}: ${elapsed.toFixed(3)} ms`); assert.ok(elapsed < 50);
+		assert.deepEqual(names.sort(), expected);
 	}
 });
 
@@ -333,7 +324,7 @@ test("backlog bar fills dreamt bytes from the right and coverage refuses invente
 	assert.match(dream.dreamProgressText(dream.dreamCoverage({ ...frame, backlogBytes: null, backlogLimitBytes: null, undreamtBytes: null, nextBytes: null }, start), 12, "model call"), /Backlog unknown for this saved batch/);
 	for (const change of [{ archiveBytes: 350 * megabyte }, { backlogBytes: 199 * megabyte }, { undreamtBytes: null }, { backlogLimitBytes: null }, { completedBytes: 5 * megabyte }, { nextBytes: 197 * megabyte }, { estimateSeconds: -1 }]) assert.throws(() => dream.dreamCoverage({ ...frame, ...change }, start));
 	for (const width of [20, 40, 80]) {
-		const renderer = commandFixture().renderers.get(dream.DREAM_REVIEW_TYPE);
+		const renderer = historyFixture().renderers.get(dream.DREAM_REVIEW_TYPE);
 		const lines = renderer({ data: { report: final, memory: "/memory", coverage } }).render(width);
 		assert.ok(lines.every((line: string) => tui.visibleWidth(line) <= width));
 		assert.ok(lines.includes("░".repeat(width * 2 / 5) + "▒".repeat(width * 2 / 5) + "█".repeat(width / 5)));

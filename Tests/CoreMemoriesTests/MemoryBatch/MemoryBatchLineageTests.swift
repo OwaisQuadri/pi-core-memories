@@ -115,6 +115,50 @@ import Testing
     candidateID: untouched.change.id, clockDate: ReviewFlowFixture.reviewDate)
 }
 
+@Test func batchFrozenSnapshotSlotKeepsWarmAdmissionChecksAndClearsOnFailedBaseChange() throws {
+  let fixture = try ReviewFlowFixture()
+  defer { fixture.transaction.clean() }
+  let controller = try fixture.controller()
+  let store = try MemoryStore(repo: fixture.transaction.memory, environment: [:])
+  let snapshot = try store.reviewSnapshot(base: store.approvedCommit())
+  let prepared = try controller.preparedBatchCandidates(
+    snapshot: snapshot, date: ReviewFlowFixture.reviewDate, limit: 32, offset: 0,
+    paths: ["MEMORY.md"])
+  let row = try #require(prepared.rows.first { $0.effect != nil })
+  let item = MemoryBatchItem(
+    itemID: memoryBatchIdentity("candidate:\(row.intent.candidateID)"), generation: 0,
+    intent: .candidate(row.intent))
+  var frozenSnapshot: ApprovedDecisionSnapshot?
+  let cold = try controller.batchEffect(
+    item: item, intent: row.intent, snapshot: snapshot, frozenSnapshot: &frozenSnapshot)
+  #expect(cold == row.effect)
+  #expect(frozenSnapshot?.base == row.candidate.change.base)
+  let warm = try controller.batchEffect(
+    item: item, intent: row.intent, snapshot: snapshot, frozenSnapshot: &frozenSnapshot)
+  #expect(warm == cold)
+  let changedAdmission = MemoryBatchCandidateIntent(
+    candidateID: row.intent.candidateID, admissionHash: String(repeating: "0", count: 64),
+    choice: row.intent.choice, identity: row.intent.identity, instant: row.intent.instant,
+    amendment: row.intent.amendment)
+  #expect(throws: MemoryError.self) {
+    try controller.batchEffect(
+      item: item, intent: changedAdmission, snapshot: snapshot, frozenSnapshot: &frozenSnapshot)
+  }
+  #expect(frozenSnapshot?.base == row.candidate.change.base)
+  #expect(snapshot.base != row.candidate.change.base)
+  frozenSnapshot = snapshot
+  let base = row.candidate.change.base
+  let object = fixture.transaction.memory.appendingPathComponent(
+    ".git/objects/\(base.prefix(2))/\(base.dropFirst(2))")
+  try #require(FileManager.default.fileExists(atPath: object.path))
+  try FileManager.default.removeItem(at: object)
+  #expect(throws: (any Error).self) {
+    try controller.batchEffect(
+      item: item, intent: row.intent, snapshot: snapshot, frozenSnapshot: &frozenSnapshot)
+  }
+  #expect(frozenSnapshot == nil)
+}
+
 @Test func unknownExternalCommitStillBlocksPendingCandidateAfterVerifiedBatch() throws {
   let fixture = try ReviewFlowFixture()
   defer { fixture.transaction.clean() }

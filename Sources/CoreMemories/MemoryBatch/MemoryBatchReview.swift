@@ -42,6 +42,7 @@ extension MemoryReviewController {
       let catalog = selectable.dropFirst(offset).prefix(limit).map(\.0)
       let catalogIDs = Set(catalog)
       let retainedIDs = Set(retaining.map(\.candidateID)).subtracting(catalogIDs).sorted()
+      var frozenSnapshot: ApprovedDecisionSnapshot?
       let rows = try (catalog + retainedIDs).map { id in
         let (change, admission, limitations) = candidates[id]!
         let disposition = try selection(id)
@@ -62,7 +63,7 @@ extension MemoryReviewController {
             item: MemoryBatchItem(
               itemID: memoryBatchIdentity("candidate:\(id)"), generation: 0,
               intent: .candidate(intent)),
-            intent: intent, snapshot: snapshot)
+            intent: intent, snapshot: snapshot, frozenSnapshot: &frozenSnapshot)
           return PreparedMemoryBatchCandidate(
             candidate: MemoryReviewCandidate(
               change: change, disposition: disposition, limitation: nil,
@@ -82,6 +83,7 @@ extension MemoryReviewController {
 
   func batchEffect(
     item: MemoryBatchItem, intent: MemoryBatchCandidateIntent, snapshot: ApprovedDecisionSnapshot,
+    frozenSnapshot: inout ApprovedDecisionSnapshot?,
     publications: ((String, String) throws -> [VerifiedMemoryPublication])? = nil
   ) throws -> MemoryBatchEffect? {
     guard let (change, admission, _) = candidates[intent.candidateID],
@@ -95,8 +97,12 @@ extension MemoryReviewController {
       }
       return nil
     }
-    let frozen = try store.reviewSnapshot(base: change.base)
-    guard frozen.documents.first(where: { $0.path == change.path })?.digest == change.documentHash
+    if frozenSnapshot?.base != change.base {
+      frozenSnapshot = nil
+      frozenSnapshot = try store.reviewSnapshot(base: change.base)
+    }
+    guard let frozen = frozenSnapshot,
+      frozen.documents.first(where: { $0.path == change.path })?.digest == change.documentHash
     else {
       throw MemoryError("frozen candidate document changed")
     }
@@ -272,6 +278,7 @@ extension MemoryReviewController {
     }
     var verified: [String: VerifiedMemoryPublication] = [:]
     let manager = try MemoryManagement(repository: repository)
+    var frozenSnapshot: ApprovedDecisionSnapshot?
     func verify(_ commit: String, manifest: MemoryBatchManifest) throws {
       let snapshot = try store.reviewSnapshot(base: manifest.draft.baseCommit)
       let composition = try MemoryBatchComposition.prepare(
@@ -281,8 +288,9 @@ extension MemoryReviewController {
         else {
           throw MemoryError("batch review binding changed")
         }
-        return try self.batchEffect(item: item, intent: intent, snapshot: snapshot) {
-          base, current in
+        return try self.batchEffect(
+          item: item, intent: intent, snapshot: snapshot, frozenSnapshot: &frozenSnapshot
+        ) { base, current in
           try self.publicationChain(from: base, to: current) { verified[$0] }
         }
       }
@@ -356,7 +364,8 @@ extension MemoryReviewController {
       let composition = try MemoryBatchComposition.prepare(
         manifest.draft, snapshot: snapshot, manager: manager
       ) { item, intent in
-        try self.batchEffect(item: item, intent: intent, snapshot: snapshot)
+        try self.batchEffect(
+          item: item, intent: intent, snapshot: snapshot, frozenSnapshot: &frozenSnapshot)
       }
       try MemoryBatchReplay.validate(manifest, composition: composition, commit: nil, store: store)
       try fold(manifest)
@@ -367,6 +376,7 @@ extension MemoryReviewController {
         throw DreamRunError.corruption
       }
     }
+    frozenSnapshot = nil
     let publisher = MemoryBatchPublisher(root: root, store: store, review: self)
     for name in names where name.hasPrefix("batch-attempt-") {
       guard names.contains("batch-format.json") else { throw DreamRunError.corruption }

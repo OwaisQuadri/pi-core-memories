@@ -26,6 +26,7 @@ final class MemoryBatchPublisher {
     try verifyMemoryBatchRepository(store, review: review)
     let snapshot = try store.reviewSnapshot(base: draft.baseCommit)
     let manager = try MemoryManagement(repository: store.reviewGit.repo)
+    var frozenSnapshot: ApprovedDecisionSnapshot?
     return try MemoryBatchComposition.prepare(draft, snapshot: snapshot, manager: manager) {
       item, candidate in
       guard let review,
@@ -33,7 +34,8 @@ final class MemoryBatchPublisher {
       else {
         throw MemoryError("candidate-bearing batch requires its original verified review binding")
       }
-      return try review.batchEffect(item: item, intent: candidate, snapshot: snapshot)
+      return try review.batchEffect(
+        item: item, intent: candidate, snapshot: snapshot, frozenSnapshot: &frozenSnapshot)
     }
   }
 

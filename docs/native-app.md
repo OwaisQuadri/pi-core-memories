@@ -1,145 +1,122 @@
-# Build and setup
+# Native application and installation
 
-The app, command, and Pi integration share one memory store. Pi runs inference. The Swift core validates replies and publishes approved changes.
+## Product boundary
 
-Build requirements are in [Package.swift](../Package.swift). Install [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) and sign in through Pi before using live dreams. This project supports Pi first.
+Memory work belongs in ordinary Pi conversation. Dreaming runs in the
+background while interactive Pi sessions are open. The extension registers no
+slash commands and has no manual dreaming or separate review mode.
 
-## Build the app and command
+The source no longer offers app-launched model calls or a Pi command adapter.
+The legacy application's dreaming view reads saved records. Historical status
+is not a live monitor of every background call.
 
-Run from this checkout:
+The existing installed application, drafts, saved findings, and source evidence
+remain until replacement and migration pass acceptance. Do not uninstall or
+replace it merely because command removal passes. Its retained review and draft
+actions are recovery facilities, not the recommended conversation interface.
 
-```zsh
+The ordinary-chat approval transport is not complete yet. This limitation is
+explicit in the [README](../README.md#implementation-status). A menu or another
+application cannot stand in for that acceptance.
+
+## Build
+
+Build requirements are in [Package.swift](../Package.swift). From the checkout:
+
+```sh
 scripts/package.zsh "$HOME/.local/share/pi-core-memories-runtime"
 ```
 
-Choose a new output directory. The command refuses to replace an existing app or runtime. It builds with warnings treated as errors. It does not change Pi settings or initialize memory.
+Use a new output directory. Packaging refuses to replace an existing app or
+runtime. It builds with warnings as errors and does not change Pi settings or
+initialize memory.
 
-The output contains:
-
-- `Core Memories.app`, with its own command and Pi control resources.
-- `bin/pi-core-memories`.
-- `lib/pi-core-memories/pi`, the command's Pi resources.
-
-Keep the command and `lib` directories together. The app is self-contained. Move the app to Applications if you want it installed.
-
-Add the command directory to your shell path:
-
-```zsh
-export PATH="$HOME/.local/share/pi-core-memories-runtime/bin:$PATH"
-```
-
-For a new memory store, use the separate data location shown in the app's Storage settings:
-
-```zsh
-memory_repo="/absolute/path/to/private-memory"
-pi-core-memories init --repo "$memory_repo"
-```
-
-Do not initialize an existing store. Set the app's Memory repository field to the same location. Keep memory data outside the source repository.
+The output contains `Core Memories.app`, `bin/pi-core-memories`, and
+`lib/pi-core-memories/pi`. The integration resources contain no command adapter.
+Keep the executable and resource directories together. Packaging is not
+installation, migration, or retirement approval.
 
 ## Install the Pi integration
 
-```zsh
+```sh
 pi install https://github.com/OwaisQuadri/pi-core-memories
 ```
 
-The package declares `pi.compile` as `node Integration/Pi/compile.ts` for Pi versions with install/update compilation support. This adapter awaits [pi-compiled](https://github.com/OwaisQuadri/pi-compiled), requires Git verification even when output matches its stamp, exits nonzero on build failure, and never uses `PI_CORE_MEMORIES_EXECUTABLE` to skip installation compilation. The output is `target/release/pi-core-memories` inside the installed clone. Session start also invokes the same compiler in the background and builds only when needed. A progress bar above the editor shows the build, and its result stays there until the next prompt starts a run. Until the first build finishes, memory loading, `/dream`, and the memory tools wait for it, and you can cancel that wait. `/mem-review` says the command is still building and returns, and the memory review reminder waits for the next session. It refuses to build unless `HEAD` is the fetched upstream commit, so install from a branch, not a pinned tag or commit. It also refuses uncommitted, untracked, or ignored source changes. `build.zsh` rejects a `.swiftpm` configuration or a symlinked `target` or scratch directory. Swift Package Manager owns scratch cleanup before each build and after the staged executable passes validation. The script atomically replaces the binary only after that cleanup command succeeds. Native clean can retain package state and does not guarantee removal of every artifact. A matching binary and stamp skip the build and do not sweep scratch. A build or cleanup-command failure retains the prior binary and stamp. Set `PI_CORE_MEMORIES_EXECUTABLE` to an absolute path to use another build during sessions only. The Pi package does not use the command on your path. Set `PI_CORE_MEMORIES_REPO` when your data store differs from the loader's default. If you already use a separate core-memories extension, disable that copy before enabling this package. Do not load both copies.
+Use checked, user-merged source. The package compile entrypoint is
+`node Integration/Pi/compile.ts`. It uses
+[pi-compiled](https://github.com/OwaisQuadri/pi-compiled), requires upstream Git
+verification, and fails on build errors. Installation compilation never uses
+`PI_CORE_MEMORIES_EXECUTABLE` to skip that verification.
 
-The package adds memory loading, `/dream`, `/mem-review`, `/mem-rereview`, `/mem-prepare`, and the existing memory management tools. Installing the package does not approve candidates or run a dream.
+Session start uses the same compiler when needed. A progress bar shows the
+build. Memory loading and tools wait for readiness; their wait can be cancelled.
+A failed build or cleanup command retains the previous executable and stamp.
+A matching executable and stamp do not cause a scratch sweep. Swift Package
+Manager owns scratch cleanup. Cleanup success does not promise an empty cache.
 
-## Find suggestions
+`PI_CORE_MEMORIES_EXECUTABLE` can select an absolute executable for session
+verification. `PI_CORE_MEMORIES_REPO` selects the approved-memory repository.
+Neither supplies approval or changes stored snapshots. Do not enable two copies
+of the extension.
 
-Choose Find Suggestions to process recent conversations. The queue shows dreamt text, undreamt text, and free queue capacity. Batch sizes come from runtime measurements; unavailable measurements stay unknown.
+Installing the package does not approve pending findings or grant model access.
+Use Pi's established login, selected provider, model, and thinking level. Do not
+add a paid fallback or read credential files to make a check pass.
 
-Review Suggestions opens the Memories workspace. To Review, Changes, Blocked, and Saved History remain separate groups beside the editor and final Save Changes control. A finished run and a manual refresh reload the suggestions. Review each proposed result before choosing Stage Acceptance.
+## Saved configuration
 
-If approved memories changed after a reply was saved, choose Prepare Saved Suggestions. Inspect the saved suggestions and their blockers, then confirm Prepare for Review. This action makes no model call and changes no approved memories. Each compatible suggestion still needs separate review and approval. Changed or ambiguous targets stay blocked.
+Keep memory and private state outside the public source tree. Configuration
+retains storage roots, source identity, diagnostics, scope keys, and project
+bindings. Existing serialized model-harness fields remain compatible with saved
+diagnostics; they no longer launch models from the application.
 
-Details contains saved runs, attempts, model selection, validation failures, and exact artifacts. Inspection does not call a model or advance dream progress.
+The agent directory still identifies historical source data. Saved status is
+matched against its original profile. A missing or mismatched record stays
+unknown rather than being attached to another profile.
 
-Other Actions includes processing all waiting batches. Retry Interrupted Call and Replace Invalid Reply can make another billable call. Neither repairs a saved reply whose publication stopped after approved memories changed. Replacement retains the rejected reply and keeps the frozen validation rules.
+A diagnostic reader can inspect saved state through the native executable.
+That internal interface is not a command the user must run to get memory work
+done. Removed manual generation operations fail rather than launching a hidden
+replacement or selecting an alternate profile.
 
-Stop Finding Suggestions affects only the invocation that the app owns. Other Pi sessions remain separate.
+Do not initialize an existing store, rewrite an archive, reset pending review
+state, or remove unknown locks. Keep unresolved recovery and unsupported
+historical findings visible with their limitations.
 
-In Settings, select the Pi executable and agent directory. Empty selection fields use Pi defaults. Explicit provider, model, and thinking settings must match Pi's resolved selection before a request starts. Credentials stay in Pi's normal credential stores.
+## Retained saved review
 
-Agents can use the same configured command:
+Keep native saved-data readers, batch drafts, checked receipts, and recovery
+checks until migration acceptance. Restoring a draft restores intent, not
+approval. A stale base, missing evidence, changed target, unverified Save,
+or unresolved recovery blocks the affected publication.
 
-```zsh
-pi-core-memories dream inspect
-pi-core-memories dream start
-pi-core-memories dream all
-pi-core-memories dream retry
-pi-core-memories dream replace
-```
+The application's normal shutdown still flushes input and persistence and
+checks unresolved saves. Removing a model-launch task must not remove those
+safeguards.
 
-Use `--config <file>` for a separate app or command profile. Keep that file in a private, owner-only directory. The app accepts the same argument. `dream inspect --state <directory>` reads a selected saved state without starting an invocation.
+Each Pi session retains its approved snapshot. A later memory change loads in
+a new session; it does not silently rewrite an existing session's context.
 
-## Edit and review
+## Device and project scope
 
-Review choices and memory edits stage in one local draft. Save Changes validates every staged item and publishes one approved-memory commit. A draft containing only Decide Later and Dismiss choices saves decisions without creating a commit. An invalid annotation, stale base, changed target, or checkout conflict prevents publication. Remove and staged Undo change the next Save's contents. They do not reverse a completed Save.
+Native catalogues supply exact device and project keys. Device setup creates a
+random local key, not a hostname or hardware identifier. Reads do not create an
+identity. Explicit project bindings let the same scope be used on another
+machine without rewriting historical source context.
 
-Use Prepare Checkout before the first publication from an attached initialization checkout. It preserves that checkout's files and index. It does not approve memory.
+Configured paths and keys are private integration data. Do not copy them into
+public tickets, examples, screenshots, or repository history.
 
-Select a suggestion to inspect its original proposal, approved-before text, and final result. Choose Stage Acceptance, Decide Later, or Dismiss to stage its disposition. To correct a suggestion, choose Edit Suggestion, retain its sources, enter a reason, and choose Preview Amendment. Inspect the amended result before choosing Stage Acceptance. The original proposal and provenance remain intact.
+## Verification
 
-Staged suggestions appear only in Changes, not To Review. Successful triage of the selected To Review item selects and prepares the next unstaged suggestion, continuing across catalog pages and wrapping to remaining earlier items. The last item clears the selection. A failed action keeps the current review. Removing or undoing a staged choice makes its suggestion available again. Restored publishing choices stay in Changes with Needs Review until freshly inspected and staged.
+Use affected-test selection for changed code. A fresh independent reviewer runs
+required complete suites on the current source. Keep native worker and saved
+artifact safety coverage when deleting command-only fixtures.
 
-The Review menu owns these shortcuts on macOS 13 and later:
+Native protocol tests and saved-view screenshots do not prove background-to-chat
+handoff. That acceptance also needs exact chat presentation, trusted later
+approval, conversational changes, ownership and restart recovery, foreground
+priority, last-session shutdown, preserved data, and migration.
 
-- Command-Return stages acceptance of the displayed result.
-- Command-Shift-D stages Decide Later.
-- Command-Shift-X stages Dismiss.
-
-Inspector buttons use the same guarded actions and show the keys in tooltips. Held-key repeats are rejected before an action starts. Shortcuts are disabled outside Memories, for incompatible selections, dirty or unreviewed amendments, pending recovery, or busy or unresolved Saves. Preview Amendment still requires explicit Stage Acceptance. Changing selection, draft ownership, or input invalidates a captured action rather than applying it to another suggestion.
-
-Supported additions, updates, deletions, and Confirm Reviewed also stage in this workspace. Confirm Reviewed requires inspection of its exact result before Stage Confirm Reviewed. Save Changes, the toolbar, and Command-S use the same final Save action. Command-Z uses text undo in an active editor and staged undo elsewhere.
-
-Draft persistence runs separately from prepared interaction. A crash can lose input that has not received a persistence acknowledgment. Restoring a draft restores intent, not approval authority. Each restored publishing suggestion and Confirm Reviewed row requires fresh inspection and staging. Details contains exact sources, diagnostics, paths, and receipts. Recovery-required or unknown Save outcomes block another publication until exact recovery resolves them.
-
-Recovery Required lists retained Saves whose consumption cannot currently be verified. Select a row for read-only Details. To continue separate manual work, explicitly open a distinct manual draft from Details, or choose Start Manual Batch… and confirm. These actions leave recovery pending and unchanged. Review actions remain blocked until Refresh verifies the history. Refresh preserves the selected independent manual draft and its prepared scope.
-
-Terminal review remains explicitly confirmed one item at a time. It uses the shared transaction owner, not the native batch's Save action. Memory management commands remain create, read, update, and delete operations. They cannot approve suggestions or save a review-bearing batch.
-
-Reveal Checkout in Finder opens the selected working-file location, or the repository folder when that file is not checked out. The editor reads committed approved bytes, not dirty working files. Existing Pi sessions keep their saved memory snapshot; start a new session to load changed memory.
-
-## Device and project layers
-
-Set Up This Device creates a random, machine-local key. Reads do not create a device identity. The key is not a hostname or hardware identifier. Do not sync the local configuration as if it were shared memory.
-
-The New Memory menu offers global, this-device, project, and project-on-this-device targets. Other devices stay hidden by default. All devices shows them for explicit editing.
-
-Memory rows and the review inspector label the actual target as Global, a project name, This device, or Another device. Project names come from configured Git-directory bindings or matching recorded source working directories, not from the memory text. Names are prepared with the catalog outside interactive triage. Missing context shows Project (name unavailable). Conflicting names show Project (ambiguous name). Details retains exact target paths, keys, and recorded or configured directories. These labels do not change target scope or approval authority.
-
-A project's default key follows its local canonical Git directory. To share a project across devices, reuse the first device's project key through an explicit binding on each other device:
-
-```zsh
-pi-core-memories project-key --cwd "$project"
-pi-core-memories setup-device
-pi-core-memories bind-project --cwd "$project" --key "$shared_project_key"
-pi-core-memories scope
-```
-
-The app provides the same binding controls. Bindings do not rewrite old documents or pending contexts. Without a binding, moving a project changes its default key.
-
-## Private data and remotes
-
-Use a private remote for approved memory data. The app does not push, pull, or merge automatically. Sync approved main history through your normal Git process.
-
-Keep dream inputs, rejected replies, draft journals, and invocation diagnostics outside both the public source tree and the committed memory tree. The configuration and private state locations come from `MemoryConfiguration` in the Swift core.
-
-## Development checks
-
-```zsh
-swift build -Xswiftc -warnings-as-errors
-PI_CORE_MEMORIES_BIN="$(swift build --show-bin-path)/pi-core-memories" swift test -Xswiftc -warnings-as-errors
-npm ci --ignore-scripts
-node node_modules/typescript/bin/tsc --project tsconfig.json
-PI_CORE_MEMORIES_BIN="$(swift build --show-bin-path)/pi-core-memories" node --throw-deprecation --test Integration/Pi/*.test.ts
-```
-
-The tests use temporary stores and offline providers. They do not require a live model. Native screen checks must also use a separate fixture configuration, not a personal memory store.
-
-The opt-in review drivers use the same twelve-suggestion fixture with four retained approvals and eight timed approvals. Build release tests with warnings treated as errors. Set CORE_MEMORY_REVIEW_BASELINE=1 or CORE_MEMORY_REVIEW_BATCH=1 and filter the corresponding ReviewFlow test. CORE_MEMORY_REVIEW_REPETITION selects one repetition from zero through five. Zero is the warmup. Without that variable, each driver runs the warmup and five measured repetitions. For a before-and-after comparison, run the baseline against frozen pre-change production sources and alternate equivalent repetitions.
-
-PI_NATIVE_PREPARED_TARGET=1 enables nativeThirtySuggestionPreparedActionTarget. It reports prepared model-command timings separately from preparation, durability, and final Save with reconciliation. These checks do not measure rendered-interface latency.
+No test uses a personal memory store. No source check authorizes an installed
+application change, permission grant, model switch, or data deletion.

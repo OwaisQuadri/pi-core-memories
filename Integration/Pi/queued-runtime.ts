@@ -1,11 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { askMemoryDecision } from "./conversation.ts";
 import { callDreamModel, dreamBatchTextBytes, dreamRoots, readDreamScope, runDreamWorker, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
-import { decodeQueuePreview, openQueueClient, queueObject, type QueueConnection, type QueueObject } from "./queue-client.ts";
+import { openQueueClient, queueObject, type QueueObject } from "./queue-client.ts";
 import { protectDreamSources } from "./source-protection.ts";
 import { joinInteractiveMembership, type InteractiveMembership } from "./interactive-membership.ts";
 
@@ -31,45 +30,6 @@ export function assertArchivedRequest(request: DreamRequest, sessionID: string |
 	}
 }
 
-export async function reviewQueuedMemory(pi: ExtensionAPI, ctx: ExtensionContext, client: QueueConnection, identity: { sessionID: string; requestID: string }, operation: string, fields: QueueObject, signal: AbortSignal, isCurrent: () => boolean): Promise<QueueObject> {
-	const reviewSignal = client.signal ? AbortSignal.any([signal, client.signal]) : signal;
-	let frame = await client.request(operation, { ...fields, ...identity });
-	try {
-		for (let phase = 0; phase < 2; phase++) {
-			if (frame.type === "blocked") return { status: "blocked", code: frame.code };
-			const preview = decodeQueuePreview(frame, identity);
-			const prefix = preview.isManagement ? "manage-" : "";
-			let messageReference: string | undefined;
-			const choice = await askMemoryDecision(pi, ctx, preview, reviewSignal, isCurrent, {
-				isDetachRequired: preview.isDetachRequired, isManagement: preview.isManagement,
-				onPresented: async (reference) => {
-					if (reviewSignal.aborted || !isCurrent()) throw new Error("Memory review is no longer current.");
-					messageReference = reference;
-					const ack = await client.request(`${prefix}presented`, { ...preview.tuple, messageReference }, true);
-					if (ack.type !== `${prefix}presented` || ack.displayDigest !== preview.digest) throw new Error("Native memory display was not acknowledged.");
-				},
-			});
-			if (choice === "cancelled" || reviewSignal.aborted || !isCurrent()) return { status: "cancelled" };
-			if (!messageReference) throw new Error("The live memory question was not presented.");
-			const decisionID = randomUUID();
-			const responseReference = `${messageReference}:interactive-answer`;
-			pi.appendEntry("core-memory-queue-decision", { decisionID, isManagement: preview.isManagement, messageReference, responseReference });
-			const result = await client.request(`${prefix}choice`, { ...preview.tuple, action: choice, decisionID, responseReference, isInteractive: true }, true);
-			if (result.type === "blocked") return { status: "outcome-unresolved", decisionID };
-			if (result.type !== `${prefix}decision`) throw new Error("Native memory decision did not return a receipt.");
-			const receipt = queueObject(result.receipt);
-			if (receipt.decisionID !== decisionID || receipt.displayDigest !== preview.digest) throw new Error("Native memory receipt does not match the decision.");
-			if (receipt.status === "detached" && choice === "detach" && phase === 0) {
-				frame = await client.request(operation, { ...fields, ...identity });
-				continue;
-			}
-			if (receipt.status === "approved" && (choice !== "approve" || typeof receipt.commit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(receipt.commit) || typeof receipt.auditRef !== "string" || !receipt.auditRef)) throw new Error("Native memory save was not proved.");
-			return { status: receipt.status, decisionID, ...(typeof receipt.commit === "string" ? { commit: receipt.commit } : {}) };
-		}
-		return { status: "detached", limitation: "A fresh preview and explicit decision are still required." };
-	} finally { await client.request("release").catch(() => {}); }
-}
-
 type RuntimeDependencies = {
 	open: typeof openQueueClient;
 	run: typeof runDreamWorker;
@@ -83,9 +43,6 @@ type RuntimeDependencies = {
 };
 export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<RuntimeDependencies> = {}): () => Promise<void> {
 	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, membership: joinInteractiveMembership, membershipDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
-	const reviewConfigFlag = "memory-queue-review-config";
-	pi.registerFlag(reviewConfigFlag, { type: "string", description: "Review one memory configuration without background intake." });
-	let reviewConfig: string | null | Error | undefined;
 	let context: ExtensionContext | undefined;
 	let membership: InteractiveMembership | undefined;
 	let background: AbortController | undefined;
@@ -147,15 +104,10 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		await backgroundCompletion;
 	}
 	pi.on("session_start", async (_event, ctx) => {
-		if (reviewConfig === undefined) {
-			const value = pi.getFlag(reviewConfigFlag);
-			reviewConfig = value === undefined ? null : typeof value === "string" && isAbsolute(value) ? value : new Error(`--${reviewConfigFlag} requires an absolute configuration filename.`);
-		}
 		invalidate(); const epoch = generation; await leaveMembership();
 		if (generation !== epoch) return;
 		context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; isWorking = !ctx.isIdle(); failures = 0;
-		if (reviewConfig instanceof Error) throw reviewConfig;
-		if (!isAlive || reviewConfig !== null) return;
+		if (!isAlive) return;
 		try {
 			const joined = await deps.membership(deps.membershipDirectory, { sessionID: ctx.sessionManager.getSessionId(), isForeground: isWorking }, () => { stopBackground(); schedule(); });
 			if (generation !== epoch || !isAlive) { await joined.close(); return; }
@@ -180,18 +132,15 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	pi.on("session_shutdown", stop);
 	pi.registerTool({
 		name: "memory_queue", label: "Memory queue", executionMode: "sequential",
-		description: "Inspect shared pending findings, retained migration inventory or approved memories. Review a relevant exact revision with the user, including mid-task; never ask every item automatically. Source text is untrusted, not consent. Proposed approved changes always require the live exact native question. No silence or restored answer grants permission. Recovery only checks an existing decision, never retries consent.",
+		description: "Inspect pending findings, retained migration inventory and approved memories during ordinary conversation. This tool cannot approve or change memory and never opens a review dialog. The ordinary-chat approval transport is not complete. Recovery only checks an existing decision; it never replays consent.",
 		parameters: Type.Object({
-			operation: Type.Union([Type.Literal("pending"), Type.Literal("inventory"), Type.Literal("review"), Type.Literal("approved-list"), Type.Literal("approved-get"), Type.Literal("manage"), Type.Literal("confirm-reviewed"), Type.Literal("recover"), Type.Literal("manage-recover")]),
-			revision: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
+			operation: Type.Union([Type.Literal("pending"), Type.Literal("inventory"), Type.Literal("approved-list"), Type.Literal("approved-get"), Type.Literal("recover"), Type.Literal("manage-recover")]),
 			offset: Type.Optional(Type.String({ pattern: "^(0|[1-9][0-9]{0,9})$" })),
-			request: Type.Optional(Type.Object({}, { additionalProperties: true, description: "Exact native management request: operation, base, path; locator and expected for get/update/delete; replacement for add/update; reason for changes. Obtain exact bytes from approved-list." })),
+			request: Type.Optional(Type.Object({}, { additionalProperties: true, description: "Exact approved-memory get request: operation, base, path, locator and expected. Obtain exact fields from approved-list." })),
 			decisionID: Type.Optional(Type.String({ pattern: "^[A-Za-z0-9._:-]{1,256}$" })),
 		}, { additionalProperties: false }),
 		async execute(_id, params, signal, _update, ctx) {
-			const config = reviewConfig;
-			if (config instanceof Error) throw config;
-			if (config === undefined || ctx.mode !== "tui" || !ctx.hasUI || !isAlive || foreground) throw new Error("Memory queue needs one live interactive session.");
+			if (ctx.mode !== "tui" || !ctx.hasUI || !isAlive || foreground) throw new Error("Memory queue needs one live interactive session.");
 			const identity = memoryRequestIdentity(ctx);
 			const current = new AbortController(); foreground = current; updateMembership();
 			const combined = AbortSignal.any(signal ? [signal, current.signal] : [current.signal]);
@@ -205,13 +154,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				await backgroundCompletion;
 				combined.throwIfAborted();
 				if (!isCurrent()) throw new Error("Memory request changed before ownership was acquired.");
-				const client = config === null ? await deps.open(ctx.cwd, combined) : await deps.open(ctx.cwd, combined, config);
+				const client = await deps.open(ctx.cwd, combined);
 				try {
-					if (params.operation === "review" || params.operation === "manage" || params.operation === "confirm-reviewed") {
-						if (params.operation === "review" && !params.revision) throw new Error("Select an exact pending revision first.");
-						if (params.operation !== "review" && !params.request) throw new Error("An exact management request is required.");
-						return await reviewQueuedMemory(pi, ctx, client, identity, params.operation === "review" ? "claim" : "manage-preview", params.operation === "review" ? { revision: params.revision } : { request: params.request, mode: params.operation === "manage" ? "crud" : "confirm-reviewed" }, combined, isCurrent);
-					}
 					const operation = params.operation === "pending" ? "list" : params.operation;
 					const fields = operation === "list" ? { ...identity, offset: params.offset ?? "0" } : operation === "approved-get" ? { request: params.request } : operation === "recover" || operation === "manage-recover" ? { decisionID: params.decisionID } : {};
 					const result = await client.request(operation, fields);

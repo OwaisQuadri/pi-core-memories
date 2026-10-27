@@ -58,7 +58,7 @@ extension AppModel {
   }
 
   func isReviewRequestCurrent(_ request: NativeReviewRequest) -> Bool {
-    guard isLoaded, !isDreamRunning, !isSubmittingSave, isReviewTransitionEnabled, !isInputDirty,
+    guard isLoaded, !isSubmittingSave, isReviewTransitionEnabled, !isInputDirty,
       request.owner == nativeDraftOwner, request.selection == selection,
       request.section == section, request.inputRevision == inputRevision,
       request.editorOwner == editorOwner

@@ -8,7 +8,7 @@ import { sourceProtectionFixture } from "./test/source-protection.ts";
 import { protectDreamSources } from "./source-protection.ts";
 const { runDreamWorker } = await import("./dream.ts");
 const { openQueueClient, decodeQueuePreview, queueObject } = await import("./queue-client.ts");
-const binary = process.env.PI_CORE_MEMORIES_BIN;
+const binary = process.env.PI_CORE_MEMORIES_BIN ?? process.env.PI_CORE_MEMORIES_EXECUTABLE;
 assert.ok(binary, "Set PI_CORE_MEMORIES_BIN to the verified release command");
 
 test("two native sessions share ownership and persisted same-request deferral after owner death", { timeout: 20_000 }, async (t) => {

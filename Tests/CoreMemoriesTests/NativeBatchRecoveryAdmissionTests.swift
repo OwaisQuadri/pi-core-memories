@@ -245,22 +245,30 @@ func nativeRecoverySelectionIsReadOnlyAndAcknowledgedManualCreationReleasesDetai
   model.setEditorText(fact("Initial input before final persistence."), owner: owner)
   model.setEditorReason("Initial reason", owner: owner)
   let save = Task { await model.save() }
-  let deadline = ContinuousClock.now + .seconds(5)
-  while await control.requests.count == initialRequestCount && ContinuousClock.now < deadline {
-    await Task.yield()
+  let completion = Task {
+    await save.value
+    await control.pauseOperationCompleted()
   }
-  let isHeld = await control.requests.count == initialRequestCount + 1
-  if !isHeld { await control.resumeWrites() }
-  try #require(isHeld)
-  try #require(model.isBusy)
   let newerText = fact("Newer exact input delivered during final persistence.")
   let newerReason = "Newer exact reason"
-  model.setEditorText(newerText, owner: owner)
-  model.setEditorReason(newerReason, owner: owner)
-  await model.stageEditor()
-  #expect(model.isBusy, "Stage Edit must not compete with final Save")
-  await control.resumeWrites()
-  await save.value
+  do {
+    let isHeld = await control.isWritePaused(after: initialRequestCount)
+    try #require(isHeld)
+    try #require(await control.requests.count == initialRequestCount + 1)
+    try #require(model.isBusy)
+    model.setEditorText(newerText, owner: owner)
+    model.setEditorReason(newerReason, owner: owner)
+    await model.stageEditor()
+    #expect(model.isBusy, "Stage Edit must not compete with final Save")
+    await control.resumeWrites()
+    await save.value
+    await completion.value
+  } catch {
+    await control.resumeWrites()
+    await save.value
+    await completion.value
+    throw error
+  }
   guard case .saved(let receipt) = model.saveOutcome, let commit = receipt.commit else {
     throw MemoryError("Expected actual independent manual publication")
   }

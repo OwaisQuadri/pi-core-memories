@@ -12,16 +12,37 @@ actor NativePersistenceControl {
   private var isFailingAfterInstall = false
   private var isPaused = false
   private var release: CheckedContinuation<Void, Never>?
+  private var isPauseOperationCompleted = false
+  private var pauseObserver: (after: Int, continuation: CheckedContinuation<Bool, Never>)?
 
   func failWrites() { isFailing = true }
   func failInstalledWrite() { isFailingAfterInstall = true }
-  func pauseWrites() { isPaused = true }
+  func pauseWrites() {
+    isPaused = true
+    isPauseOperationCompleted = false
+  }
+
+  func isWritePaused(after count: Int) async -> Bool {
+    if release != nil, requests.count > count { return true }
+    if !isPaused || isPauseOperationCompleted { return false }
+    precondition(pauseObserver == nil)
+    return await withCheckedContinuation { pauseObserver = (count, $0) }
+  }
+
+  func pauseOperationCompleted() {
+    isPauseOperationCompleted = true
+    pauseObserver?.continuation.resume(returning: false)
+    pauseObserver = nil
+  }
+
   func resumeWrites(isFailing: Bool = false, isFailingAfterInstall: Bool = false) {
     self.isFailing = isFailing
     self.isFailingAfterInstall = isFailingAfterInstall
     isPaused = false
     release?.resume()
     release = nil
+    pauseObserver?.continuation.resume(returning: false)
+    pauseObserver = nil
   }
 
   func write(_ request: MemoryBatchPersistenceRequest, repository: URL, journal: URL) async throws
@@ -32,7 +53,15 @@ actor NativePersistenceControl {
     maximumInFlight = max(maximumInFlight, inFlight)
     defer { inFlight -= 1 }
     guard inFlight == 1 else { throw MemoryError("Concurrent native persistence") }
-    if isPaused { await withCheckedContinuation { release = $0 } }
+    if isPaused {
+      await withCheckedContinuation {
+        release = $0
+        if let observer = pauseObserver, requests.count > observer.after {
+          pauseObserver = nil
+          observer.continuation.resume(returning: true)
+        }
+      }
+    }
     if isFailing { throw MemoryError("Synthetic persistence failure") }
     let store = try MemoryDraftStore(repository: repository, journal: journal)
     if isFailingAfterInstall {
@@ -482,19 +511,45 @@ extension Workspace {
   model.setEditorText(fact("First autosave held while the flush starts."), owner: owner)
   model.setEditorReason("First reason", owner: owner)
   let previous = try #require(model.autosaveTask)
-  let deadline = ContinuousClock.now + .seconds(5)
-  while await control.requests.isEmpty && ContinuousClock.now < deadline { await Task.yield() }
-  if await control.requests.isEmpty { await control.resumeWrites() }
-  try #require(await control.requests.count == 1)
-  let flush = Task { try await model.flushInputAndPersistence() }
-  while !previous.isCancelled && ContinuousClock.now < deadline { await Task.yield() }
-  if !previous.isCancelled { await control.resumeWrites() }
-  try #require(previous.isCancelled)
+  let completion = Task {
+    await previous.value
+    await control.pauseOperationCompleted()
+  }
+  let (cancellations, cancellation) = AsyncStream<Void>.makeStream()
+  model.autosaveTask = Task {
+    await withTaskCancellationHandler {
+      await previous.value
+    } onCancel: {
+      previous.cancel()
+      cancellation.yield()
+      cancellation.finish()
+    }
+  }
   let latestText = fact("Latest exact input admitted while the flush awaits its predecessor.")
-  model.setEditorText(latestText, owner: owner)
-  model.setEditorReason("Latest exact reason", owner: owner)
-  await control.resumeWrites()
-  try await flush.value
+  var flush: Task<Void, Error>?
+  do {
+    let isHeld = await control.isWritePaused(after: 0)
+    try #require(isHeld)
+    try #require(await control.requests.count == 1)
+    let running = Task {
+      defer { cancellation.finish() }
+      try await model.flushInputAndPersistence()
+    }
+    flush = running
+    var events = cancellations.makeAsyncIterator()
+    try #require(await events.next() != nil)
+    try #require(previous.isCancelled)
+    model.setEditorText(latestText, owner: owner)
+    model.setEditorReason("Latest exact reason", owner: owner)
+    await control.resumeWrites()
+    try await running.value
+    await completion.value
+  } catch {
+    await control.resumeWrites()
+    if let flush { _ = try? await flush.value }
+    await completion.value
+    throw error
+  }
   #expect(!model.isDraftDirty)
   #expect(model.autosaveTask == nil)
   #expect(model.autosaveID == nil)

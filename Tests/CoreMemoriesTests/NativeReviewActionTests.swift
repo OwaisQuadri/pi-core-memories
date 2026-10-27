@@ -101,9 +101,6 @@ import Testing
   model.isBusy = true
   #expect(model.captureReviewAction(.accept) == nil)
   model.isBusy = false
-  model.isDreamRunning = true
-  #expect(model.captureReviewAction(.dismiss) == nil)
-  model.isDreamRunning = false
   model.isSubmittingSave = true
   #expect(model.captureReviewAction(.decideLater) == nil)
   model.isSubmittingSave = false

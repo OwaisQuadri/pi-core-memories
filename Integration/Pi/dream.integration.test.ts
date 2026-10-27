@@ -5,7 +5,6 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { DreamCoverage, DreamRequest, DreamStart } from "./dream.ts";
 
 import { sdkURL, aiURL } from "./test/host.ts";
@@ -15,9 +14,7 @@ const { sourceProtectionFixture } = await import("./test/source-protection.ts");
 const dream = {
 	...nativeDream,
 	runDreamWorker: (...args: Parameters<typeof nativeDream.runDreamWorker>) => nativeDream.runDreamWorker(args[0], args[1], args[2], args[3], args[4] ?? ((value, signal) => protectDreamSources(sourceProtectionFixture(), args[0].invocationID, value, signal))),
-	registerDream: (pi: ExtensionAPI) => nativeDream.registerDream(sourceProtectionFixture(pi)),
 };
-const { default: coreMemories } = await import("./index.ts");
 const sdk = await import(sdkURL) as typeof import("@earendil-works/pi-coding-agent");
 const ai = await import(aiURL) as typeof import("@earendil-works/pi-ai");
 const binary = process.env.PI_CORE_MEMORIES_BIN ?? process.env.PI_CORE_MEMORIES_EXECUTABLE;
@@ -118,7 +115,7 @@ test("real worker withholds provider error text, saves no response, and calls ag
 	assert.equal(report.status, "pending"); assert.equal(report.reason, "callbackFailure"); assert.equal(report.generation, "0"); assert.equal(calls, 1);
 	assert.equal(report.detail, "The dream model call did not complete.");
 	const display = dream.dreamReviewText(report);
-	assert.ok(display.includes(`Cause: ${report.detail}`)); assert.ok(display.includes("Use /dream retry only")); assert.ok(!display.includes("PRIVATE PARTIAL RESPONSE"));
+	assert.ok(display.includes(`Cause: ${report.detail}`)); assert.ok(display.includes("Discuss recovery in conversation before another model call.")); assert.ok(!display.includes("/dream")); assert.ok(!display.includes("PRIVATE PARTIAL RESPONSE"));
 	const directory = join(f.roots.state, "runs", report.runID!);
 	await assert.rejects(readFile(join(directory, "response.json")), { code: "ENOENT" });
 	assert.equal(f.cli("render", "--repo", f.repo, "--cwd", f.root), memoryBefore);
@@ -157,14 +154,11 @@ test("saved owner byte mismatch reports its exact cause and cannot be replaced b
 	assert.deepEqual(await readFile(join(directory, "rejected-1.json")), await readFile(join(directory, "response.json")));
 });
 
-test("explicit replace command alone dispatches current selection and archives rejected bytes", async (t) => {
+test("explicit worker replacement alone dispatches current selection and archives rejected bytes", async (t) => {
 	const f = await fixture(t);
-	let handler!: (args: string, ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext) => Promise<void>;
-	const entries: { report: import("./dream.ts").DreamReport }[] = [];
-	const shutdown = dream.registerDream({ registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; }, registerEntryRenderer: () => {}, appendEntry: (_name: string, data: { report: import("./dream.ts").DreamReport }) => entries.push(data), getThinkingLevel: () => "off" } as unknown as ExtensionAPI);
-	t.after(shutdown);
 	const calls: { model: unknown; context: Context; reasoning: unknown }[] = [];
-	const current = { provider: "anthropic", id: "current", api: "offline", contextWindow: 262_144 };
+	const selectedModel: Model<"offline"> = { provider: "openai", id: "selected", api: "offline", name: "Synthetic model", baseUrl: "https://offline.invalid", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 262_144, maxTokens: 16_384 };
+	const current = { ...selectedModel, provider: "anthropic", id: "current" };
 	const registry = { streamSubscriptionSimple(model, context, options) {
 		calls.push({ model, context, reasoning: options?.reasoning });
 		options?.onDispatch?.(Object.freeze({ provider: model.provider, modelID: model.id, api: model.api }));
@@ -173,30 +167,31 @@ test("explicit replace command alone dispatches current selection and archives r
 		const reply: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [{ type: "text", text }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 		const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
 	} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSubscriptionSimple">;
-	const ctx = { cwd: f.root, mode: "rpc", model: { provider: "openai", id: "selected", api: "offline", contextWindow: 262_144 }, thinkingLevel: "off", waitForIdle: async () => {}, ui: { notify: () => {} }, modelRegistry: registry };
-	const commandContext = ctx as unknown as import("@earendil-works/pi-coding-agent").ExtensionCommandContext;
+	const ctx = { cwd: f.root, mode: "rpc", model: selectedModel, thinkingLevel: "off", waitForIdle: async () => {}, ui: { notify: () => {} }, modelRegistry: registry };
+	const launch = (start: DreamStart) => dream.runDreamWorker(start, (request, signal) => dream.callDreamModel(request, ctx as unknown as import("@earendil-works/pi-coding-agent").ExtensionContext, ctx.model, start.selection, signal), new AbortController().signal);
 	const memoryBefore = f.cli("render", "--repo", f.repo, "--cwd", f.root);
-	await handler("", commandContext);
-	assert.equal(entries.at(-1)!.report.reason, "invalidDecision"); assert.equal(calls.length, 1);
-	const runID = entries[0].report.runID!;
+	const first = await launch(f.start);
+	assert.equal(first.reason, "invalidDecision"); assert.equal(calls.length, 1);
+	const runID = first.runID!;
 	const directory = join(f.roots.state, "runs", runID);
 	const original = await readFile(join(directory, "response.json"));
 	const names = ["input.json", "context.json", "request.json"];
 	const frozen = await Promise.all(names.map((name) => readFile(join(directory, name))));
-	for (const argument of ["", "retry", "all"]) {
-		await handler(argument, commandContext); assert.equal(calls.length, 1); assert.equal(entries.at(-1)!.report.reason, "invalidDecision");
+	for (const resume of ["inspectOrContinue", "retryInterruptedCall"] as const) {
+		assert.equal((await launch({ ...f.start, resume })).reason, "invalidDecision"); assert.equal(calls.length, 1);
 	}
 	assert.equal(f.cli("render", "--repo", f.repo, "--cwd", f.root), memoryBefore);
 	await rm(f.roots.sessions, { recursive: true });
 	ctx.model = current; ctx.thinkingLevel = "high";
-	await handler("replace", commandContext);
+	const currentStart: DreamStart = { ...f.start, selection: { provider: current.provider, modelID: current.id, thinkingLevel: "high" }, resume: "replaceInvalidResponse" };
+	const replaced = await launch(currentStart);
 	assert.equal(calls.length, 2); assert.strictEqual(calls[1].model, current); assert.equal(calls[1].reasoning, "high"); assert.deepEqual(calls[1].context, calls[0].context);
-	assert.equal(entries.at(-1)!.report.status, "completed"); assert.equal(entries.at(-1)!.report.runID, runID); assert.equal(entries.at(-1)!.report.generation, "1");
+	assert.equal(replaced.status, "completed"); assert.equal(replaced.runID, runID); assert.equal(replaced.generation, "1");
 	assert.deepEqual(await readFile(join(directory, "rejected-1.json")), original);
 	assert.deepEqual(await readFile(join(directory, "response.json")), original);
 	assert.deepEqual(await Promise.all(names.map((name) => readFile(join(directory, name)))), frozen);
 	assert.equal(f.cli("render", "--repo", f.repo, "--cwd", f.root), memoryBefore);
-	await handler("replace", commandContext); assert.equal(calls.length, 2); assert.equal(entries.at(-1)!.report.status, "blocked");
+	assert.equal((await launch(currentStart)).status, "blocked"); assert.equal(calls.length, 2);
 });
 
 test("interrupted replacement needs explicit retry, retains original, and uses current selection", async (t) => {
@@ -290,37 +285,6 @@ test("exclusions-only complete and no-new records never call registry", async (t
 	assert.equal((await dream.runDreamWorker(f.start, forbidden, new AbortController().signal)).status, "noNewRecords");
 });
 
-for (const action of ["escape", "shutdown"] as const) test(`native BorderedLoader ${action} aborts registry, reaps worker, and leaves recoverable pending state`, { timeout: 10000 }, async (t) => {
-	const f = await fixture(t); sdk.initTheme("dark", false);
-	let handler!: (args: string, ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext) => Promise<void>;
-	let loader: import("@earendil-works/pi-coding-agent").BorderedLoader | undefined;
-	let signal: AbortSignal | undefined;
-	let entered!: () => void; const ready = new Promise<void>((done) => { entered = done; });
-	const entries: unknown[] = [];
-	const pi = { registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; }, registerEntryRenderer: () => {}, appendEntry: (_name: string, data: unknown) => entries.push(data), getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
-	const shutdown = dream.registerDream(pi);
-	t.after(async () => { await shutdown(); loader?.dispose(); });
-	let isDismissed = false;
-	const ctx = { cwd: f.root, mode: "tui", model: { provider: "openai", id: "selected", api: "fixture", contextWindow: 262_144 }, thinkingLevel: "off", waitForIdle: async () => {},
-		modelRegistry: { streamSubscriptionSimple(_model: unknown, _context: unknown, options: { signal: AbortSignal }) {
-			signal = options.signal; entered();
-			return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }), result: () => new Promise(() => {}) };
-		} },
-		ui: { notify: () => {}, custom: (factory: (...args: unknown[]) => unknown) => new Promise((done) => {
-			loader = factory({ requestRender: () => {} }, { fg: (_name: string, value: string) => value }, {}, (value: unknown) => { isDismissed = true; loader?.dispose(); done(value); }) as typeof loader;
-		}) },
-	} as unknown as import("@earendil-works/pi-coding-agent").ExtensionCommandContext;
-	const work = handler("", ctx); await Promise.race([ready, work.then(() => assert.fail("Command stopped before registry call"))]);
-	if (action === "escape") {
-		loader!.handleInput("\u001b"); assert.equal(isDismissed, true); assert.equal(signal?.aborted, true);
-	} else { await shutdown(); }
-	await work; loader?.dispose();
-	assert.equal(signal?.aborted, true);
-	assert.equal(entries.length, action === "escape" ? 1 : 0);
-	const pending = await dream.runDreamWorker(f.start, async () => { assert.fail("Inspect must not call"); }, new AbortController().signal);
-	assert.equal(pending.status, "pending"); assert.equal(pending.reason, "interruptedCall");
-});
-
 test("SDK subscription guard rejects custom virtual transport without changing logical selection", async (t) => {
 	const f = await fixture(t);
 	const runtime = await sdk.ModelRuntime.create({ authPath: join(f.agent, "auth.json"), modelsPath: null, modelsStorePath: join(f.agent, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
@@ -345,39 +309,6 @@ test("SDK subscription guard rejects custom virtual transport without changing l
 	assert.equal(routes, 1); assert.equal(nativeCalls, 0); assert.equal(captured.api, "pi-virtual"); assert.equal(request.selection.thinkingLevel, "medium");
 });
 
-test("installed SDK command lifecycle captures selection and stores review outside model and human input", async (t) => {
-	const f = await fixture(t);
-	const runtime = await sdk.ModelRuntime.create({ authPath: join(f.agent, "auth.json"), modelsPath: null, modelsStorePath: join(f.agent, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
-	const model = runtime.getModels("openai").find((item) => !item.reasoning && item.contextWindow >= 65_536); assert.ok(model);
-	const requests: { model: unknown; context: Context; reasoning: unknown }[] = [];
-	runtime.streamSubscriptionSimple = (current, context, options) => {
-		options?.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
-		requests.push({ model: current, context, reasoning: options?.reasoning });
-		assert.equal(context.tools, undefined); assert.ok(!JSON.stringify(context).includes("ACTIVE CONVERSATION MUST NOT BE MINED"));
-		assert.ok(!JSON.stringify(context).includes("CURRENT LOADER MUST NOT BE APPENDED"));
-		const request = { messages: context.messages.map((item) => ({ text: typeof item.content === "string" ? item.content : "", role: item.role, timestampMilliseconds: item.timestamp })), contextHash: JSON.parse(typeof context.messages[0].content === "string" ? context.messages[0].content : "").contextHash } as DreamRequest;
-		const content = JSON.parse(request.messages[0].text) as { primaryEvidence: { source: unknown }[] };
-		const text = JSON.stringify({ schemaVersion: 1, contextHash: contentHash(context), decisions: content.primaryEvidence.map((entry) => ({ kind: "noChange", sources: [entry.source], reasonCode: "notDurable", explanation: "Offline SDK note." })) });
-		const reply: AssistantMessage = { role: "assistant", api: current.api, provider: current.provider, model: current.id, content: [{ type: "text", text }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-		const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
-	};
-	const settingsManager = sdk.SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off", compaction: { enabled: false } });
-	const loader = new sdk.DefaultResourceLoader({ cwd: f.root, agentDir: f.agent, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [(pi: ExtensionAPI) => coreMemories(sourceProtectionFixture(pi), async () => "CURRENT LOADER MUST NOT BE APPENDED")] });
-	await loader.reload();
-	const manager = sdk.SessionManager.inMemory(f.root); manager.appendMessage({ role: "user", content: "ACTIVE CONVERSATION MUST NOT BE MINED", timestamp: 0 });
-	const { session } = await sdk.createAgentSession({ cwd: f.root, agentDir: f.agent, resourceLoader: loader, modelRuntime: runtime, model, thinkingLevel: "off", settingsManager, sessionManager: manager, tools: [] });
-	t.after(() => session.dispose());
-	const errors: string[] = [];
-	await session.bindExtensions({ mode: "rpc", onError: (error) => errors.push(error.error) });
-	const before = manager.getBranch().filter((entry) => entry.type === "message" && entry.message.role === "user").length;
-	await session.prompt("/dream");
-	assert.equal(requests.length, 1); assert.strictEqual(requests[0].model, model); assert.equal(requests[0].reasoning, undefined);
-	assert.equal(session.model, model); assert.equal(session.thinkingLevel, "off"); assert.deepEqual(session.getActiveToolNames(), []);
-	const reviews = manager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === dream.DREAM_REVIEW_TYPE);
-	assert.equal(reviews.length, 1); assert.equal(manager.getBranch().filter((entry) => entry.type === "message" && entry.message.role === "user").length, before);
-	assert.ok(!JSON.stringify(manager.buildSessionProjection().messages).includes("Offline SDK note."));
-	await session.prompt("/dream retry"); await session.prompt("/dream"); assert.equal(requests.length, 1); assert.deepEqual(errors, []);
-});
 function contentHash(context: Context): string {
 	const payload = JSON.parse(typeof context.messages[0].content === "string" ? context.messages[0].content : "") as Record<string, unknown>;
 	assert.equal(typeof payload.contextHash, "string");
@@ -421,23 +352,6 @@ test("client keeps a failed model call as the pending report cause", async (t) =
 	await scriptedWorker(t, `let count = 0; process.stdin.on('data',()=>{ if (count++ === 0) process.stdout.write(${JSON.stringify(JSON.stringify(request) + "\n")}); else { process.stdout.write(${JSON.stringify(JSON.stringify(pending) + "\n")}); process.stdin.destroy(); } });`, true);
 	const report = await dream.runDreamWorker(protocolStart, async () => { throw new Error("provider quota exceeded"); }, new AbortController().signal);
 	assert.equal(report.detail, "The dream model call did not complete.");
-});
-
-test("dream all runs every batch until the backlog ends", async (t) => {
-	const f = await fixture(t);
-	const counter = join(f.root, "starts.txt");
-	await writeFile(counter, "0");
-	await scriptedWorker(t, `const fs = require("node:fs"); process.stdin.once("data", bytes => {
-const start = JSON.parse(bytes.toString());
-const count = Number(fs.readFileSync(${JSON.stringify(counter)}, "utf8")) + 1; fs.writeFileSync(${JSON.stringify(counter)}, String(count));
-if (start.batchTextBytes !== 262144) process.exit(9);
-process.stdout.write(JSON.stringify({ version: 1, type: "final", invocationID: start.invocationID, status: "completed", generation: String(count), runID: "run", base: "b".repeat(40), proposals: [], notes: [], isBacklog: count < 13, isRecovered: false, reason: null, detail: null, unfinishedTails: 0 }) + "\\n"); process.stdin.destroy();
-});`);
-	let handler!: (args: string, ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext) => Promise<void>;
-	const entries: unknown[] = [];
-	const shutdown = dream.registerDream({ registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; }, registerEntryRenderer: () => {}, appendEntry: (_name: string, data: unknown) => entries.push(data), getThinkingLevel: () => "medium" } as unknown as ExtensionAPI);
-	await handler("all", { mode: "rpc", cwd: f.root, model: { provider: "openai", id: "gpt-6.1", contextWindow: 262_144 }, waitForIdle: async () => {}, ui: { notify: () => {} } } as unknown as import("@earendil-works/pi-coding-agent").ExtensionCommandContext);
-	assert.equal(entries.length, 13); await shutdown();
 });
 
 test("client rejects duplicate or wrong-bound requests before a second registry call", async (t) => {
@@ -504,85 +418,4 @@ test("transport rejects progress completion followed by an uncommitted final rep
 	const output = [frame, { ...frame, completedBytes: 100 }, protocolFinal].map((value) => JSON.stringify(value) + "\n").join("");
 	await scriptedWorker(t, `process.stdout.write(${JSON.stringify(output)});`);
 	await assert.rejects(dream.runDreamWorker(protocolStart, async () => { assert.fail("No model request"); }, new AbortController().signal));
-});
-
-for (const ending of ["completed", "pending", "blocked", "busy", "noNewRecords", "error", "cancel", "shutdown"] as const) test(`dream all saves reports in order and stops on ${ending} without retry or approval`, async (t) => {
-	const f = await fixture(t);
-	const startsFile = join(f.root, "starts.json");
-	const entriesFile = join(f.root, "entries.json");
-	await writeFile(startsFile, "[]"); await writeFile(entriesFile, "[]");
-	await scriptedWorker(t, `
-const fs = require("node:fs");
-process.stdin.once("data", bytes => {
- const start = JSON.parse(bytes.toString());
- const starts = JSON.parse(fs.readFileSync(${JSON.stringify(startsFile)}, "utf8"));
- const entries = JSON.parse(fs.readFileSync(${JSON.stringify(entriesFile)}, "utf8"));
- if (entries.length !== starts.length) process.exit(9);
- starts.push(start); fs.writeFileSync(${JSON.stringify(startsFile)}, JSON.stringify(starts));
- if (starts.length > 1 && ${JSON.stringify(ending)} === "error") process.exit(1);
- const status = starts.length === 1 ? "completed" : ${JSON.stringify(ending === "cancel" || ending === "shutdown" ? "completed" : ending)};
- const report = { version: 1, type: "final", invocationID: start.invocationID, status, generation: String(starts.length), runID: ["busy", "noNewRecords"].includes(status) ? null : "run", base: ["busy", "noNewRecords"].includes(status) ? null : "b".repeat(40), proposals: [], notes: [], isBacklog: starts.length === 1 || status !== "completed", isRecovered: starts.length === 1, reason: null, detail: null, unfinishedTails: 0 };
- const progress = { version: 1, type: "progress", invocationID: start.invocationID, backlogBytes: 200, backlogLimitBytes: 400, plannedBytes: 100, completedBytes: 0, undreamtBytes: starts.length === 1 ? 200 : 100, nextBytes: starts.length === 1 ? 100 : 0, repeatedRecords: 0, estimateSeconds: null };
- if (status === "completed") process.stdout.write(JSON.stringify(progress) + "\\n");
- setTimeout(() => {
-  if (status === "completed") process.stdout.write(JSON.stringify({ ...progress, completedBytes: 100 }) + "\\n");
-  process.stdout.write(JSON.stringify(report) + "\\n"); process.stdin.destroy();
- }, 100);
-});`);
-	let handler!: (args: string, ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext) => Promise<void>;
-	const entries: unknown[] = []; const notices: string[] = [];
-	const frames: string[][] = [];
-	let shutdown!: () => Promise<void>; let loader: { handleInput(value: string): void; dispose(): void; render(width: number): string[] } | undefined;
-	shutdown = dream.registerDream({
-		registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; },
-		registerEntryRenderer: () => {}, getThinkingLevel: () => "medium",
-		appendEntry: (_name: string, value: unknown) => {
-			entries.push(value); writeFileSync(entriesFile, JSON.stringify(entries));
-			if (ending === "cancel") loader!.handleInput("\u001b");
-			if (ending === "shutdown") void shutdown();
-		},
-	} as unknown as ExtensionAPI);
-	const captured = { provider: "openai", id: "gpt-6.1", api: "openai-responses", contextWindow: 262_144 };
-	let modelReads = 0; let thinkingReads = 0;
-	const ctx = {
-		mode: "tui", cwd: f.root,
-		get model() { modelReads++; return modelReads === 1 ? captured : { ...captured, id: "changed" }; },
-		get thinkingLevel() { thinkingReads++; return thinkingReads === 1 ? "medium" : "high"; },
-		waitForIdle: async () => {},
-		modelRegistry: { streamSubscriptionSimple: () => assert.fail("No provider call or retry allowed") },
-		ui: { notify: (value: string) => notices.push(value), custom: (factory: (...args: unknown[]) => unknown) => new Promise((done) => {
-			loader = factory({ requestRender: () => { if (loader) frames.push(loader.render(100)); } }, { fg: (_name: string, value: string) => value }, {}, done) as typeof loader;
-		}) },
-	} as unknown as import("@earendil-works/pi-coding-agent").ExtensionCommandContext;
-	await handler("all", ctx); loader?.dispose(); await shutdown();
-	const starts = JSON.parse(await readFile(startsFile, "utf8")) as DreamStart[];
-	assert.equal(starts.length, ending === "cancel" || ending === "shutdown" ? 1 : 2);
-	assert.equal(entries.length, ending === "error" || ending === "cancel" || ending === "shutdown" ? 1 : 2);
-	assert.equal(modelReads, 1); assert.equal(thinkingReads, 1);
-	assert.equal(new Set(starts.map((start) => start.invocationID)).size, starts.length);
-	for (const start of starts) {
-		assert.deepEqual(start.selection, { provider: "openai", modelID: "gpt-6.1", thinkingLevel: "medium" });
-		assert.equal(start.resume, "inspectOrContinue");
-	}
-	if (ending === "error") assert.match(notices.join("\n"), /Dream failed/);
-	if (ending === "completed") {
-		assert.ok(frames.some((frame) => frame.join("\n").includes("all · batch 1")));
-		assert.ok(frames.some((frame) => frame.join("\n").includes("all · batch 2")));
-		if (process.env.DREAM_VISUAL_EVIDENCE) await writeFile(process.env.DREAM_VISUAL_EVIDENCE, JSON.stringify(frames));
-	}
-	assert.equal(f.cli("render", "--repo", f.repo, "--cwd", f.root), "# Memory\n");
-});
-
-for (const argument of ["", "retry"]) test(`dream ${argument || "default"} remains one batch with backlog`, async (t) => {
-	const f = await fixture(t);
-	await scriptedWorker(t, `process.stdin.once("data", bytes => {
-const start = JSON.parse(bytes.toString());
-if (start.resume !== ${JSON.stringify(argument === "retry" ? "retryInterruptedCall" : "inspectOrContinue")}) process.exit(9);
-process.stdout.write(JSON.stringify({ version: 1, type: "final", invocationID: start.invocationID, status: "completed", generation: "1", runID: "run", base: "b".repeat(40), proposals: [], notes: [], isBacklog: true, isRecovered: false, reason: null, detail: null, unfinishedTails: 0 }) + "\\n"); process.stdin.destroy();
-});`);
-	let handler!: (args: string, ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext) => Promise<void>;
-	const entries: unknown[] = [];
-	const shutdown = dream.registerDream({ registerCommand: (_name: string, command: { handler: typeof handler }) => { handler = command.handler; }, registerEntryRenderer: () => {}, appendEntry: (_name: string, data: unknown) => entries.push(data), getThinkingLevel: () => "medium" } as unknown as ExtensionAPI);
-	await handler(argument, { mode: "rpc", cwd: f.root, model: { provider: "openai", id: "gpt-6.1", contextWindow: 262_144 }, waitForIdle: async () => {}, ui: { notify: () => {} } } as unknown as import("@earendil-works/pi-coding-agent").ExtensionCommandContext);
-	assert.equal(entries.length, 1); await shutdown();
 });

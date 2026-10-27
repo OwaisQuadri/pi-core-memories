@@ -242,7 +242,7 @@ package final class MemoryManagement {
       let witness = try checkout.witness()
       guard witness.head == Data((witness.commit + "\n").utf8) else {
         throw MemoryError(
-          "checkout is attached; run /mem-prepare and confirm checkout preparation, then retry the requested change"
+          "checkout is attached; memory writes remain blocked until checkout preparation has explicit approval in conversation"
         )
       }
       try checkout.lock(state: state, detachedHead: witness.head)
@@ -347,7 +347,9 @@ package final class MemoryManagement {
       try checkout.lock(state: state, detachedHead: Data((preview.commit + "\n").utf8))
       try afterCheckoutLocks?()
       guard try checkout.witness(isLocked: true) == preview.witness else {
-        throw MemoryError("checkout changed; run /mem-prepare again")
+        throw MemoryError(
+          "checkout changed; obtain fresh checkout preparation and explicit approval in conversation"
+        )
       }
       try checkout.detach(preview.witness)
     }

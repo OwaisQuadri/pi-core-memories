@@ -8,14 +8,7 @@ struct DreamsView: View {
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 16) {
-        HStack {
-          Label("Find memory suggestions", systemImage: "moon.stars").font(.title2.bold())
-          Spacer()
-          if model.isDreamRunning {
-            ProgressView().controlSize(.small).accessibilityLabel(model.dreamPhase)
-            Button("Stop Finding Suggestions") { model.cancelDream() }.fixedSize()
-          }
-        }
+        Label("Saved dreams", systemImage: "moon.stars").font(.title2.bold())
         Text(statusTitle).font(.headline)
         if !model.dreamDetail.isEmpty, model.invocationStatus?.isPublicationBlocked != true,
           model.dreamPhase != "Status unavailable"
@@ -23,41 +16,14 @@ struct DreamsView: View {
           Text(model.dreamDetail).textSelection(.enabled)
         }
         DreamQueueView(model: model)
-        if !model.isDreamRunning {
-          HStack {
-            if model.savedRecoveryRunID != nil {
-              Button("Prepare Saved Suggestions…") {
-                Task { await model.prepareSavedRecovery() }
-              }.fixedSize()
-            } else if model.resumableRun != nil {
-              Button("Continue Saved Work") { model.run(.start) }.fixedSize()
-            } else if model.invocationStatus?.reason == "invalidDecision" {
-              Button("Replace Invalid Reply…") { model.isConfirmingReplacement = true }.fixedSize()
-            } else if ["interruptedCall", "callInterrupted", "callbackFailure"].contains(
-              model.invocationStatus?.reason ?? "")
-            {
-              Button("Retry Interrupted Call…") { model.isConfirmingRetry = true }.fixedSize()
-            } else {
-              Button("Find Suggestions") { model.run(.start) }.fixedSize()
-            }
-            Button(model.reviewActionTitle) { model.section = "Memories" }.fixedSize()
-            Menu("Other Actions") {
-              Button("Find Suggestions in One Batch") { model.run(.start) }
-              Button("Find Suggestions in All Waiting Batches") { model.run(.all) }
-              Divider()
-              Button("Retry Interrupted Call…") { model.isConfirmingRetry = true }
-                .disabled(model.invocationStatus?.isPublicationBlocked == true)
-              Button("Replace Invalid Reply…") { model.isConfirmingReplacement = true }
-                .disabled(model.invocationStatus?.isPublicationBlocked == true)
+        HStack {
+          if model.savedRecoveryRunID != nil {
+            Button("Prepare Saved Suggestions…") {
+              Task { await model.prepareSavedRecovery() }
             }.fixedSize()
-            Spacer()
           }
-          if model.invocationStatus?.isPublicationBlocked != true {
-            Text(
-              "Finding suggestions uses your selected model and may incur a charge. It never changes saved memories. Stage reviewed suggestions in Memories, then choose Save Changes."
-            )
-            .font(.callout).foregroundStyle(.secondary)
-          }
+          Button(model.reviewActionTitle) { model.section = "Memories" }.fixedSize()
+          Spacer()
         }
         DisclosureGroup("Details", isExpanded: $isShowingDetails) {
           details
@@ -103,35 +69,18 @@ struct DreamsView: View {
       }.padding(24).frame(width: 640, height: 520)
         .environment(\.isEnabled, true)
     }
-    .alert("Retry Interrupted Call?", isPresented: $model.isConfirmingRetry) {
-      Button("Cancel", role: .cancel) {}
-      Button("Retry") { model.run(.retry) }
-    } message: {
-      Text(
-        "This can make another billable call using the saved request and your current selection. It does not save suggestions into memory."
-      )
-    }
-    .alert("Replace Invalid Reply?", isPresented: $model.isConfirmingReplacement) {
-      Button("Cancel", role: .cancel) {}
-      Button("Replace") { model.run(.replace) }
-    } message: {
-      Text(
-        "The rejected reply is retained. A replacement can make another billable call and uses the same frozen validation rules. It does not save suggestions into memory."
-      )
-    }
   }
 
   private var statusTitle: String {
-    if model.isDreamRunning { return model.dreamPhase }
     if model.dreamInspectionFailure != nil { return "Saved dream details unavailable" }
     if let status = model.invocationStatus {
       switch status.status {
-      case "completed": return "Conversation processing finished"
-      case "noNewRecords": return "No new conversations to process"
+      case "completed": return "Saved processing completed"
+      case "noNewRecords": return "Last saved report: no new conversations"
       case "pending":
         return status.isPublicationBlocked
           ? "Saved suggestions are waiting" : "Saved work needs attention"
-      default: return status.title
+      default: return "Last saved report: \(status.title)"
       }
     }
     if model.dreamPhase == "Status unavailable" { return model.dreamPhase }
@@ -139,7 +88,7 @@ struct DreamsView: View {
       return runTitle(run)
     }
     return model.dreamPhase == "Idle"
-      ? "Ready to find suggestions in recent conversations" : model.dreamPhase
+      ? "No saved invocation status" : model.dreamPhase
   }
 
   private var details: some View {
@@ -158,14 +107,6 @@ struct DreamsView: View {
       if let unavailable = model.queueSnapshot?.unavailableReason {
         Text(unavailable).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
       }
-      LabeledContent(
-        "Requested model",
-        value: [
-          model.configuration.settings.provider ?? "Pi default",
-          model.configuration.settings.modelID ?? "Pi default",
-          model.configuration.settings.thinkingLevel ?? "Pi default",
-        ].joined(separator: " / "))
-      LabeledContent("Resolved model", value: model.resolvedSelection)
       if let date = model.invocationStatus?.observedAt {
         LabeledContent(
           "Last saved report", value: date.formatted(date: .abbreviated, time: .standard))
@@ -222,11 +163,6 @@ struct DreamsView: View {
           PlainTextView(text: model.artifactText)
         }.padding(12).frame(minWidth: 300)
       }.frame(height: 320)
-      if !model.dreamEvents.isEmpty {
-        DisclosureGroup("Invocation Events") {
-          PlainTextView(text: model.dreamEvents.joined(separator: "\n\n")).frame(height: 150)
-        }
-      }
     }.padding(.top, 12)
   }
 
@@ -239,7 +175,7 @@ struct DreamsView: View {
     if run.isCompleted { return "Processing completed" }
     switch run.attempts.last?.status {
     case "Reply valid": return "Saved suggestions are waiting"
-    case "Rejected reply": return "Saved reply needs replacement"
+    case "Rejected reply": return "Saved reply was rejected"
     default: return "Saved work; completion not established"
     }
   }

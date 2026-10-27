@@ -47,11 +47,6 @@ struct DreamQueueView: View {
         .foregroundStyle(.secondary)
       }
       HStack(spacing: 24) {
-        let batch = model.eventCoverage
-        Text(
-          "\(model.isDreamRunning ? "Current" : "Last") batch \(batch.map { bytes($0.plannedBytes) } ?? "unknown")"
-        )
-        Text("Next batch \(batch?.nextBytes.map(bytes) ?? "unknown")")
         Spacer()
         if let date = model.queueObservedAt {
           Text("As of \(date.formatted(date: .omitted, time: .standard))").foregroundStyle(

@@ -24,6 +24,14 @@ First verified queue access pins the actual review/source/repository binding and
 
 Direct `manage` mutations and legacy manual draft Save have no review-profile proof and cannot publish after binding. List/get and checked historical recovery remain available. A supported matching-profile path is `MemoryBatchSession(repository:drafts:review:...)` with the actual verified controller, fresh per-item authorization, and `save()`. It supports requested additions, updates, deletions, and confirm-reviewed changes through the existing batch types. The private management operations below expose that matching-profile path; legacy `manage` mutation remains fenced.
 
+## Isolated foreground review
+
+Start Pi with `--memory-queue-review-config /absolute/path/config.json` to select a separate configuration for foreground memory review. This host-owned flag is not a model-facing tool parameter. [The runtime](../Integration/Pi/queued-runtime.ts) captures it at the first session start and keeps that selection across session changes.
+
+An explicit profile keeps interactive review available but does not join background membership or schedule intake. Invalid explicit values fail closed; a rejected profile never falls back to the default configuration. Without the flag, the existing foreground and background paths stay unchanged.
+
+The approved-memory loader has a separate `PI_CORE_MEMORIES_REPO` selection. For an isolated review process, point that variable at the same fixture repository. The review flag alone does not redirect that loader or change saved settings.
+
 ## Transport and ownership
 
 All frames are newline-delimited UTF-8 JSON objects. Input frames must be shorter than 65,536 bytes including their newline. Output frames are at most 8 MiB before their newline. The parser rejects duplicate keys, unknown fields, wrong versions, invalid UTF-8, foreign invocations, and malformed frames. Each frame has numeric `version:1`, `type`, and `invocationID`. Boolean `true` is not a version number.

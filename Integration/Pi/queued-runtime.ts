@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { askMemoryDecision } from "./conversation.ts";
@@ -83,6 +83,9 @@ type RuntimeDependencies = {
 };
 export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<RuntimeDependencies> = {}): () => Promise<void> {
 	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, membership: joinInteractiveMembership, membershipDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
+	const reviewConfigFlag = "memory-queue-review-config";
+	pi.registerFlag(reviewConfigFlag, { type: "string", description: "Review one memory configuration without background intake." });
+	let reviewConfig: string | null | Error | undefined;
 	let context: ExtensionContext | undefined;
 	let membership: InteractiveMembership | undefined;
 	let background: AbortController | undefined;
@@ -144,10 +147,15 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		await backgroundCompletion;
 	}
 	pi.on("session_start", async (_event, ctx) => {
+		if (reviewConfig === undefined) {
+			const value = pi.getFlag(reviewConfigFlag);
+			reviewConfig = value === undefined ? null : typeof value === "string" && isAbsolute(value) ? value : new Error(`--${reviewConfigFlag} requires an absolute configuration filename.`);
+		}
 		invalidate(); const epoch = generation; await leaveMembership();
 		if (generation !== epoch) return;
 		context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; isWorking = !ctx.isIdle(); failures = 0;
-		if (!isAlive) return;
+		if (reviewConfig instanceof Error) throw reviewConfig;
+		if (!isAlive || reviewConfig !== null) return;
 		try {
 			const joined = await deps.membership(deps.membershipDirectory, { sessionID: ctx.sessionManager.getSessionId(), isForeground: isWorking }, () => { stopBackground(); schedule(); });
 			if (generation !== epoch || !isAlive) { await joined.close(); return; }
@@ -181,7 +189,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			decisionID: Type.Optional(Type.String({ pattern: "^[A-Za-z0-9._:-]{1,256}$" })),
 		}, { additionalProperties: false }),
 		async execute(_id, params, signal, _update, ctx) {
-			if (ctx.mode !== "tui" || !ctx.hasUI || !isAlive || foreground) throw new Error("Memory queue needs one live interactive session.");
+			const config = reviewConfig;
+			if (config instanceof Error) throw config;
+			if (config === undefined || ctx.mode !== "tui" || !ctx.hasUI || !isAlive || foreground) throw new Error("Memory queue needs one live interactive session.");
 			const identity = memoryRequestIdentity(ctx);
 			const current = new AbortController(); foreground = current; updateMembership();
 			const combined = AbortSignal.any(signal ? [signal, current.signal] : [current.signal]);
@@ -195,7 +205,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				await backgroundCompletion;
 				combined.throwIfAborted();
 				if (!isCurrent()) throw new Error("Memory request changed before ownership was acquired.");
-				const client = await deps.open(ctx.cwd, combined);
+				const client = config === null ? await deps.open(ctx.cwd, combined) : await deps.open(ctx.cwd, combined, config);
 				try {
 					if (params.operation === "review" || params.operation === "manage" || params.operation === "confirm-reviewed") {
 						if (params.operation === "review" && !params.revision) throw new Error("Select an exact pending revision first.");

@@ -279,10 +279,8 @@ import Testing
   model.editorText = fact("Failed autosave keeps this text.")
   model.editorReason = "Retain this reason"
   model.editorChanged()
-  let deadline = ContinuousClock.now + .seconds(5)
-  while model.draftFailure == nil && ContinuousClock.now < deadline {
-    try await Task.sleep(for: .milliseconds(5))
-  }
+  let autosave = try #require(model.autosaveTask)
+  await autosave.value
   #expect(model.draftFailure != nil)
   #expect(model.failure == nil)
   #expect(model.isDraftDirty)

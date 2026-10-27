@@ -233,7 +233,13 @@ func executeMemoryReviewWorker(
     let state = try url(roots, "state")
     guard FileManager.default.fileExists(atPath: state.appendingPathComponent("root.json").path)
     else {
-      try emit("final", ["status": "blocked", "reason": "Run /dream first."])
+      try emit(
+        "final",
+        [
+          "status": "blocked",
+          "reason":
+            "No saved dream run is available. Pending work stays queued for background dreaming.",
+        ])
       return 0
     }
     let input = ReviewInput(invocation: invocation)

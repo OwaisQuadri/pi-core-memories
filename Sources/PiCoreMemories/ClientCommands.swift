@@ -1,5 +1,4 @@
 import CoreMemories
-import Darwin
 import Foundation
 
 func executeClientCommand(_ arguments: [String]) throws -> Int32 {
@@ -35,7 +34,12 @@ func executeClientCommand(_ arguments: [String]) throws -> Int32 {
     case "relocate-prompts-preview": allowed = ["--config", "--baseline-run", "--to"]
     case "relocate-prompts-confirm":
       allowed = ["--config", "--baseline-run", "--to", "--preview", "--confirm"]
-    default: allowed = ["--config", "--state"]
+    case "inspect": allowed = ["--config", "--state"]
+    default:
+      throw UsageError(
+        description:
+          "manual dream operations are unavailable; use ordinary chat and background dreaming. Expected dream inspect, relocate-prompts-preview, or relocate-prompts-confirm"
+      )
     }
   case "draft": allowed = ["--config", "--repo", "--journal", "--id", "--revision", "--key"]
   case "scope", "setup-device": allowed = ["--config"]
@@ -130,33 +134,6 @@ func executeClientCommand(_ arguments: [String]) throws -> Int32 {
           stateRoot: options["--state"].map { URL(fileURLWithPath: $0) } ?? config.stateURL))
       return 0
     }
-    guard let action = DreamControlOperation(rawValue: operation), options["--state"] == nil else {
-      throw UsageError(
-        description:
-          "expected dream inspect, start, all, retry, or replace; Ctrl+C cancels only this invocation"
-      )
-    }
-    let control = DreamControl()
-    signal(SIGINT, SIG_IGN)
-    signal(SIGTERM, SIG_IGN)
-    let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-    let terminate = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
-    interrupt.setEventHandler { control.cancel() }
-    terminate.setEventHandler { control.cancel() }
-    interrupt.resume()
-    terminate.resume()
-    defer {
-      interrupt.cancel()
-      terminate.cancel()
-    }
-    try control.run(
-      operation: action, settings: config.settings, roots: config.roots,
-      diagnostics: URL(fileURLWithPath: config.diagnostics), deviceKey: config.deviceKey,
-      projectBindings: config.projectBindings,
-      onEvent: { bytes in
-        try? FileHandle.standardOutput.write(contentsOf: bytes + Data([10]))
-      })
-    return 0
   }
   let store = try MemoryDraftStore(
     repository: options["--repo"].map { URL(fileURLWithPath: $0) } ?? config.memoryURL,

@@ -34,23 +34,16 @@ import Foundation
   @Published var failure: String?
   @Published var draftFailure: String?
   @Published var isBusy = true
-  @Published var isDreamRunning = false
   @Published var dreamPhase = "Idle"
   @Published var dreamDetail = ""
   @Published var queueSnapshot: DreamQueueSnapshot?
   @Published var isQueueLoading = false
   @Published var isReviewLoading = false
   @Published var reviewFailure: String?
-  @Published var eventCoverage: DreamQueueCoverage?
-  @Published var coverageObservedAt: Date?
   @Published var invocationStatus: DreamInvocationStatus?
-  @Published var resolvedSelection = "Not resolved"
-  @Published var dreamEvents: [String] = []
   @Published var artifactText = ""
   @Published var selectedArtifact: DreamArtifact?
   @Published var checkout: MemoryReviewCheckoutPreview?
-  @Published var isConfirmingReplacement = false
-  @Published var isConfirmingRetry = false
   @Published var isConfirmingDiscard = false
   var stagedInputRevision: UInt64 = 0
   var persistedBatchRevision: UInt64?
@@ -65,10 +58,6 @@ import Foundation
   private var queueTask: Task<Void, Never>?
   private var queueRevision: UInt64 = 0
   private(set) var queueScanCount = 0
-  private var terminalPhase: String?
-  private var isCancellingDream = false
-  private var dreamTask: Task<Void, Never>?
-  private var control: DreamControl?
   let workspace: Workspace
   let configURL: URL
   let autosaveDelay: Duration
@@ -94,7 +83,7 @@ import Foundation
   }
 
   func refresh() async {
-    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    guard isLoaded, !isBusy, !isSaveUnresolved else { return }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -150,7 +139,7 @@ import Foundation
   }
 
   func prepareSavedRecovery() async {
-    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved,
+    guard isLoaded, !isBusy, !isSaveUnresolved,
       let runID = savedRecoveryRunID, let base = catalog?.base
     else { return }
     isBusy = true
@@ -174,7 +163,7 @@ import Foundation
   }
 
   func confirmSavedRecovery() async {
-    guard isLoaded, !isBusy, !isDreamRunning, savedRecovery != nil,
+    guard isLoaded, !isBusy, savedRecovery != nil,
       let base = catalog?.base
     else { return }
     isBusy = true
@@ -223,18 +212,16 @@ import Foundation
     catalog = snapshot.catalog
     inspection = snapshot.inspection
     dreamInspectionFailure = snapshot.dreamInspectionFailure
-    if !isDreamRunning {
-      if let unavailable = snapshot.invocationStatusFailure {
-        invocationStatus = nil
-        dreamPhase = "Status unavailable"
-        dreamDetail = unavailable
-      } else if let status = snapshot.invocationStatus {
-        applyStatus(status)
-      } else if invocationStatus != nil || dreamPhase == "Status unavailable" {
-        invocationStatus = nil
-        dreamPhase = "Idle"
-        dreamDetail = ""
-      }
+    if let unavailable = snapshot.invocationStatusFailure {
+      invocationStatus = nil
+      dreamPhase = "Status unavailable"
+      dreamDetail = unavailable
+    } else if let status = snapshot.invocationStatus {
+      applyStatus(status)
+    } else {
+      invocationStatus = nil
+      dreamPhase = "Idle"
+      dreamDetail = ""
     }
     drafts = snapshot.drafts
     draftRecoveries = snapshot.draftRecoveries
@@ -250,7 +237,7 @@ import Foundation
   }
 
   func prepareCheckout() async {
-    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    guard isLoaded, !isBusy, !isSaveUnresolved else { return }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -261,7 +248,7 @@ import Foundation
   }
 
   func detach() async {
-    guard isLoaded, !isBusy, !isDreamRunning, let checkout, !isSaveUnresolved else { return }
+    guard isLoaded, !isBusy, let checkout, !isSaveUnresolved else { return }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -281,23 +268,9 @@ import Foundation
     } catch { failure = String(describing: error) }
   }
 
-  var queueCoverage: DreamQueueCoverage? {
-    if let eventCoverage, eventCoverage.segments != nil,
-      coverageObservedAt.map({ $0 > (queueSnapshot?.observedAt ?? .distantPast) }) == true
-    {
-      return eventCoverage
-    }
-    return queueSnapshot?.coverage ?? eventCoverage
-  }
+  var queueCoverage: DreamQueueCoverage? { queueSnapshot?.coverage }
 
-  var queueObservedAt: Date? {
-    if let eventCoverage, eventCoverage.segments != nil,
-      coverageObservedAt.map({ $0 > (queueSnapshot?.observedAt ?? .distantPast) }) == true
-    {
-      return coverageObservedAt
-    }
-    return queueSnapshot?.coverage == nil ? coverageObservedAt : queueSnapshot?.observedAt
-  }
+  var queueObservedAt: Date? { queueSnapshot?.observedAt }
 
   func inspect(_ artifact: DreamArtifact) async {
     selectedArtifact = artifact
@@ -322,108 +295,15 @@ import Foundation
     } catch { failure = String(describing: error) }
   }
 
-  @discardableResult
-  func run(_ operation: DreamControlOperation) -> Task<Void, Never>? {
-    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return nil }
-    savedRecovery = nil
-    isDreamRunning = true
-    dreamPhase = "Starting"
-    dreamDetail = ""
-    invocationStatus = nil
-    eventCoverage = nil
-    coverageObservedAt = nil
-    terminalPhase = nil
-    isCancellingDream = false
-    dreamEvents = []
-    resolvedSelection = "Not resolved"
-    let control = DreamControl()
-    self.control = control
-    let config = configuration
-    dreamTask = Task {
-      await workspace.cancelSavedRecovery()
-      await pauseQueue()
-      let events = AsyncStream<Data>.makeStream()
-      let consumer = Task { for await bytes in events.stream { receive(bytes) } }
-      do {
-        try await flushInputAndPersistence()
-        try await Task.detached {
-          defer { events.continuation.finish() }
-          try control.run(
-            operation: operation, settings: config.settings, roots: config.roots,
-            diagnostics: URL(fileURLWithPath: config.diagnostics), deviceKey: config.deviceKey,
-            projectBindings: config.projectBindings, onEvent: { events.continuation.yield($0) })
-        }.value
-        await consumer.value
-        dreamPhase = terminalPhase ?? "Invocation ended; completion not established"
-      } catch {
-        events.continuation.finish()
-        await consumer.value
-        dreamPhase = isCancellingDream ? "Cancelled" : "Stopped"
-        if !isCancellingDream { failure = String(describing: error) }
-      }
-      isDreamRunning = false
-      self.control = nil
-      await refresh()
-    }
-    return dreamTask
-  }
-
-  func receive(_ bytes: Data) {
-    guard let event = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any] else {
-      return
-    }
-    if let selection = event["selection"] as? [String: Any] {
-      resolvedSelection = [selection["provider"], selection["modelID"], selection["thinkingLevel"]]
-        .map { $0 as? String ?? "unknown" }.joined(separator: " / ")
-    }
-    if let phase = event["phase"] as? String {
-      switch phase {
-      case "modelCall": dreamPhase = "Model working"
-      case "planning": dreamPhase = "Preparing batch"
-      case "saving": dreamPhase = "Saving inference"
-      default: dreamPhase = phase
-      }
-    }
-    if event["event"] as? String == "progress", let coverage = event["coverage"] as? [String: Any] {
-      do {
-        eventCoverage = try DreamQueueCoverage(json: coverage)
-        coverageObservedAt = Date()
-      } catch {
-        eventCoverage = nil
-        dreamDetail = "Invalid queue progress received; showing the last read-only snapshot."
-      }
-    }
-    if event["event"] as? String == "report", let report = event["report"] as? [String: Any],
-      let status = report["status"] as? String
-    {
-      if let saved = DreamInvocationStatus(report: report) { applyStatus(saved) }
-      terminalPhase =
-        isCancellingDream && report["reason"] as? String == "callInterrupted"
-        ? "Cancelled" : invocationStatus?.title ?? status.capitalized
-    }
-    let formatted =
-      (try? JSONSerialization.data(withJSONObject: event, options: [.sortedKeys, .prettyPrinted]))
-      ?? bytes
-    dreamEvents.append(String(decoding: formatted, as: UTF8.self))
-    if dreamEvents.count > 200 { dreamEvents.removeFirst() }
-  }
-
   private func applyStatus(_ status: DreamInvocationStatus) {
     invocationStatus = status
     dreamPhase = status.title
     dreamDetail = status.explanation
   }
 
-  func cancelDream() {
-    guard isDreamRunning, terminalPhase == nil else { return }
-    isCancellingDream = true
-    dreamPhase = "Cancelling"
-    control?.cancel()
-  }
-
   func saveSettings(isSettingUpDevice: Bool = false) async {
     do {
-      guard isLoaded, !isBusy, !isDreamRunning, !isInputDirty, stagedItems.isEmpty,
+      guard isLoaded, !isBusy, !isInputDirty, stagedItems.isEmpty,
         !isSaveUnresolved
       else {
         throw WorkspaceError("Save or discard local edits before changing configuration")
@@ -445,8 +325,6 @@ import Foundation
       queueSnapshot = nil
       presentation = nil
       invocationStatus = nil
-      eventCoverage = nil
-      coverageObservedAt = nil
       dreamPhase = "Idle"
       dreamDetail = ""
       postSaveCandidates = []
@@ -471,8 +349,6 @@ import Foundation
       guard !isSaveUnresolved else {
         throw WorkspaceError("Resolve the Save outcome before quitting")
       }
-      control?.cancel()
-      await dreamTask?.value
       queueTask?.cancel()
       await queueTask?.value
       retainedDraft = await workspace.closeBatch()

@@ -45,7 +45,6 @@ import SwiftUI
           await model.load()
         }
         .onDisappear {
-          model.cancelDream()
           Task {
             do { try await model.shutdown() } catch { model.failure = String(describing: error) }
           }
@@ -85,8 +84,6 @@ import SwiftUI
       }
       CommandGroup(after: .toolbar) {
         Button("Refresh") { Task { await model.refresh() } }.keyboardShortcut("r")
-        Button("Cancel Dream") { model.cancelDream() }.keyboardShortcut(".").disabled(
-          !model.isDreamRunning)
       }
     }
     Settings { SettingsView(model: model).padding(24).frame(width: 650) }
@@ -100,7 +97,7 @@ struct WorkspaceView: View {
 
   private func sectionTitle(_ section: String) -> String {
     switch section {
-    case "Dreams": "Find Suggestions"
+    case "Dreams": "Saved Dreams"
     case "Memories": "Memories"
     default: section
     }

@@ -175,7 +175,7 @@ extension AppModel {
     !draftRecoveries.isEmpty && batchProjection == nil
   }
   var isIndependentManualEnabled: Bool {
-    isLoaded && !isBusy && !isDreamRunning && !isSaveUnresolved
+    isLoaded && !isBusy && !isSaveUnresolved
       && !isInputDirty && stagedItems.isEmpty
       && !(drafts.contains { $0.batch?.isManualOnly == false })
   }
@@ -187,19 +187,19 @@ extension AppModel {
       && !drafts.contains { $0.draftID != value.draftID && $0.batch?.isManualOnly == false }
   }
   var isSaveEnabled: Bool {
-    isLoaded && batchProjection != nil && !isBusy && !isDreamRunning && !isSaveUnresolved
+    isLoaded && batchProjection != nil && !isBusy && !isSaveUnresolved
       && (!stagedItems.isEmpty || isInputDirty)
       && (batchProjection?.needsReview.isEmpty ?? true)
       && !(isAmendingSuggestion && isInputDirty)
       && (draftRecoveries.isEmpty || draft?.batch?.isManualOnly == true)
   }
   var isStageShownEnabled: Bool {
-    isLoaded && !isBusy && !isDreamRunning && !isSubmittingSave && isReviewTransitionEnabled
+    isLoaded && !isBusy && !isSubmittingSave && isReviewTransitionEnabled
       && !isInputDirty && presentation != nil
   }
   var isStageAcceptanceEnabled: Bool { isStageShownEnabled && selectedCandidate != nil }
   func isDecisionEnabled(for candidate: MemoryReviewCandidate) -> Bool {
-    isLoaded && !isBusy && !isDreamRunning && !isSubmittingSave && isReviewTransitionEnabled
+    isLoaded && !isBusy && !isSubmittingSave && isReviewTransitionEnabled
       && !isInputDirty && !isAmendingSuggestion
       && [.pending, .deferred].contains(candidate.disposition)
   }
@@ -252,7 +252,7 @@ extension AppModel {
   }
 
   func loadCandidates() async {
-    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    guard isLoaded, !isBusy, !isSaveUnresolved else { return }
     if isWaitingForIndependentManualWork || isRetainingConsumedInput {
       isWorkspaceLoaded = false
       reviewFailure = await workspace.reviewPreparationFailure
@@ -280,7 +280,7 @@ extension AppModel {
   }
 
   func add(path: String = "MEMORY.md") async {
-    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    guard isLoaded, !isBusy, !isSaveUnresolved else { return }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -300,7 +300,7 @@ extension AppModel {
   }
 
   func addProject(isDeviceSpecific: Bool) async {
-    guard isLoaded, !isBusy, !isDreamRunning else { return }
+    guard isLoaded, !isBusy else { return }
     let panel = NSOpenPanel()
     panel.canChooseFiles = false
     panel.canChooseDirectories = true
@@ -337,7 +337,7 @@ extension AppModel {
     {
       value = .staged(existing.itemID)
     }
-    guard !isBusy, !isDreamRunning, !isSaveUnresolved, value != selection else { return }
+    guard !isBusy, !isSaveUnresolved, value != selection else { return }
     isBusy = true
     defer { isBusy = false }
     do {
@@ -578,7 +578,7 @@ extension AppModel {
   }
 
   func stageEditor() async {
-    guard !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    guard !isBusy, !isSaveUnresolved else { return }
     isBusy = true
     defer { isBusy = false }
     do { try await flushInputAndPersistence() } catch { failure = String(describing: error) }
@@ -877,7 +877,7 @@ extension AppModel {
   }
 
   func startIndependentManualBatch() async {
-    guard isLoaded, !isBusy, !isDreamRunning, !isSaveUnresolved else { return }
+    guard isLoaded, !isBusy, !isSaveUnresolved else { return }
     isConfirmingIndependentManual = false
     isBusy = true
     defer { isBusy = false }

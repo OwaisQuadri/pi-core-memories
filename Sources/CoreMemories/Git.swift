@@ -478,7 +478,7 @@ final class ReviewCheckoutDirectory {
         var status = stat()
         guard fstatat(descriptor, name, &status, AT_SYMLINK_NOFOLLOW) != 0, errno == ENOENT else {
           throw MemoryError(
-            "checkout has an existing \(name); do not remove unknown locks automatically. For a legacy native review lease, reopen /mem-review with its original explicit configuration."
+            "checkout has an existing \(name); do not remove unknown locks automatically. Retain the original review configuration for saved-review recovery."
           )
         }
       }

@@ -9,19 +9,6 @@ struct SettingsView: View {
 
   var body: some View {
     Form {
-      Section("Pi Harness") {
-        TextField("Executable", text: $model.configuration.settings.piExecutable)
-        TextField("Agent directory", text: $model.configuration.settings.agentDirectory)
-        TextField("Provider (Pi default when empty)", text: optional(\.provider))
-        TextField("Model (Pi default when empty)", text: optional(\.modelID))
-        Picker("Thinking", selection: optional(\.thinkingLevel)) {
-          Text("Pi default").tag("")
-          ForEach(["off", "minimal", "low", "medium", "high", "xhigh", "max"], id: \.self) {
-            Text($0).tag($0)
-          }
-        }
-        TextField("Control extension (bundled when empty)", text: optional(\.controlExtension))
-      }
       Section("Local Scope") {
         LabeledContent("Device", value: model.configuration.deviceKey ?? "Not configured")
           .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
@@ -59,6 +46,7 @@ struct SettingsView: View {
         }
       }
       Section("Storage") {
+        TextField("Agent directory", text: $model.configuration.settings.agentDirectory)
         TextField(
           "Memory repository", text: root(\.memory, fallback: model.configuration.memoryURL.path))
         TextField("Dream state", text: root(\.state, fallback: model.configuration.stateURL.path))
@@ -73,18 +61,9 @@ struct SettingsView: View {
       HStack {
         Text(model.configURL.path).font(.caption).textSelection(.enabled)
         Spacer()
-        Button("Save Settings") { Task { await model.saveSettings() } }.disabled(
-          model.isDreamRunning)
+        Button("Save Settings") { Task { await model.saveSettings() } }
       }
     }.formStyle(.grouped)
-  }
-
-  private func optional(_ keyPath: WritableKeyPath<MemoryAppSettings, String?>) -> Binding<String> {
-    Binding(
-      get: { model.configuration.settings[keyPath: keyPath] ?? "" },
-      set: {
-        model.configuration.settings[keyPath: keyPath] = $0.isEmpty ? nil : $0
-      })
   }
 
   private func root(_ keyPath: WritableKeyPath<DreamControlRoots, String>, fallback: String)

@@ -11,20 +11,29 @@ private func nativeReportEvent(_ report: [String: Any]) throws -> Data {
 
 @Test(arguments: ["callbackFailure", "workerFailure", "protocolFailure", "invalidDecision"])
 @MainActor
-func nativeStatusKeepsTechnicalDetailsOutOfThePrimaryExplanation(_ reason: String) throws {
-  let model = AppModel(configURL: URL(fileURLWithPath: "/unused-synthetic-profile"))
+func nativeStatusKeepsTechnicalDetailsOutOfThePrimaryExplanation(_ reason: String) async throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let (_, pending) = try savedRecoveryPendingAddition(fixture)
+  let configuration = queueConfiguration(fixture)
   let detail = "Synthetic provider error: quota exceeded"
-  try model.receive(
-    nativeReportEvent([
-      "status": "pending", "reason": reason, "detail": detail,
-    ]))
+  _ = try savedNativeReport(
+    configuration: configuration, runID: pending.runID, reason: reason, detail: detail)
+  let url = fixture.root.appendingPathComponent("profile/config.json")
+  try configuration.save(to: url)
+  let before = try fixture.snapshot(fixture.root)
+  let model = AppModel(configURL: url)
+  await model.load()
   #expect(!model.dreamDetail.isEmpty)
   #expect(!model.dreamDetail.contains(detail))
   #expect(model.invocationStatus?.detail == detail)
+  #expect(try fixture.snapshot(fixture.root) == before)
+  try await model.shutdown()
 }
 
 private func savedNativeReport(
-  configuration: MemoryConfiguration, runID: String
+  configuration: MemoryConfiguration, runID: String,
+  reason: String = "staleUnpublishedPlans", detail: String = ""
 ) throws -> URL {
   let root = try DreamStateDirectory.openRoot(URL(fileURLWithPath: configuration.diagnostics))
   let name = UUID().uuidString
@@ -41,7 +50,7 @@ private func savedNativeReport(
     ]), name: "request.json")
   try invocation.installReviewFile(
     nativeReportEvent([
-      "status": "pending", "reason": "staleUnpublishedPlans", "runID": runID,
+      "status": "pending", "reason": reason, "runID": runID, "detail": detail,
     ]), name: "event-1.json")
   return URL(fileURLWithPath: configuration.diagnostics).appendingPathComponent(name)
 }
@@ -81,21 +90,6 @@ private func savedNativeReport(
     try await Task.sleep(for: .milliseconds(10))
   }
   #expect(model.queueCoverage?.segments?.undreamt == 28)
-  let event = try JSONSerialization.data(withJSONObject: [
-    "event": "progress",
-    "coverage": [
-      "backlogBytes": NSNull(), "backlogLimitBytes": NSNull(), "undreamtBytes": NSNull(),
-      "nextBytes": NSNull(), "plannedBytes": 28, "completedBytes": 0,
-      "repeatedRecords": 0, "estimateSeconds": NSNull(),
-    ],
-  ])
-  model.receive(event)
-  model.receive(
-    try nativeReportEvent([
-      "status": "pending", "reason": "staleUnpublishedPlans", "runID": pending.runID,
-    ]))
-  #expect(model.eventCoverage?.completedBytes == 0)
-  #expect(model.queueCoverage?.segments?.undreamt == 28)
   #expect(try fixture.snapshot(fixture.root) == before)
   var otherProfile = configuration
   otherProfile.settings.agentDirectory = fixture.root.appendingPathComponent("another-agent").path
@@ -106,12 +100,6 @@ private func savedNativeReport(
   let recoveryStore = try fixture.store()
   _ = try transactionCompleted(
     recoveryStore.confirmSavedRecovery(recoveryStore.previewSavedRecovery(runID: pending.runID)))
-  model.isDreamRunning = true
-  model.receive(try JSONSerialization.data(withJSONObject: ["phase": "modelCall"]))
-  await model.refresh()
-  #expect(model.dreamPhase == "Model working")
-  #expect(model.invocationStatus?.isPublicationBlocked == true)
-  model.isDreamRunning = false
   await model.refresh()
   #expect(model.inspection?.runs.first?.isCompleted == true)
   #expect(model.invocationStatus == nil)
@@ -206,8 +194,7 @@ func nativeStatusReadFailureIsUnavailableRatherThanRetainingTheOldReport() async
 }
 
 @Test @MainActor
-func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPreview() async throws
-{
+func nativeSavedRefreshReloadsAuthoritativeSuggestionsAndClearsPreview() async throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   try fixture.populate()
@@ -215,25 +202,7 @@ func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPre
     fixture.store().run(
       selection: fixture.selection, prepare: { try fixture.prepare($0) },
       call: { try transactionAdd($0) }))
-  var configuration = queueConfiguration(fixture)
-  let control = fixture.root.appendingPathComponent("control.ts")
-  try fixture.write("export {}", file: control)
-  let pi = fixture.root.appendingPathComponent("fake-pi")
-  try fixture.write(
-    """
-    #!/bin/zsh
-    IFS= read -r line
-    printf '%s\\n' '{"type":"response","id":"commands","success":true,"data":{"commands":[{"name":"memory-dream-control"},{"name":"memory-dream-cancel"}]}}'
-    IFS= read -r line
-    printf '%s\\n' '{"type":"response","id":"state","success":true,"data":{"model":{"provider":"fixture","id":"selected"},"thinkingLevel":"off"}}'
-    IFS= read -r line
-    printf '%s\\n' '{"type":"extension_ui_request","method":"notify","message":"{\\"version\\":1,\\"type\\":\\"core-memory-control\\",\\"event\\":\\"report\\",\\"report\\":{\\"status\\":\\"completed\\"}}"}'
-    printf '%s\\n' '{"type":"response","id":"dream","success":true}'
-    while IFS= read -r line; do :; done
-    """, file: pi)
-  #expect(chmod(pi.path, 0o700) == 0)
-  configuration.settings = MemoryAppSettings(
-    piExecutable: pi.path, agentDirectory: fixture.root.path, controlExtension: control.path)
+  let configuration = queueConfiguration(fixture)
   let url = fixture.root.appendingPathComponent("profile/config.json")
   try configuration.save(to: url)
   let model = AppModel(configURL: url)
@@ -248,9 +217,7 @@ func nativeRefreshAndTerminalInvocationReloadAuthoritativeSuggestionsAndClearPre
     fixture.store().run(
       selection: fixture.selection, prepare: { try fixture.prepare($0) },
       call: { try transactionAdd($0) }))
-  let invocation = try #require(model.run(.start))
-  await invocation.value
-  #expect(!model.isDreamRunning)
+  await model.refresh()
   try #require(!model.isBusy)
   #expect(model.failure == nil)
   #expect(model.actionableCandidates.count == 2)

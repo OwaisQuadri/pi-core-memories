@@ -2,16 +2,17 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { setImmediate, setTimeout as sleep } from "node:timers/promises";
 import { test } from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DreamReport, DreamRequest, runDreamWorker } from "./dream.ts";
-import type { QueueConnection, QueueObject } from "./queue-client.ts";
+import type { openQueueClient, QueueConnection, QueueObject } from "./queue-client.ts";
 import "./test/host.ts";
 const { memoryRequestIdentity, reviewQueuedMemory, registerQueuedRuntime, assertArchivedRequest } = await import("./queued-runtime.ts");
 const sha = (value: string): string => createHash("sha256").update(value).digest("hex");
 function context() {
 	const entries = [{ type: "message", id: "user-entry", message: { role: "user" } }];
 	const ctx = { mode: "tui", hasUI: true, cwd: "/synthetic", model: { provider: "openai-codex", id: "selected", contextWindow: 262_144 }, thinkingLevel: "high", isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionId: () => "session", getBranch: () => entries } } as unknown as ExtensionContext;
-	return { ctx, entries };
+	const toolContext: ExtensionToolContext = { ...ctx, tools: [], executeTool: async () => { assert.fail("Unexpected nested fixture tool call."); } };
+	return { ctx: toolContext, entries };
 }
 function frame(identity: { sessionID: string; requestID: string }, isDetachRequired = false) {
 	const payload = { claimID: "private", sequence: "1", request: identity, finding: { revision: "a".repeat(64), candidateID: "b".repeat(64), proposed: Buffer.from("  exact finding\n").toString("base64"), reason: "exact reason" }, before: "", after: Buffer.from("  exact finding\n").toString("base64"), replacement: Buffer.from("# Memory\n\n  exact finding\n").toString("base64"), previewDigest: "c".repeat(64), currentBase: "d".repeat(40), isDetachRequired };
@@ -112,13 +113,27 @@ test("active transcript evidence fails closed before archived model dispatch", (
 	assert.doesNotThrow(() => assertArchivedRequest(request, "another-session"));
 });
 
-function runtime(run: typeof runDreamWorker, mode = "tui") {
+function runtime(run: typeof runDreamWorker, mode = "tui", openFailure?: Error) {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
-	const pi = { ...bus(), on: (name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => { handlers.set(name, handler); }, registerTool: () => {}, getThinkingLevel: () => "high" } as unknown as ExtensionAPI;
+	const flags = new Map<string, boolean | string>();
+	const flagRegistrations = new Map<string, unknown>();
+	const flagReads: string[] = [];
+	const opened: Parameters<typeof openQueueClient>[] = [];
+	const memberships: string[] = [];
+	const closed: string[] = [];
+	let registeredTool: ToolDefinition | undefined;
+	const pi = { ...bus(), on: (name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => { handlers.set(name, handler); },
+		registerFlag: (name: string, options: unknown) => { flagRegistrations.set(name, options); },
+		getFlag: (name: string) => { flagReads.push(name); return flags.get(name); },
+		registerTool: (tool: ToolDefinition) => { registeredTool = tool; }, getThinkingLevel: () => "high" } as unknown as ExtensionAPI;
 	const { ctx } = context(); (ctx as { mode: string }).mode = mode;
 	let changed = () => {}; let isPeerForeground = false;
-	const stop = registerQueuedRuntime(pi, { run, idleMilliseconds: 5, membership: async (_directory, _initial, onChanged) => { changed = onChanged; return { set: () => {}, snapshot: async () => ({ sessionIDs: ["session", "another-live-session"].sort(), isForeground: isPeerForeground }), close: async () => {} }; }, roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}) });
-	return { ctx, stop, peerForeground: () => { isPeerForeground = true; changed(); }, emit: async (name: string) => handlers.get(name)?.({}, ctx) };
+	const stop = registerQueuedRuntime(pi, { run, idleMilliseconds: 5,
+		open: async (...args) => { opened.push(args); if (openFailure) throw openFailure; return { request: async () => ({ type: "queue", rows: [], nextOffset: null }), close: async () => { closed.push("closed"); } }; },
+		membership: async (directory, _initial, onChanged) => { memberships.push(directory); changed = onChanged; return { set: () => {}, snapshot: async () => ({ sessionIDs: ["session", "another-live-session"].sort(), isForeground: isPeerForeground }), close: async () => {} }; }, roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}) });
+	return { ctx, stop, flags, flagRegistrations, flagReads, opened, memberships, closed,
+		get tool() { assert.ok(registeredTool); return registeredTool; },
+		peerForeground: () => { isPeerForeground = true; changed(); }, emit: async (name: string) => handlers.get(name)?.({}, ctx) };
 }
 
 test("foreground work cancels idle background and shutdown stops rescheduling", async () => {
@@ -166,4 +181,60 @@ test("helper death cancels an unanswered question and releases the native claim"
 	await setImmediate(); lifetime.abort();
 	assert.equal((await pending).status, "cancelled");
 	assert.deepEqual(calls, ["claim", "presented", "release"]);
+});
+
+test("review profile survives late flag binding and session restart without genuine background work", async () => {
+	let runs = 0;
+	const f = runtime(async () => { runs++; return { status: "pending" } as DreamReport; });
+	try {
+		assert.deepEqual(f.flagReads, []);
+		f.flags.set("memory-queue-review-config", "/synthetic/review-config.json");
+		await f.emit("session_start");
+		await f.tool.execute("first", { operation: "pending" }, undefined, undefined, f.ctx);
+		assert.equal(f.opened[0]?.[2], "/synthetic/review-config.json");
+		assert.deepEqual(f.flagRegistrations.get("memory-queue-review-config"), { type: "string", description: "Review one memory configuration without background intake." });
+		f.flags.set("memory-queue-review-config", "/synthetic/changed-config.json");
+		await f.emit("session_start");
+		await f.tool.execute("second", { operation: "pending" }, undefined, undefined, f.ctx);
+		assert.deepEqual(f.opened.map((args) => args[2]), ["/synthetic/review-config.json", "/synthetic/review-config.json"]);
+		assert.equal(f.flagReads.length, 1);
+		for (const event of ["agent_end", "model_select", "thinking_level_select", "session_tree", "session_compact", "session_compact_failed"]) await f.emit(event);
+		await sleep(20);
+		assert.equal(f.memberships.length, 0); assert.equal(runs, 0); assert.equal(f.closed.length, 2);
+	} finally { await f.stop(); }
+});
+
+test("invalid explicit review profiles cannot open default data or join background membership", async () => {
+	for (const value of ["", "relative.json", true]) {
+		let runs = 0;
+		const f = runtime(async () => { runs++; return { status: "pending" } as DreamReport; });
+		try {
+			f.flags.set("memory-queue-review-config", value);
+			await assert.rejects(f.emit("session_start"), /absolute configuration filename/);
+			await assert.rejects(f.tool.execute("invalid", { operation: "pending" }, undefined, undefined, f.ctx), /absolute configuration filename/);
+			await f.emit("agent_end"); await sleep(20);
+			assert.equal(f.opened.length, 0); assert.equal(f.memberships.length, 0); assert.equal(runs, 0);
+		} finally { await f.stop(); }
+	}
+});
+
+test("an explicit review profile refusal never retries with default data", async () => {
+	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", new Error("Fixture review profile unavailable."));
+	try {
+		f.flags.set("memory-queue-review-config", "/synthetic/missing-config.json");
+		await f.emit("session_start");
+		await assert.rejects(f.tool.execute("refused", { operation: "pending" }, undefined, undefined, f.ctx), /Fixture review profile unavailable/);
+		assert.equal(f.opened.length, 1); assert.equal(f.opened[0]?.[2], "/synthetic/missing-config.json");
+		assert.equal(f.closed.length, 0); assert.equal(f.memberships.length, 0);
+	} finally { await f.stop(); }
+});
+
+test("absent review profile keeps default foreground opening and interactive membership", async () => {
+	const f = runtime(async () => ({ status: "pending" }) as DreamReport);
+	try {
+		await f.emit("session_start");
+		await f.tool.execute("default", { operation: "pending" }, undefined, undefined, f.ctx);
+		assert.equal(f.opened.length, 1); assert.equal(f.opened[0]?.length, 2);
+		assert.equal(f.memberships.length, 1); assert.equal(f.closed.length, 1);
+	} finally { await f.stop(); }
 });

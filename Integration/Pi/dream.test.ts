@@ -259,7 +259,7 @@ test("factory registers only, command rejects unknown args and missing selection
 });
 
 test("warm imports and two full factories register under 50 ms without starting work", async (t) => {
-	const pi = { on: () => {}, registerCommand: () => {}, registerEntryRenderer: () => {}, registerTool: () => {} } as unknown as ExtensionAPI;
+	const pi = { on: () => {}, registerFlag: () => {}, registerCommand: () => {}, registerEntryRenderer: () => {}, registerTool: () => {} } as unknown as ExtensionAPI;
 	coreMemories(pi);
 	for (let run = 0; run < 2; run++) {
 		const before = performance.now(); await import("./index.ts"); coreMemories(pi);

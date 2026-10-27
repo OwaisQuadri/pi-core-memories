@@ -1259,10 +1259,17 @@ public final class DreamRunStore {
     if isRecovered {
       try checkProtection(sealed, excludedSessionIDs: excludedSessionIDs, protect: protect)
     }
+    var attempt: ResponseAttempt
+    do {
+      let verified = try attemptReader(sealed).verify()
+      guard verified.replacement?.schemaVersion != 3 || verified.response != nil else {
+        throw DreamRunError.unsupportedSchema
+      }
+      attempt = verified.attempt
+    }
     if isRecovered, cached?.admissionHash != sealed.admissionHash.rawValue {
       try save(generation: sealed.run.progress.generation, hash: chain.hash, sealed: sealed)
     }
-    var attempt = try activeAttempt(sealed)
     var isReplacementStarted = false
     if resume == .replaceInvalidResponse, try sealed.directory.isPresent(attempt.responseName) {
       guard !(try sealed.directory.isPresent("decisions.json")),

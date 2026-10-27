@@ -63,6 +63,8 @@ The original and scope-contract renderings cannot represent tool evidence, conne
 
 Read-only replay also verifies historical feedback retries against the verified request rendering. The baseline call and response use envelope schema 2; a feedback replacement, its call and its response use schema 3. Verification checks the actual prior rejection, exact rejected archive, derived feedback, predecessor call, attempt number, selected call, effective-call hash and response binding. Inspection uses that same attempt verifier and the verified response contract. The current pending-run writer does not create this historical retry format.
 
+Pending historical feedback retries with no saved response remain read-only. The writer refuses them before it changes pending state or calls a model. This guard uses the verified replacement format, not the request rendering.
+
 ## Integration obligations
 
 No CLI flag or archive-supplied scrub assertion is added. The parent must implement the trusted source-protection bridge before setting both preparation flags. Leave default tool exclusion in place until then. No model client, credentials, model selection or worker lifecycle is added here.

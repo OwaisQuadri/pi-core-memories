@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -7,6 +8,8 @@ private let decisionBlue =
   "# Memory\n\nUse blue buttons. [source: pi:one#u1/part/0; added: 2026-01-01]\n"
 private let decisionKey = String(repeating: "a", count: 64)
 private let decisionOtherKey = String(repeating: "b", count: 64)
+private let decisionRootBinding = Data(#"{"schemaVersion":2}"#.utf8)
+private let feedbackRenderings: [DreamRequestRendering] = [.legacyV1, .scopeV2, .connectedV3]
 
 private struct DecisionFixture {
   let store: Fixture
@@ -68,7 +71,7 @@ private struct DecisionFixture {
     let selection = try DreamSelectedCall(
       provider: "synthetic", modelID: "fixture", thinkingLevel: "off")
     let runID = "00000000-0000-4000-8000-000000000001"
-    let binding = SourceDigest(bytes: Data("synthetic".utf8))
+    let binding = SourceDigest(bytes: decisionRootBinding)
     let input = try DreamRunEncoding.input(
       runID: runID, context: DreamRunContext(selection: selection, currentApprovedBase: base),
       bindingHash: binding, progress: DreamProgress(), batch: batch, limits: DreamRunLimits())
@@ -111,6 +114,166 @@ private struct DecisionFixture {
       responseHash: SourceDigest(bytes: Data(("synthetic envelope:" + text).utf8)), isReplay: true,
       isBaseCurrent: false)
   }
+}
+
+
+private enum FeedbackAttemptMutation: CaseIterable, Sendable {
+  case feedback, feedbackRendering, feedbackHash, rejectedCall, archive, attemptNumber
+  case replacementBinding, effectiveHash, responseCall, envelopeVersion, orphanResponse
+}
+
+private func feedbackAttemptFixture(
+  _ fixture: DecisionFixture, rendering: DreamRequestRendering,
+  mutation: FeedbackAttemptMutation? = nil
+) throws -> (reader: DreamAttemptReader, stateRoot: URL) {
+  let context = try fixture.context()
+  let saved = DreamRunEncoding.Request(
+    schemaVersion: rendering == .legacyV1 ? 2 : 3,
+    runID: fixture.run.runID, generation: fixture.run.progress.generation,
+    inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+    systemPrompt: context.systemPrompt(rendering: rendering),
+    messages: try context.requestMessages(timestampMilliseconds: 123, rendering: rendering),
+    renderingVersion: rendering == .legacyV1 ? nil : rendering.rawValue)
+  let requestBytes = try DreamRunEncoding.encode(saved)
+  let request = try saved.verifiedDomain(
+    run: fixture.run, context: context, bytes: requestBytes
+  ).request
+  guard let canonical = realpath(fixture.store.root.path, nil) else {
+    throw MemoryError("fixture root")
+  }
+  defer { free(canonical) }
+  let folder = URL(fileURLWithPath: String(cString: canonical))
+    .appendingPathComponent("scope-contract-attempts")
+  let runFolder = folder.appendingPathComponent("runs").appendingPathComponent(fixture.run.runID)
+  let admissions = folder.appendingPathComponent("admissions")
+  for directory in [runFolder, admissions] {
+    try FileManager.default.createDirectory(
+      at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+  }
+  let directory = try DreamStateDirectory.openRoot(runFolder)
+  let binding = SourceDigest(bytes: decisionRootBinding)
+  let input = try DreamRunEncoding.input(
+    runID: fixture.run.runID,
+    context: DreamRunContext(
+      selection: fixture.run.selection, currentApprovedBase: fixture.run.approvedBase),
+    bindingHash: binding, progress: fixture.run.progress, batch: fixture.run.batch,
+    limits: DreamRunLimits())
+  #expect(SourceDigest(bytes: input) == fixture.run.inputHash)
+  let admissionBytes = try DreamRunEncoding.encode(
+    DreamRunEncoding.Admission(
+      schemaVersion: 2, bindingHash: binding.rawValue,
+      generation: fixture.run.progress.generation,
+      predecessorHash: SourceDigest(bytes: Data()).rawValue, runID: fixture.run.runID,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      requestHash: request.requestHash.rawValue,
+      selection: DreamRunEncoding.Selection(fixture.run.selection), base: fixture.run.approvedBase))
+  for (file, bytes) in [
+    (folder.appendingPathComponent("root.json"), decisionRootBinding),
+    (folder.appendingPathComponent("writer.lock"), Data()),
+    (admissions.appendingPathComponent("\(fixture.run.progress.generation).json"), admissionBytes),
+  ] {
+    try bytes.write(to: file)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+  }
+  let admission = SourceDigest(bytes: admissionBytes)
+  let other = SourceDigest(bytes: Data("other synthetic binding".utf8)).rawValue
+  let reader = DreamAttemptReader(
+    directory: directory, run: fixture.run, context: context, baseline: request,
+    rendering: rendering, admissionHash: admission, limits: try DreamRunLimits())
+  func write(_ name: String, _ bytes: Data) throws {
+    let file = runFolder.appendingPathComponent(name)
+    try bytes.write(to: file)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+  }
+  try write("input.json", input)
+  try write("context.json", context.canonicalBytes)
+  try write("request.json", requestBytes)
+  let baselineCall = DreamRunEncoding.Intent(
+    schemaVersion: 2, admissionHash: admission.rawValue, requestHash: request.requestHash.rawValue,
+    selection: DreamRunEncoding.Selection(request.selection))
+  let baselineCallBytes = try DreamRunEncoding.encode(baselineCall)
+  try write("call-started.json", baselineCallBytes)
+  let initialResponse = DreamRunEncoding.BoundResponse(
+    schemaVersion: 2, admissionHash: admission.rawValue,
+    runID: fixture.run.runID, generation: fixture.run.progress.generation,
+    inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+    requestHash: request.requestHash.rawValue,
+    selection: DreamRunEncoding.Selection(request.selection), text: "Invalid synthetic reply")
+  let responseBytes = try DreamRunEncoding.encode(initialResponse)
+  try write("response.json", responseBytes)
+  let rejected = try #require(reader.verify().response)
+  guard
+    case .failure(let rejection) = DreamDecision.assess(
+      response: rejected, context: context, rendering: rendering)
+  else { throw DreamRunError.corruption }
+  var feedback = DreamReplacementFeedback(failure: rejection.failure, rendering: rendering)
+  if mutation == .feedback || mutation == .feedbackRendering {
+    var object = try #require(
+      JSONSerialization.jsonObject(with: feedback.bytes()) as? [String: Any])
+    if mutation == .feedbackRendering {
+      object["renderingVersion"] = rendering == .legacyV1 ? 2 : 1
+    } else {
+      var failure = try #require(object["failure"] as? [String: Any])
+      failure["code"] = DreamValidationCode.schemaVersion.rawValue
+      object["failure"] = failure
+    }
+    feedback = try JSONDecoder().decode(
+      DreamReplacementFeedback.self,
+      from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+  }
+  var archive = responseBytes
+  if mutation == .archive { archive.append(0x0A) }
+  try write("rejected-1.json", archive)
+  var replacement = DreamRunEncoding.ReplacementIntent(
+    schemaVersion: 3, admissionHash: admission.rawValue,
+    requestHash: request.requestHash.rawValue,
+    rejectedResponseHash: SourceDigest(bytes: archive).rawValue)
+  replacement.attemptNumber = mutation == .attemptNumber ? 2 : 1
+  replacement.rejectedAttemptNumber = 0
+  replacement.rejectedCallIntentHash =
+    mutation == .rejectedCall ? other : SourceDigest(bytes: baselineCallBytes).rawValue
+  replacement.feedback = feedback
+  replacement.feedbackHash =
+    mutation == .feedbackHash ? other : SourceDigest(bytes: try feedback.bytes()).rawValue
+  let replacementBytes = try DreamRunEncoding.encode(replacement)
+  let replacementHash = SourceDigest(bytes: replacementBytes)
+  try write("replacement-1.json", replacementBytes)
+  let selection = try DreamSelectedCall(
+    provider: "synthetic", modelID: "historical-replacement", thinkingLevel: "off")
+  let effective = try reader.request(
+    attempt: DreamResponseAttempt(number: 1), replacement: replacement,
+    replacementHash: replacementHash, selection: selection)
+  let effectiveHash = mutation == .effectiveHash ? other : effective.requestHash.rawValue
+  var call = DreamRunEncoding.Intent(
+    schemaVersion: 3, admissionHash: admission.rawValue, requestHash: effectiveHash,
+    selection: DreamRunEncoding.Selection(selection))
+  call.baselineRequestHash = request.requestHash.rawValue
+  call.replacementIntentHash = mutation == .replacementBinding ? other : replacementHash.rawValue
+  call.attemptNumber = 1
+  let callBytes = try DreamRunEncoding.encode(call)
+  try write("replacement-1-call-started.json", callBytes)
+  let text = try fixture.response(
+    [
+      [
+        "kind": "noChange", "sources": context.primaryCatalogue.map { decisionSource($0.id) },
+        "reasonCode": "notDurable", "explanation": "Synthetic non-durable detail.",
+      ]
+    ], context: context
+  ).response.text
+  var response = DreamRunEncoding.BoundResponse(
+    schemaVersion: mutation == .envelopeVersion ? 2 : 3,
+    admissionHash: admission.rawValue,
+    runID: fixture.run.runID, generation: fixture.run.progress.generation,
+    inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+    requestHash: effectiveHash, selection: DreamRunEncoding.Selection(selection), text: text)
+  if mutation != .envelopeVersion {
+    response.callIntentHash =
+      mutation == .responseCall ? other : SourceDigest(bytes: callBytes).rawValue
+  }
+  let finalBytes = try DreamRunEncoding.encode(response)
+  try write("replacement-1-response.json", finalBytes)
+  if mutation == .orphanResponse { try write("replacement-2-response.json", finalBytes) }
+  return (reader, folder)
 }
 
 private func decisionLimits(_ values: [String: Int]) throws -> DreamDecisionLimits {
@@ -203,6 +366,209 @@ private func decisionOwnerNote(_ source: PrimaryTextID, owner: PinnedOwnerInput)
     ],
     "contradictions": [], "explanation": "The supplied owner already contains the rule.",
   ]
+}
+
+@Test(arguments: [DreamRequestRendering.legacyV1, .connectedV3])
+func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
+  rendering: DreamRequestRendering
+) throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  let request = DreamRunEncoding.Request(
+    schemaVersion: 2, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+    inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+    systemPrompt: context.systemPrompt(rendering: rendering),
+    messages: try context.requestMessages(timestampMilliseconds: 123, rendering: rendering))
+  let bytes = Data(
+    (" \n" + String(decoding: try DreamRunEncoding.encode(request), as: UTF8.self)).utf8)
+  let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
+  let replay = try saved.domain(run: fixture.run, context: context, bytes: bytes)
+  #expect(replay.requestHash == SourceDigest(bytes: bytes))
+  #expect(replay.systemPrompt.utf8.elementsEqual(request.systemPrompt.utf8))
+  #expect(replay.messages[0].text.utf8.elementsEqual(request.messages[0].text.utf8))
+  if rendering == .legacyV1 {
+    #expect(
+      SourceDigest(bytes: Data(request.systemPrompt.utf8)).rawValue
+        == "76a60a515c0c03b8d810859056a69cb09ea2c1b6e683e149ae3c6bb42a61fd31")
+    let body = try #require(
+      JSONSerialization.jsonObject(with: Data(request.messages[0].text.utf8)) as? [String: Any])
+    #expect(body["connectedWindowBindings"] == nil)
+    let primary = try #require(body["primaryEvidence"] as? [[String: Any]])
+    #expect(
+      Set(try #require(primary.first).keys)
+        == ["source", "kind", "text", "timestampReferenceTimeBits"])
+    let schema = try #require(body["decisionSchema"] as? [String: Any])
+    let properties = try #require(schema["properties"] as? [String: Any])
+    let decisions = try #require(properties["decisions"] as? [String: Any])
+    let items = try #require(decisions["items"] as? [String: Any])
+    let variants = try #require(items["oneOf"] as? [[String: Any]])
+    #expect(
+      Set(try #require(variants.first?["required"] as? [String]))
+        == ["kind", "scope", "text", "sources", "contradictions", "reason"])
+  }
+}
+
+@Test func dreamRequestVersionMarkerRefusesMissingUnknownAndInconsistentFormats() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  for (schema, rendering) in [(3, 3), (3, nil), (3, 1), (3, 2), (2, 3), (4, 4)] as [(Int, Int?)] {
+    let request = DreamRunEncoding.Request(
+      schemaVersion: schema, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      systemPrompt: context.savedSystemPrompt,
+      messages: try context.requestMessages(timestampMilliseconds: 123), renderingVersion: rendering
+    )
+    let bytes = try DreamRunEncoding.encode(request)
+    if schema == 3 && rendering == 3 {
+      let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
+      #expect(
+        try saved.domain(run: fixture.run, context: context, bytes: bytes).requestHash
+          == SourceDigest(bytes: bytes))
+    } else if schema == 3 && rendering == 2 {
+      #expect(throws: DreamRunError.corruption) {
+        try request.domain(run: fixture.run, context: context, bytes: bytes)
+      }
+    } else {
+      #expect(throws: DreamRunError.unsupportedSchema) {
+        try request.domain(run: fixture.run, context: context, bytes: bytes)
+      }
+    }
+  }
+}
+
+@Test func dreamRequestMixedHistoricalPromptAndMessageFormatsRemainCorrupt() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  for (prompt, message) in [
+    (DreamRequestRendering.legacyV1, DreamRequestRendering.connectedV3),
+    (.connectedV3, .legacyV1), (.legacyV1, .scopeV2), (.scopeV2, .legacyV1),
+    (.scopeV2, .connectedV3), (.connectedV3, .scopeV2),
+  ] {
+    let request = DreamRunEncoding.Request(
+      schemaVersion: 2, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      systemPrompt: context.systemPrompt(rendering: prompt),
+      messages: try context.requestMessages(timestampMilliseconds: 123, rendering: message))
+    #expect(throws: DreamRunError.corruption) {
+      try request.domain(
+        run: fixture.run, context: context, bytes: DreamRunEncoding.encode(request))
+    }
+  }
+}
+
+@Test func dreamRequestLegacyRenderingCannotOmitToolEvidence() throws {
+  let fixture = try DecisionFixture(isToolEvidenceIncluded: true)
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  #expect(throws: DreamRunError.corruption) {
+    try context.requestMessages(timestampMilliseconds: 123, rendering: .legacyV1)
+  }
+}
+
+
+@Test func dreamScopeContractRequestReplaysExactVersionedBytes() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  for (schema, marker) in [(2, nil), (3, 2)] as [(Int, Int?)] {
+    let saved = DreamRunEncoding.Request(
+      schemaVersion: schema, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      systemPrompt: context.systemPrompt(rendering: .scopeV2),
+      messages: try context.requestMessages(timestampMilliseconds: 123, rendering: .scopeV2),
+      renderingVersion: marker)
+    let bytes = try DreamRunEncoding.encode(saved)
+    let decoded = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
+    let verified = try decoded.verifiedDomain(run: fixture.run, context: context, bytes: bytes)
+    #expect(verified.rendering == .scopeV2)
+    #expect(verified.request.requestHash == SourceDigest(bytes: bytes))
+    #expect(verified.request.systemPrompt == saved.systemPrompt)
+    #expect(verified.request.messages == saved.messages)
+    let body = try #require(
+      JSONSerialization.jsonObject(with: Data(saved.messages[0].text.utf8)) as? [String: Any])
+    let scopes = try #require(body["scopes"] as? [[String: Any]])
+    let reasons = try #require(scopes.first?["allowedNoChangeReasons"] as? [String])
+    #expect(Set(reasons) == ["alreadyRepresented", "notDurable", "insufficientEvidence"])
+    let destinations = try #require(scopes.first?["eligibleProposalScopes"] as? [[String: Any]])
+    #expect(destinations.count == 1 && destinations.first?["kind"] as? String == "global")
+    #expect(body["connectedWindowBindings"] == nil)
+  }
+}
+
+@Test(arguments: feedbackRenderings)
+private func dreamFeedbackChainReplaysVerifiedRenderingWithoutChangingArtifacts(
+  rendering: DreamRequestRendering
+) throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let reader = try feedbackAttemptFixture(fixture, rendering: rendering).reader
+  let before = try fixture.store.snapshot(fixture.store.root)
+  var attempts: [Int] = []
+  let verified = try reader.verify { attempts.append($0.attempt.number) }
+  #expect(attempts == [0, 1])
+  #expect(verified.attempt.number == 1)
+  #expect(verified.selection?.modelID == "historical-replacement")
+  let response = try #require(verified.response)
+  switch DreamDecision.assess(
+    response: response, context: reader.context, rendering: rendering)
+  {
+  case .success(let result):
+    #expect(result.plans.isEmpty && result.notes.count == 1)
+  case .failure(let rejection):
+    throw rejection.error
+  }
+  let replacement = try #require(verified.replacement)
+  let effective = try reader.request(
+    attempt: verified.attempt, replacement: replacement,
+    replacementHash: verified.replacementHash, selection: try #require(verified.selection))
+  #expect(effective.messages.count == 2)
+  #expect(effective.messages[0] == reader.baseline.messages[0])
+  #expect(
+    effective.messages[1].text
+      == String(
+        decoding: try #require(replacement.feedback).bytes(), as: UTF8.self))
+  #expect(try fixture.store.snapshot(fixture.store.root) == before)
+}
+
+@Test(arguments: feedbackRenderings, [false, true])
+private func dreamInspectionUsesVerifiedFeedbackChainWithoutWrites(
+  rendering: DreamRequestRendering, isMalformed: Bool
+) throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let saved = try feedbackAttemptFixture(
+    fixture, rendering: rendering, mutation: isMalformed ? .responseCall : nil)
+  let before = try fixture.store.snapshot(fixture.store.root)
+  let inspection = try DreamInspection.read(stateRoot: saved.stateRoot)
+  let run = try #require(inspection.runs.first)
+  if isMalformed {
+    #expect(run.attempts.isEmpty)
+    #expect(run.diagnostic == DreamRunError.corruption.description)
+  } else {
+    #expect(run.diagnostic == nil)
+    #expect(run.attempts.map(\.number) == [0, 1])
+    #expect(run.attempts.map(\.status) == ["Rejected reply", "Reply valid"])
+    #expect(run.attempts[1].modelID == "historical-replacement")
+    #expect(run.attempts[1].suggestionCount == 0)
+  }
+  #expect(try fixture.store.snapshot(fixture.store.root) == before)
+}
+
+@Test(arguments: FeedbackAttemptMutation.allCases, feedbackRenderings)
+private func dreamFeedbackChainRejectsReboundTamperingWithoutWrites(
+  mutation: FeedbackAttemptMutation, rendering: DreamRequestRendering
+) throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let reader = try feedbackAttemptFixture(
+    fixture, rendering: rendering, mutation: mutation
+  ).reader
+  let before = try fixture.store.snapshot(fixture.store.root)
+  #expect(throws: DreamRunError.corruption) { try reader.verify() }
+  #expect(try fixture.store.snapshot(fixture.store.root) == before)
 }
 
 @Test func dreamDecisionCorrectsBlueToGreenWithExactBytesAndMetadata() throws {

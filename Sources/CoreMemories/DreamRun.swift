@@ -1224,10 +1224,11 @@ public final class DreamRunStore {
         milliseconds < Double(Int64.max)
       else { throw DreamRunError.corruption }
       let request = DreamRunEncoding.Request(
-        schemaVersion: 2, runID: runID, generation: progress.generation,
+        schemaVersion: 3, runID: runID, generation: progress.generation,
         inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
         systemPrompt: context.savedSystemPrompt,
-        messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)))
+        messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)),
+        renderingVersion: DreamRequestRendering.connectedV3.rawValue)
       let requestBytes = try bounded(request)
       let directory = try runs.child(runID, isCreating: true)
       try synchronize(runs, name: "runDirectory")
@@ -1251,16 +1252,24 @@ public final class DreamRunStore {
         admission: admission, admissionHash: SourceDigest(bytes: admissionBytes), run: run,
         context: context,
         request: try request.domain(run: run, context: context, bytes: requestBytes),
-        directory: directory)
+        rendering: .connectedV3, directory: directory)
       try save(generation: progress.generation, hash: chain.hash, sealed: sealed)
     }
+    guard sealed.rendering != .scopeV2 else { throw DreamRunError.unsupportedSchema }
     if isRecovered {
       try checkProtection(sealed, excludedSessionIDs: excludedSessionIDs, protect: protect)
+    }
+    var attempt: ResponseAttempt
+    do {
+      let verified = try attemptReader(sealed).verify()
+      guard verified.replacement?.schemaVersion != 3 || verified.response != nil else {
+        throw DreamRunError.unsupportedSchema
+      }
+      attempt = verified.attempt
     }
     if isRecovered, cached?.admissionHash != sealed.admissionHash.rawValue {
       try save(generation: sealed.run.progress.generation, hash: chain.hash, sealed: sealed)
     }
-    var attempt = try activeAttempt(sealed)
     var isReplacementStarted = false
     if resume == .replaceInvalidResponse, try sealed.directory.isPresent(attempt.responseName) {
       guard !(try sealed.directory.isPresent("decisions.json")),
@@ -1803,6 +1812,7 @@ public final class DreamRunStore {
     let run: FrozenDreamRun
     let context: DreamDecisionContext
     let request: DreamModelRequest
+    let rendering: DreamRequestRendering
     let directory: DreamStateDirectory
   }
 
@@ -1964,10 +1974,10 @@ public final class DreamRunStore {
       throw DreamRunError.corruption
     }
     let request = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: requestBytes)
+    let verified = try request.verifiedDomain(run: run, context: context, bytes: requestBytes)
     return SealedRun(
       admission: admission, admissionHash: SourceDigest(bytes: bytes), run: run,
-      context: context,
-      request: try request.domain(run: run, context: context, bytes: requestBytes),
+      context: context, request: verified.request, rendering: verified.rendering,
       directory: directory)
   }
 
@@ -1982,74 +1992,37 @@ public final class DreamRunStore {
     limits.maximumResponseBytes * 6 + DreamRunEncoding.maximumMetadataBytes
   }
 
-  private struct ResponseAttempt {
-    static let maximumReplacements = 32
-    let number: Int
-    var responseName: String {
-      number == 0 ? "response.json" : "replacement-\(number)-response.json"
-    }
-    var callName: String {
-      number == 0 ? "call-started.json" : "replacement-\(number)-call-started.json"
-    }
-    var intentName: String { "replacement-\(number).json" }
-    var archiveName: String { "rejected-\(number).json" }
+  private typealias ResponseAttempt = DreamResponseAttempt
+
+  private func attemptReader(_ sealed: SealedRun) -> DreamAttemptReader {
+    DreamAttemptReader(
+      directory: sealed.directory, run: sealed.run, context: sealed.context,
+      baseline: sealed.request, rendering: sealed.rendering,
+      admissionHash: sealed.admissionHash, limits: limits)
   }
 
   private func activeAttempt(_ sealed: SealedRun) throws -> ResponseAttempt {
-    let replacementNames = try sealed.directory.names().filter { $0.hasPrefix("replacement-") }
-    let names = replacementNames.filter {
-      !$0.hasSuffix("-response.json") && !$0.hasSuffix("-call-started.json")
+    try attemptReader(sealed).verify().attempt
+  }
+
+  private func verifiedAttempt(_ sealed: SealedRun, attempt: ResponseAttempt) throws
+    -> VerifiedDreamAttempt
+  {
+    var selected: VerifiedDreamAttempt?
+    _ = try attemptReader(sealed).verify { value in
+      if value.attempt.number == attempt.number { selected = value }
     }
-    guard names.count <= ResponseAttempt.maximumReplacements else {
-      throw DreamRunError.limitExceeded
-    }
-    let expectedNames = Set(
-      (1..<(names.count + 1)).flatMap { number in
-        let attempt = ResponseAttempt(number: number)
-        return [attempt.intentName, attempt.callName, attempt.responseName]
-      })
-    guard replacementNames.allSatisfy(expectedNames.contains) else {
-      throw DreamRunError.corruption
-    }
-    var previous = ResponseAttempt(number: 0)
-    for number in 1..<(names.count + 1) {
-      let attempt = ResponseAttempt(number: number)
-      guard names.contains(attempt.intentName) else { throw DreamRunError.corruption }
-      let bytes = try sealed.directory.read(
-        attempt.intentName, maximum: DreamRunEncoding.maximumMetadataBytes)
-      let intent = try DreamRunEncoding.decode(
-        DreamRunEncoding.ReplacementIntent.self, bytes: bytes)
-      let rejected = try sealed.directory.read(
-        attempt.archiveName, maximum: maximumResponseEnvelopeBytes)
-      guard bytes == (try bounded(intent)),
-        intent.admissionHash == sealed.admissionHash.rawValue,
-        intent.requestHash == sealed.request.requestHash.rawValue,
-        intent.rejectedResponseHash == SourceDigest(bytes: rejected).rawValue,
-        rejected
-          == (try sealed.directory.read(
-            previous.responseName, maximum: maximumResponseEnvelopeBytes))
-      else { throw DreamRunError.corruption }
-      do {
-        _ = try validatedOutcome(sealed, attempt: previous)
-        throw DreamRunError.corruption
-      } catch is DreamDecisionError {}
-      previous = attempt
-    }
-    return previous
+    guard let selected else { throw DreamRunError.corruption }
+    return selected
   }
 
   private func loadCallSelection(_ sealed: SealedRun, attempt: ResponseAttempt) throws
     -> DreamSelectedCall
   {
-    let bytes = try sealed.directory.read(attempt.callName, maximum: limits.maximumFrozenBytes)
-    let intent = try DreamRunEncoding.decode(DreamRunEncoding.Intent.self, bytes: bytes)
-    guard intent.admissionHash == sealed.admissionHash.rawValue,
-      intent.requestHash == sealed.request.requestHash.rawValue,
-      bytes == (try bounded(intent))
-    else { throw DreamRunError.corruption }
-    do { return try intent.selection?.domain() ?? sealed.run.selection } catch {
+    guard let selection = try verifiedAttempt(sealed, attempt: attempt).selection else {
       throw DreamRunError.corruption
     }
+    return selection
   }
 
   private func validatedOutcome(_ sealed: SealedRun, attempt supplied: ResponseAttempt? = nil)
@@ -2065,16 +2038,16 @@ public final class DreamRunStore {
       else { throw DreamRunError.corruption }
       validated = nil
     } else {
-      let callSelection = try loadCallSelection(sealed, attempt: attempt)
-      let bytes = try sealed.directory.read(
-        attempt.responseName, maximum: maximumResponseEnvelopeBytes)
-      let response = try DreamRunEncoding.decode(DreamRunEncoding.BoundResponse.self, bytes: bytes)
-      let durable = try response.domain(
-        run: run, context: sealed.context, request: sealed.request,
-        admissionHash: sealed.admissionHash, selection: callSelection, bytes: bytes,
-        maximumResponseBytes: limits.maximumResponseBytes)
+      guard let durable = try verifiedAttempt(sealed, attempt: attempt).response else {
+        throw DreamRunError.missingPayload
+      }
       responseHash = durable.responseHash
-      validated = try DreamDecision.validate(response: durable, context: sealed.context)
+      switch DreamDecision.assess(
+        response: durable, context: sealed.context, rendering: sealed.rendering)
+      {
+      case .success(let result): validated = result
+      case .failure(let rejection): throw rejection.error
+      }
     }
     let plans = validated?.plans ?? []
     let notes = validated?.notes ?? []

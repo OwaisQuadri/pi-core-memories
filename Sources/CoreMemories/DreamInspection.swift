@@ -107,8 +107,10 @@ package struct DreamInspection: Codable, Sendable {
     let context = try DreamRunEncoding.context(
       bytes: directory.read("context.json", maximum: limits.maximumFrozenBytes), run: run)
     let requestBytes = try directory.read("request.json", maximum: limits.maximumFrozenBytes)
-    let request = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: requestBytes)
-      .domain(run: run, context: context, bytes: requestBytes)
+    let verifiedRequest = try DreamRunEncoding.decode(
+      DreamRunEncoding.Request.self, bytes: requestBytes
+    ).verifiedDomain(run: run, context: context, bytes: requestBytes)
+    let request = verifiedRequest.request
     let admissionBytes = try root.child("admissions").read(
       "\(run.progress.generation).json", maximum: DreamRunEncoding.maximumMetadataBytes)
     let admission = try DreamRunEncoding.decode(
@@ -120,40 +122,26 @@ package struct DreamInspection: Codable, Sendable {
       admission.generation == run.progress.generation, admission.base == run.approvedBase,
       try admission.selection.domain() == run.selection
     else { throw DreamRunError.corruption }
-    let admissionHash = SourceDigest(bytes: admissionBytes)
+    let reader = DreamAttemptReader(
+      directory: directory, run: run, context: context, baseline: request,
+      rendering: verifiedRequest.rendering,
+      admissionHash: SourceDigest(bytes: admissionBytes), limits: limits)
     var attempts: [SavedDreamAttempt] = []
-    for number in 0...32 {
-      let prefix = number == 0 ? "" : "replacement-\(number)-"
-      let callName = prefix + "call-started.json"
-      guard try directory.isPresent(callName) else { continue }
-      let intent = try DreamRunEncoding.decode(
-        DreamRunEncoding.Intent.self,
-        bytes: directory.read(callName, maximum: limits.maximumFrozenBytes))
-      guard intent.admissionHash == admissionHash.rawValue,
-        intent.requestHash == request.requestHash.rawValue
-      else { throw DreamRunError.corruption }
-      let selection = try intent.selection?.domain() ?? run.selection
-      let responseName = prefix + "response.json"
+    _ = try reader.verify { attempt in
+      guard let selection = attempt.selection else { return }
       var status = "No saved reply"
       var suggestionCount: Int?
       var diagnostic: String?
-      if try directory.isPresent(responseName) {
-        let bytes = try directory.read(
-          responseName,
-          maximum: limits.maximumResponseBytes * 6 + DreamRunEncoding.maximumMetadataBytes)
-        let response = try DreamRunEncoding.decode(
-          DreamRunEncoding.BoundResponse.self, bytes: bytes
-        )
-        .domain(
-          run: run, context: context, request: request, admissionHash: admissionHash,
-          selection: selection, bytes: bytes, maximumResponseBytes: limits.maximumResponseBytes)
-        do {
-          suggestionCount = try DreamDecision.validate(response: response, context: context).plans
-            .count
+      if let response = attempt.response {
+        switch DreamDecision.assess(
+          response: response, context: context, rendering: verifiedRequest.rendering)
+        {
+        case .success(let result):
+          suggestionCount = result.plans.count
           status = "Reply valid"
-        } catch let error as DreamDecisionError {
+        case .failure(let rejection):
           status = "Rejected reply"
-          switch error {
+          switch rejection.error {
           case .decision(let index, let category):
             diagnostic = "Decision index \(index): \(category)"
           case .context(let message): diagnostic = message
@@ -164,7 +152,7 @@ package struct DreamInspection: Codable, Sendable {
       }
       attempts.append(
         SavedDreamAttempt(
-          number: number, provider: selection.provider,
+          number: attempt.attempt.number, provider: selection.provider,
           modelID: selection.modelID, thinkingLevel: selection.thinkingLevel,
           status: status, suggestionCount: suggestionCount, diagnostic: diagnostic))
     }

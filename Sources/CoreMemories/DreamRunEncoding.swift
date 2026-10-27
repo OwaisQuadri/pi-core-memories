@@ -48,10 +48,27 @@ enum DreamRunEncoding {
       let schema = try decoder.decode(Schema.self, from: bytes)
       guard
         schema.schemaVersion == 2
-          || (type == Completion.self && schema.schemaVersion == 3)
+          || ((type == Completion.self || type == Request.self || type == Intent.self
+            || type == ReplacementIntent.self || type == BoundResponse.self)
+            && schema.schemaVersion == 3)
           || (type == RecoveryCheckpoint.self && schema.schemaVersion == 1)
       else { throw DreamRunError.unsupportedSchema }
       let value = try decoder.decode(type, from: bytes)
+      if schema.schemaVersion == 2 {
+        if let intent = value as? Intent {
+          guard intent.baselineRequestHash == nil, intent.replacementIntentHash == nil,
+            intent.attemptNumber == nil
+          else { throw DreamRunError.corruption }
+        }
+        if let intent = value as? ReplacementIntent {
+          guard intent.attemptNumber == nil, intent.rejectedAttemptNumber == nil,
+            intent.rejectedCallIntentHash == nil, intent.feedback == nil, intent.feedbackHash == nil
+          else { throw DreamRunError.corruption }
+        }
+        if let response = value as? BoundResponse {
+          guard response.callIntentHash == nil else { throw DreamRunError.corruption }
+        }
+      }
       let encoded = try encode(value)
       if bytes == encoded { return value }
       guard let supplied = try JSONSerialization.jsonObject(with: bytes) as? NSDictionary,
@@ -690,22 +707,44 @@ extension DreamRunEncoding {
     let contextHash: String
     let systemPrompt: String
     let messages: [DreamRequestMessage]
+    var renderingVersion: Int?
+
+    func renderings() throws -> [DreamRequestRendering] {
+      switch (schemaVersion, renderingVersion) {
+      case (2, nil): return [.connectedV3, .scopeV2, .legacyV1]
+      case (3, 2): return [.scopeV2]
+      case (3, 3): return [.connectedV3]
+      default: throw DreamRunError.unsupportedSchema
+      }
+    }
 
     func domain(run: FrozenDreamRun, context: DreamDecisionContext, bytes: Data) throws
       -> DreamModelRequest
     {
-      guard schemaVersion == 2, runID == run.runID, generation == run.progress.generation,
+      try verifiedDomain(run: run, context: context, bytes: bytes).request
+    }
+
+    func verifiedDomain(run: FrozenDreamRun, context: DreamDecisionContext, bytes: Data) throws
+      -> (request: DreamModelRequest, rendering: DreamRequestRendering)
+    {
+      let renderings = try renderings()
+      guard runID == run.runID, generation == run.progress.generation,
         inputHash == run.inputHash.rawValue, contextHash == context.contextHash.rawValue,
-        systemPrompt == context.savedSystemPrompt, messages.count == 1,
-        messages[0].role == .user,
-        messages
-          == (try context.requestMessages(
-            timestampMilliseconds: messages[0].timestampMilliseconds))
+        messages.count == 1, messages[0].role == .user
       else { throw DreamRunError.corruption }
-      return DreamModelRequest(
+      let rendering = try renderings.first { rendering in
+        guard systemPrompt.utf8.elementsEqual(context.systemPrompt(rendering: rendering).utf8)
+        else { return false }
+        let expected = try context.requestMessages(
+          timestampMilliseconds: messages[0].timestampMilliseconds, rendering: rendering)
+        return messages[0].text.utf8.elementsEqual(expected[0].text.utf8)
+      }
+      guard let rendering else { throw DreamRunError.corruption }
+      let request = DreamModelRequest(
         runID: runID, generation: generation, inputHash: run.inputHash,
         contextHash: context.contextHash, requestHash: SourceDigest(bytes: bytes),
         selection: run.selection, systemPrompt: systemPrompt, messages: messages)
+      return (request, rendering)
     }
   }
 
@@ -714,6 +753,9 @@ extension DreamRunEncoding {
     let admissionHash: String
     let requestHash: String
     let selection: Selection?
+    var baselineRequestHash: String?
+    var replacementIntentHash: String?
+    var attemptNumber: Int?
   }
 
   struct ReplacementIntent: Codable {
@@ -721,6 +763,26 @@ extension DreamRunEncoding {
     let admissionHash: String
     let requestHash: String
     let rejectedResponseHash: String
+    var attemptNumber: Int?
+    var rejectedAttemptNumber: Int?
+    var rejectedCallIntentHash: String?
+    var feedback: DreamReplacementFeedback?
+    var feedbackHash: String?
+  }
+
+  struct EffectiveCall: Encodable {
+    let schemaVersion = 1
+    let runID: String
+    let generation: UInt64
+    let inputHash: String
+    let contextHash: String
+    let admissionHash: String
+    let baselineRequestHash: String
+    let replacementIntentHash: String
+    let attemptNumber: Int
+    let selection: Selection
+    let systemPrompt: String
+    let messages: [DreamRequestMessage]
   }
 
   struct BoundResponse: Codable {
@@ -734,6 +796,7 @@ extension DreamRunEncoding {
     let selection: Selection
     let text: String
 
+    var callIntentHash: String?
     func domain(
       run: FrozenDreamRun, context: DreamDecisionContext, request: DreamModelRequest,
       admissionHash: SourceDigest, selection: DreamSelectedCall, bytes: Data,

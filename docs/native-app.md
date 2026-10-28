@@ -15,7 +15,7 @@ remain until replacement and migration pass acceptance. Do not uninstall or
 replace it merely because command removal passes. Its retained review and draft
 actions are recovery facilities, not the recommended conversation interface.
 
-The [README](../README.md#implementation-status) records the current source
+The [README](../README.md#public-pi-integration) records the current source
 implementation boundary. Source code, a menu, or another application cannot
 stand in for installed replacement and migration acceptance.
 

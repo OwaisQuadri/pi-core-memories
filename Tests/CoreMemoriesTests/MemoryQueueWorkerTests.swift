@@ -65,9 +65,17 @@ private final class QueueWorkerFixture {
     while bytes.count < 8 * 1_048_576 {
       var descriptor = pollfd(
         fd: output.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0)
-      guard poll(&descriptor, 1, 10_000) == 1,
-        let byte = try output.fileHandleForReading.read(upToCount: 1), !byte.isEmpty
-      else { throw MemoryError("queue frame missing") }
+      let readiness = poll(&descriptor, 1, 10_000)
+      let failureCode = readiness < 0 ? errno : 0
+      guard readiness == 1 else {
+        let helper = process.isRunning ? "running" : "exit \(process.terminationStatus)"
+        throw MemoryError(
+          "queue frame missing: poll=\(readiness), errno=\(failureCode), events=\(descriptor.revents), bytes=\(bytes.count), helper=\(helper)")
+      }
+      guard let byte = try output.fileHandleForReading.read(upToCount: 1), !byte.isEmpty else {
+        let helper = process.isRunning ? "running" : "exit \(process.terminationStatus)"
+        throw MemoryError("queue frame missing: EOF, bytes=\(bytes.count), helper=\(helper)")
+      }
       if byte == Data([10]) {
         return try #require(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
       }

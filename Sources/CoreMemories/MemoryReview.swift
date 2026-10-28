@@ -198,7 +198,9 @@ package final class MemoryReviewController {
     }
   }
 
-  package func preview(candidateID: SourceDigest, clockDate: Date) throws -> MemoryReviewPreview {
+  package func preview(
+    candidateID: SourceDigest, clockDate: Date, amendment: MemoryBatchAmendment? = nil
+  ) throws -> MemoryReviewPreview {
     try locked {
       try refresh()
       let id = candidateID.rawValue
@@ -223,8 +225,14 @@ package final class MemoryReviewController {
       formatter.timeZone = TimeZone(secondsFromGMT: 0)
       formatter.formatOptions = [.withInternetDateTime]
       let instant = try MemoryDocument.ReviewInstant(formatter.string(from: clockDate))
-      let after = try MemoryDocument.reviewedBytes(
+      let before = Data(target.bytes[target.range])
+      let original = try MemoryDocument.reviewedBytes(
         change.after, identity: identity, instant: instant)
+      let admissionHash = SourceDigest(bytes: try MemoryReviewEncoding.encode(admission)).rawValue
+      let intent = MemoryBatchCandidateIntent(
+        candidateID: id, admissionHash: admissionHash, choice: .accept,
+        identity: identity, instant: instant, amendment: amendment)
+      let after = try Self.amendedBatchBytes(intent, proposal: original, before: before)
       var replacement = target.bytes
       let insertion = change.operation == .add ? Self.addSeparator(target.bytes) + after : after
       replacement.replaceSubrange(target.range, with: insertion)
@@ -236,13 +244,12 @@ package final class MemoryReviewController {
         MemoryDocument.entries(in: replacement).filter({ $0.identity == identity }).count == 1
       else { throw MemoryError("final native review document is invalid") }
       let payload = ReviewPreviewPayload(
-        candidateID: id,
-        admissionHash: SourceDigest(bytes: try MemoryReviewEncoding.encode(admission)).rawValue,
+        candidateID: id, admissionHash: admissionHash,
         frozenBase: change.base, currentBase: target.snapshot.base, path: change.path,
         identity: identity, instant: instant, start: target.range.lowerBound,
-        end: target.range.upperBound, before: Data(target.bytes[target.range]), after: after,
+        end: target.range.upperBound, before: before, after: after,
         originalDocument: target.bytes, replacement: replacement,
-        checkout: try store.reviewGit.reviewCheckout().witness())
+        checkout: try store.reviewGit.reviewCheckout().witness(), amendment: amendment)
       let digest = SourceDigest(bytes: try MemoryReviewEncoding.encode(payload))
       previews[id] = payload
       return MemoryReviewPreview(
@@ -542,10 +549,14 @@ package final class MemoryReviewController {
         == SourceDigest(bytes: try MemoryReviewEncoding.encode(admission)).rawValue,
       payload.path == change.path, payload.frozenBase == change.base,
       Self.isCommitID(payload.currentBase),
-      payload.identity == (try change.entryID ?? Self.assignedIdentity(payload.candidateID)),
-      try payload.after
-        == MemoryDocument.reviewedBytes(
-          change.after, identity: payload.identity, instant: payload.instant)
+      payload.identity == (try change.entryID ?? Self.assignedIdentity(payload.candidateID))
+    else { throw DreamRunError.corruption }
+    let intent = MemoryBatchCandidateIntent(
+      candidateID: payload.candidateID, admissionHash: payload.admissionHash, choice: .accept,
+      identity: payload.identity, instant: payload.instant, amendment: payload.amendment)
+    let original = try MemoryDocument.reviewedBytes(
+      change.after, identity: payload.identity, instant: payload.instant)
+    guard try payload.after == Self.amendedBatchBytes(intent, proposal: original, before: payload.before)
     else { throw DreamRunError.corruption }
     let snapshot =
       try loadSnapshot?(payload.currentBase)

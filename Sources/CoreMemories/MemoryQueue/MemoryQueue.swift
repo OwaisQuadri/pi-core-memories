@@ -92,6 +92,13 @@ package final class MemoryQueue {
     else {
       throw MemoryError("queue binding conflict")
     }
+    if let amendments = state.amendments {
+      let revisions = Set(state.findings.map(\.revision))
+      guard amendments.count <= revisions.count,
+        Set(amendments.map(\.revision)).count == amendments.count,
+        amendments.allSatisfy({ revisions.contains($0.revision) })
+      else { throw MemoryError("invalid queue amendment binding") }
+    }
     let result = try operation(&state)
     try directory.installReviewFile(
       MemoryReviewEncoding.encode(state), name: "queue.json", isReplacing: true)
@@ -266,17 +273,21 @@ package final class MemoryQueue {
     }
     let review = try controller()
     let rows = try review.list()
-    let finding = try ledger(review) { state in
+    let selected = try ledger(review) { state in
       try admit(rows, state: &state)
       guard let row = rows.first(where: { $0.change.id.rawValue == revision }),
         [.pending, .deferred].contains(row.disposition), row.limitation == nil,
         let finding = state.findings.first(where: { $0.revision == revision }),
         blockReason(finding, request: request, rows: rows, state: state) == nil
       else { throw MemoryError("finding is stale, blocked, or suppressed") }
-      return finding
+      return (
+        finding: finding,
+        amendment: state.amendments?.first(where: { $0.revision == revision })?.amendment)
     }
+    let finding = selected.finding
     let row = rows.first { $0.change.id.rawValue == revision }!
-    let preview = try review.preview(candidateID: row.change.id, clockDate: clockDate)
+    let preview = try review.preview(
+      candidateID: row.change.id, clockDate: clockDate, amendment: selected.amendment)
     let checkout = try review.checkoutPreview()
     sequence += 1
     let presentation = MemoryQueuePresentation(
@@ -284,7 +295,7 @@ package final class MemoryQueue {
       previewDigest: preview.digest.rawValue, currentBase: preview.currentBase,
       before: preview.before, after: preview.after, replacement: preview.replacement,
       isDetachRequired: checkout.isDetachRequired, checkoutCommit: checkout.commit,
-      checkoutDigest: checkout.digest.rawValue)
+      checkoutDigest: checkout.digest.rawValue, amendmentReason: selected.amendment?.reason)
     let display = MemoryQueueDisplay(
       presentation: presentation,
       displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(presentation)).rawValue)
@@ -297,6 +308,51 @@ package final class MemoryQueue {
     active = ActiveReview(
       controller: review, preview: preview, checkout: checkout, display: display)
     return display
+  }
+
+  package func amend(
+    _ display: MemoryQueueDisplay, amendment: MemoryBatchAmendment, clockDate: Date = Date()
+  ) throws -> MemoryQueueDisplay {
+    guard let current = active, current.display == display, current.messageReference != nil,
+      sequence < UInt64.max
+    else { throw MemoryError("amendment requires the exact live displayed review") }
+    active = nil
+    let presentation = display.presentation
+    let preview = try current.controller.preview(
+      candidateID: current.preview.change.id, clockDate: clockDate, amendment: amendment)
+    let checkout = try current.controller.checkoutPreview()
+    sequence += 1
+    let replacement = MemoryQueuePresentation(
+      claimID: presentation.claimID, sequence: String(sequence), request: presentation.request,
+      finding: presentation.finding, previewDigest: preview.digest.rawValue,
+      currentBase: preview.currentBase, before: preview.before, after: preview.after,
+      replacement: preview.replacement, isDetachRequired: checkout.isDetachRequired,
+      checkoutCommit: checkout.commit, checkoutDigest: checkout.digest.rawValue,
+      amendmentReason: amendment.reason)
+    let amended = MemoryQueueDisplay(
+      presentation: replacement,
+      displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(replacement)).rawValue)
+    try ledger(current.controller) { state in
+      guard state.findings.contains(where: { $0.revision == presentation.finding.revision }),
+        let index = state.shown.firstIndex(where: { $0.displayDigest == display.displayDigest }),
+        state.shown[index].messageReference == current.messageReference,
+        !state.intents.contains(where: { $0.display.displayDigest == display.displayDigest })
+      else { throw MemoryError("amendment presentation is stale or already decided") }
+      var amendments = state.amendments ?? []
+      let draft = QueueAmendment(revision: presentation.finding.revision, amendment: amendment)
+      if let previous = amendments.firstIndex(where: { $0.revision == draft.revision }) {
+        amendments[previous] = draft
+      } else {
+        amendments.append(draft)
+      }
+      state.amendments = amendments
+      state.shown[index] = QueueShown(
+        findingID: presentation.finding.findingID, revision: presentation.finding.revision,
+        request: presentation.request, displayDigest: amended.displayDigest, messageReference: nil)
+    }
+    active = ActiveReview(
+      controller: current.controller, preview: preview, checkout: checkout, display: amended)
+    return amended
   }
 
   package func presented(_ display: MemoryQueueDisplay, messageReference: String) throws {

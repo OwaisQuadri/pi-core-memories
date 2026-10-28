@@ -244,3 +244,134 @@ func queueRejectionBlocksRephrasedAndFreshEvidenceSuccessors(isNewEvidence: Bool
   #expect(try fixture.snapshot(journal) == draftBytes)
   #expect(try fixture.main() == base)
 }
+
+@Test func queueAmendmentKeepsOwnershipAndRequiresFreshDisplayBeforeExactApproval() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  let queue = try queueFixture(fixture, sources: sources)
+  defer { queue.release() }
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let row = try #require(queue.list(request: request).first { $0.finding.operation == "update" })
+  let base = try fixture.main()
+  let clock = Date()
+  let original = try queue.claim(revision: row.finding.revision, request: request, clockDate: clock)
+  try queue.presented(original, messageReference: "original-proposal")
+  #expect(original.presentation.amendmentReason == nil)
+  var seen = Set<String>()
+  let annotations = (
+    MemoryDocument.sourceAnnotations(in: original.presentation.after)
+      + MemoryDocument.sourceAnnotations(in: original.presentation.before)
+  ).filter { seen.insert($0).inserted }
+  let replacement = "Use orange buttons. " + annotations.joined(separator: " ") + "\n"
+  let amended = try queue.amend(
+    original, amendment: MemoryBatchAmendment(replacement: replacement, reason: "Revise the wording."),
+    clockDate: clock)
+  #expect(amended.presentation.claimID == original.presentation.claimID)
+  #expect(amended.presentation.request == original.presentation.request)
+  #expect(amended.presentation.finding == original.presentation.finding)
+  #expect(amended.presentation.amendmentReason == "Revise the wording.")
+  #expect(amended.displayDigest != original.displayDigest)
+  #expect(amended.presentation.previewDigest != original.presentation.previewDigest)
+  #expect(String(decoding: amended.presentation.after, as: UTF8.self).contains("Use orange buttons."))
+  #expect(throws: (any Error).self) {
+    try queue.presented(original, messageReference: "stale-proposal")
+  }
+  #expect(throws: (any Error).self) {
+    try queue.decide(
+      original, action: "approve", decisionID: "stale-approval", responseReference: "old-answer")
+  }
+  #expect(throws: (any Error).self) {
+    try queue.decide(
+      amended, action: "approve", decisionID: "unshown-approval", responseReference: "early-answer")
+  }
+  try queue.presented(amended, messageReference: "amended-proposal")
+  let explained = try queue.amend(
+    amended,
+    amendment: MemoryBatchAmendment(replacement: replacement, reason: "Clarify the revised wording."),
+    clockDate: clock)
+  #expect(explained.presentation.after == amended.presentation.after)
+  #expect(explained.presentation.amendmentReason == "Clarify the revised wording.")
+  #expect(explained.presentation.previewDigest != amended.presentation.previewDigest)
+  #expect(explained.displayDigest != amended.displayDigest)
+  let state = try MemoryReviewEncoding.decode(
+    QueueLedger.self,
+    bytes: queue.directory.read("queue.json", maximum: MemoryReviewEncoding.maximumFileBytes))
+  #expect(state.shown.count == 1)
+  #expect(state.amendments?.count == 1)
+  #expect(state.intents.isEmpty)
+  #expect(state.receipts.isEmpty)
+  #expect(try fixture.main() == base)
+  try queue.presented(explained, messageReference: "explained-proposal")
+  let detached = try queue.decide(
+    explained, action: "detach", decisionID: "prepare-amendment", responseReference: "prepare-answer")
+  #expect(detached.status == "detached")
+  #expect(try fixture.main() == base)
+  let refreshed = try queue.claim(revision: row.finding.revision, request: request, clockDate: clock)
+  #expect(!refreshed.presentation.isDetachRequired)
+  #expect(refreshed.presentation.finding == original.presentation.finding)
+  #expect(refreshed.presentation.amendmentReason == "Clarify the revised wording.")
+  #expect(String(decoding: refreshed.presentation.after, as: UTF8.self).contains("Use orange buttons."))
+  try queue.presented(refreshed, messageReference: "prepared-proposal")
+  let approved = try queue.decide(
+    refreshed, action: "approve", decisionID: "approve-amendment", responseReference: "later-answer")
+  #expect(approved.status == "approved")
+  #expect(approved.commit == (try fixture.main()))
+  #expect(approved.displayDigest == refreshed.displayDigest)
+  #expect(try queue.recover(decisionID: "approve-amendment") == approved)
+  #expect(
+    try Git(repo: fixture.memory, environment: [:]).data(["show", "refs/heads/main:MEMORY.md"])
+      == refreshed.presentation.replacement)
+}
+
+@Test func queueAmendmentSurvivesOwnerReleaseAndOldCanonicalReaderRejectsIt() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  let queue = try queueFixture(fixture, sources: sources)
+  defer { queue.release() }
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let row = try #require(queue.list(request: request).first { $0.finding.operation == "update" })
+  let base = try fixture.main()
+  let originalBytes = try queue.directory.read(
+    "queue.json", maximum: MemoryReviewEncoding.maximumFileBytes)
+  _ = try MemoryReviewEncoding.decode(QueueLedgerBeforeAmendment.self, bytes: originalBytes)
+  let display = try queue.claim(revision: row.finding.revision, request: request)
+  try queue.presented(display, messageReference: "original-proposal")
+  var seen = Set<String>()
+  let annotations = (
+    MemoryDocument.sourceAnnotations(in: display.presentation.after)
+      + MemoryDocument.sourceAnnotations(in: display.presentation.before)
+  ).filter { seen.insert($0).inserted }
+  let replacement = "Use orange buttons. " + annotations.joined(separator: " ") + "\n"
+  _ = try queue.amend(
+    display, amendment: MemoryBatchAmendment(replacement: replacement, reason: "Retain the draft."))
+  let amendedBytes = try queue.directory.read(
+    "queue.json", maximum: MemoryReviewEncoding.maximumFileBytes)
+  #expect(throws: (any Error).self) {
+    try MemoryReviewEncoding.decode(QueueLedgerBeforeAmendment.self, bytes: amendedBytes)
+  }
+  queue.release()
+  let reopened = try queueFixture(fixture, sources: fixture.store())
+  defer { reopened.release() }
+  let later = try MemoryQueueRequest(sessionID: "later-session", requestID: "later-request")
+  let restored = try reopened.claim(revision: row.finding.revision, request: later)
+  #expect(restored.presentation.finding == display.presentation.finding)
+  #expect(restored.presentation.amendmentReason == "Retain the draft.")
+  #expect(String(decoding: restored.presentation.after, as: UTF8.self).contains("Use orange buttons."))
+  #expect(try fixture.main() == base)
+  #expect(throws: (any Error).self) {
+    try reopened.decide(
+      restored, action: "approve", decisionID: "restored-unshown", responseReference: "old-answer")
+  }
+  #expect(try fixture.main() == base)
+}
+
+private struct QueueLedgerBeforeAmendment: Codable {
+  let schemaVersion: Int
+  let binding: String
+  let findings: [MemoryQueueFinding]
+  let shown: [QueueShown]
+  let intents: [QueueDecisionIntent]
+  let receipts: [MemoryQueueReceipt]
+}

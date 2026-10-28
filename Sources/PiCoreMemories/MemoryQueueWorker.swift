@@ -49,7 +49,7 @@ private final class QueueInput: @unchecked Sendable {
           } else {
             guard
               [
-                "list", "claim", "release", "recover", "inventory", "finish", "cancel",
+                "list", "claim", "amend", "release", "recover", "inventory", "finish", "cancel",
                 "approved-list", "approved-get", "manage-preview", "manage-recover",
               ].contains(
                 type)
@@ -332,6 +332,29 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             management?.release()
             queue.release()
             try emit("released")
+          case "amend":
+            guard let current = display, managementDisplay == nil,
+              let amendment = object["amendment"] as? [String: Any]
+            else { throw WorkerError.protocolFailure }
+            try WorkerJSON.fields(object, tuple.union(["amendment"]))
+            try WorkerJSON.fields(amendment, ["replacement", "reason"])
+            try matchTuple(object, tuple: queueTuple(current))
+            input.expect(nil)
+            let amended = try queue.amend(
+              current,
+              amendment: MemoryBatchAmendment(
+                replacement: WorkerJSON.text(amendment, "replacement", maximum: 262_144),
+                reason: WorkerJSON.text(amendment, "reason", maximum: 16_384)))
+            display = amended
+            input.expect(queueTuple(amended))
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            try emit(
+              "presentation",
+              [
+                "display": encoded(amended),
+                "displayBytes": encoder.encode(amended.presentation).base64EncodedString(),
+              ])
           case "recover":
             try WorkerJSON.fields(object, header.union(["decisionID"]))
             let receipt = try queue.recover(decisionID: WorkerJSON.identifier(object, "decisionID"))

@@ -27,6 +27,20 @@ test("verified preview decodes complete exact annotations and final document ins
 	assert.equal(result.tuple.claimID, "private-claim");
 });
 
+test("amended preview shows its changed reason without replacing the historical reason", () => {
+	const original = presentation();
+	const reason = "Correct the wording from this conversation; preserve the original source.";
+	const payload = { ...original.display.presentation, amendmentReason: reason };
+	const encoded = Buffer.from(JSON.stringify(payload));
+	const frame = { ...original, display: { presentation: payload, displayDigest: sha(encoded) }, displayBytes: encoded.toString("base64") };
+	const result = decodeQueuePreview(frame, identity);
+	assert.ok(result.details.includes("amendmentReason:\n  " + reason));
+	assert.ok(result.details.includes(original.display.presentation.finding.reason));
+	assert.equal(result.digest, sha(encoded));
+	payload.amendmentReason = "A different reason must not reuse this display.";
+	assert.throws(() => decodeQueuePreview(frame, identity));
+});
+
 test("tampered digest, mismatched display, foreign request and oversized preview cannot authorize", () => {
 	const changedDigest = presentation(); changedDigest.display.displayDigest = "f".repeat(64);
 	assert.throws(() => decodeQueuePreview(changedDigest, identity));

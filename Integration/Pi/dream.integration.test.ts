@@ -5,7 +5,9 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DreamCoverage, DreamRequest, DreamStart } from "./dream.ts";
+type GuardedRegistryFixture = { streamSubscriptionSimple: (model: NonNullable<ExtensionContext["model"]>, context: Context, options: NonNullable<Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2]> & { onDispatch?: (physical: { provider: string; modelID: string; api: string }) => void }) => ReturnType<ExtensionContext["modelRegistry"]["streamSimple"]> };
 
 import { sdkURL, aiURL } from "./test/host.ts";
 const nativeDream = await import("./dream.ts");
@@ -109,8 +111,8 @@ test("real worker withholds provider error text, saves no response, and calls ag
 			options?.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
 			const reply: AssistantMessage = { role: "assistant", api: current.api, provider: current.provider, model: current.id, content: [{ type: "text", text: "PRIVATE PARTIAL RESPONSE" }], stopReason: "error", errorMessage: "fixture provider quota exceeded", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 			const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "error", reason: "error", error: reply }); return stream;
-		} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSubscriptionSimple">;
-		return dream.callDreamModel(request, { modelRegistry: registry as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, f.start.selection, signal);
+		} } satisfies GuardedRegistryFixture;
+		return dream.callDreamModel(request, { modelRegistry: registry as unknown as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, f.start.selection, signal);
 	}, new AbortController().signal);
 	assert.equal(report.status, "pending"); assert.equal(report.reason, "callbackFailure"); assert.equal(report.generation, "0"); assert.equal(calls, 1);
 	assert.equal(report.detail, "The dream model call did not complete.");
@@ -166,7 +168,7 @@ test("explicit worker replacement alone dispatches current selection and archive
 		const text = calls.length === 1 ? " \nInvalid café 🌱 reply\r\n " : JSON.stringify({ schemaVersion: 1, contextHash: payload.contextHash, decisions: payload.primaryEvidence.map((entry) => ({ kind: "noChange", sources: [entry.source], reasonCode: "notDurable", explanation: "Offline replacement." })) });
 		const reply: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [{ type: "text", text }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 		const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
-	} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSubscriptionSimple">;
+	} } satisfies GuardedRegistryFixture;
 	const ctx = { cwd: f.root, mode: "rpc", model: selectedModel, thinkingLevel: "off", waitForIdle: async () => {}, ui: { notify: () => {} }, modelRegistry: registry };
 	const launch = (start: DreamStart) => dream.runDreamWorker(start, (request, signal) => dream.callDreamModel(request, ctx as unknown as import("@earendil-works/pi-coding-agent").ExtensionContext, ctx.model, start.selection, signal), new AbortController().signal);
 	const memoryBefore = f.cli("render", "--repo", f.repo, "--cwd", f.root);
@@ -250,8 +252,8 @@ test("resumed worker dispatches current provider, model and thinking with exact 
 				assert.deepEqual(context.messages, saved!.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })));
 				const reply: AssistantMessage = { role: "assistant", api: current.api, provider: current.provider, model: current.id, content: [{ type: "text", text: decision(request) }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 				const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
-			} } satisfies Pick<Parameters<typeof dream.callDreamModel>[1]["modelRegistry"], "streamSubscriptionSimple">;
-			return dream.callDreamModel(request, { modelRegistry: registry as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, selection, signal);
+			} } satisfies GuardedRegistryFixture;
+			return dream.callDreamModel(request, { modelRegistry: registry as unknown as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, selection, signal);
 		}, new AbortController().signal);
 		assert.equal(report.status, "completed"); assert.equal(calls, 1);
 		assert.deepEqual(await Promise.all(names.map((name) => readFile(join(directory, name)))), frozen);
@@ -285,7 +287,7 @@ test("exclusions-only complete and no-new records never call registry", async (t
 	assert.equal((await dream.runDreamWorker(f.start, forbidden, new AbortController().signal)).status, "noNewRecords");
 });
 
-test("SDK subscription guard rejects custom virtual transport without changing logical selection", async (t) => {
+test("SDK custom virtual transport never receives a subscription-only request", async (t) => {
 	const f = await fixture(t);
 	const runtime = await sdk.ModelRuntime.create({ authPath: join(f.agent, "auth.json"), modelsPath: null, modelsStorePath: join(f.agent, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
 	const baseline = runtime.getModels("openai").find((item) => item.reasoning); assert.ok(baseline);
@@ -305,8 +307,9 @@ test("SDK subscription guard rejects custom virtual transport without changing l
 	const selection = { provider: captured.provider, modelID: captured.id, thinkingLevel: "medium" };
 	const request = { version: 1, type: "modelRequest", invocationID: "invocation", requestID: "run:" + "a".repeat(64), runID: "run", generation: "0", inputHash: "b".repeat(64), contextHash: "c".repeat(64), requestHash: "a".repeat(64), selection, systemPrompt: "EXACT saved context", messages: [{ role: "user", text: "saved input", timestampMilliseconds: 0 }] } as DreamRequest;
 	const registry = new sdk.ModelRegistry(runtime);
-	await assert.rejects(dream.callDreamModel(request, { modelRegistry: registry }, captured, selection, new AbortController().signal), /Subscription transport could not be established for offline-native\/physical/);
-	assert.equal(routes, 1); assert.equal(nativeCalls, 0); assert.equal(captured.api, "pi-virtual"); assert.equal(request.selection.thinkingLevel, "medium");
+	const isGuarded = "streamSubscriptionSimple" in registry && typeof registry.streamSubscriptionSimple === "function";
+	await assert.rejects(dream.callDreamModel(request, { modelRegistry: registry }, captured, selection, new AbortController().signal), isGuarded ? /Subscription transport could not be established for offline-native\/physical/ : /the selected route cannot guarantee subscription-only dreaming/);
+	assert.equal(routes, isGuarded ? 1 : 0); assert.equal(nativeCalls, 0); assert.equal(captured.api, "pi-virtual"); assert.equal(request.selection.thinkingLevel, "medium");
 });
 
 function contentHash(context: Context): string {

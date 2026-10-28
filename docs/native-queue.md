@@ -38,7 +38,7 @@ All frames are newline-delimited UTF-8 JSON objects. Input frames must be shorte
 
 Opaque identifiers match `[A-Za-z0-9._:-]{1,256}`. This includes invocation, session, request, decision, and host-message references. The host can map a longer locator to a stable opaque identifier. Counters in the new queue records are canonical decimal strings. Digests are full lowercase SHA-256 hex. Git object IDs retain their native full length. Byte fields use standard padded base64 without line breaks. Optional Codable fields are omitted when absent, not encoded as null. Legacy `SavedDreamRun` inventory fields retain their existing numeric encoding.
 
-Descriptor 3 must be an inherited, owned anonymous pipe or unnamed connected Unix socket. Named pipes, listening sockets, files, and foreign endpoints fail. The descriptor is close-on-exec before Git runs. Only descriptor 3 accepts `presented`, `choice`, `manage-presented`, and `manage-choice`. Ordinary stdin, model text, restored transcripts, and generated answers cannot approve.
+Descriptor 3 must be an inherited, owned anonymous pipe or unnamed connected Unix socket. Named pipes, listening sockets, files, and foreign endpoints fail. The descriptor is close-on-exec before Git runs. Only descriptor 3 accepts `presented`, `reply`, `manage-presented`, and `manage-reply`. The retired `choice` and `manage-choice` frames are rejected, including frames that assert `isInteractive:true`. Ordinary stdin, model text, restored transcripts, and generated answers cannot approve.
 
 One live controller owns the whole review store from successful `claim` through disposition or release. Other owners receive `busy`. List and inventory normally acquire ownership only for their operation, so they can also report busy during another session's review. Queue file locks are short-lived and never held while waiting for a person. No heartbeat timeout steals a live lock. EOF on either host channel, explicit finish/cancel, helper death, and settled choices release ownership. A connected hung host remains busy until it releases or closes.
 
@@ -94,7 +94,7 @@ The host must display the complete exact proposal and annotations, old/final byt
 
 Native reserves shown-for-request suppression before emitting the presentation. A crash around display can therefore suppress a question that was never visible. It never grants approval.
 
-## Private display and choice operations
+## Private display and original-reply operations
 
 Both private operations include this full tuple in addition to the common header:
 
@@ -106,7 +106,11 @@ Every value must exactly match the current presentation. Native accepts only one
 
 `presented` adds `messageReference`. The host sends it only after installing the exact visible payload. Native persists the reference and emits `presented` with `displayDigest`. The host waits for that acknowledgement before accepting a later explicit user reply for the exact displayed proposal.
 
-`choice` adds `action`, `decisionID`, `responseReference`, and Boolean `isInteractive:true`. Actions are `approve`, `reject`, `defer`, or `detach`. The response reference must differ from the display-message reference. `isInteractive` is a trusted host attestation, not native proof of human origin. The private endpoint and claim must never enter model context or background-worker inputs.
+`reply` adds `originalText`, `submittedText`, `decisionID`, and `responseReference`. It accepts no action, approval flag, or input-source label. The installed bridge must obtain both texts from the native host's live proposal-bound reply, not a model argument. The response reference must differ from the display-message reference. The private endpoint, claim, and original reply must never enter model context or background-worker inputs. Owning the endpoint does not prove human identity.
+
+The Swift interpreter derives the decision from the complete original reply and the immutable native operation. It recognizes a small family of unconditional memory-specific expressions, such as saving a displayed addition, forgetting a displayed deletion, rejecting a memory suggestion, or leaving it for later. An explicit approval of the displayed memory change can approve that exact operation. Case, whitespace, and modest polite wording do not require a command or menu. This is not a general natural-language interpreter.
+
+Bare agreement, quoted instructions, conditions, corrections, multiple actions, or disagreement between original and submitted text do not authorize a change. Native emits `reply-clarify` with `status:"no-decision"` and retains the same claim and acknowledged preview. A later bare yes remains insufficient; asking a clarification does not establish which conversational question it answers. A new operation-specific reply may continue the same unchanged proposal. Amendments require release and a fresh exact preview. No decision intent is written for clarification.
 
 `detach` is a separate explicit checkout-preparation choice. It cannot approve memory. After a checked detached receipt, claim and display a fresh preview, then obtain a new explicit choice and decision key. This continuation can use the same request identity. An old yes never authorizes the fresh preview.
 
@@ -136,7 +140,9 @@ Offsets are native numeric UTF-8 byte offsets. Expected/replacement values are e
 
 The management `display` is a flat object containing `claimID`, decimal `sequence`, `request:{sessionID,requestID}`, `operation`, `reason`, scope `path`, `currentBase`, base64 effect `before`/`after`, base64 full-document `documentBefore`/final `replacement`, `previewDigest`, `isDetachRequired`, `checkoutCommit`, `checkoutDigest`, and `displayDigest`. `displayBytes` is the canonical sorted-key, unescaped-slash JSON object with **only `displayDigest` removed**. SHA-256(decoded displayBytes) equals displayDigest. Verify these native bytes rather than recreating JSON. Display all exact decoded before/final/annotation/scope bytes and reason before enabling the choice. Base64 alone, truncation, paraphrase, partial text, or hidden attachments do not constitute publication.
 
-Descriptor 3 accepts `manage-presented` with the common header, the full queue tuple (`revision` is **currentBase**, not a candidate digest), and `messageReference`. After exact chat presentation and native `manage-presented` acknowledgement, a fresh verified user reply may authorize `manage-choice` with the same tuple plus `action`, `decisionID`, `responseReference`, and Boolean `isInteractive:true`. Action is `approve` or separately `detach`. An attached checkout cannot approve. Detach cannot save memory: after its checked receipt, obtain a new preview/publication and explicit decision. `release`, finish, either EOF, and helper death invalidate active preview authority. There is only one active inferred or management presentation.
+Descriptor 3 accepts `manage-presented` with the common header, the full queue tuple (`revision` is **currentBase**, not a candidate digest), and `messageReference`. After exact chat presentation and native acknowledgement, `manage-reply` carries that tuple plus `originalText`, `submittedText`, `decisionID`, and `responseReference`. It uses the same original-reply interpreter as inferred findings. Clear intent can approve the exact operation or separately prepare checkout detachment. An unclear reply retains the preview and emits `reply-clarify`. Rejection or deferral releases the manual proposal and emits `manage-cancelled` with `status:"not-saved"`, without inventing a saved or queue-disposition receipt.
+
+An attached checkout cannot approve. Detach cannot save memory: after its checked receipt, obtain a new preview and a new explicit decision. `release`, finish, either EOF, and helper death invalidate active preview authority. There is only one active inferred or management presentation.
 
 `manage-decision.receipt` has `decisionID`, `displayDigest`, `status`, and optional `commit`/`auditRef`. Only `approved` with a checked native batch receipt proves saved memory. `detached` is checkout preparation only; `outcome-unresolved` does not prove mutation. Intent files (`management-<decisionID>.json`) preserve the exact display, native draft, action and opaque live response reference before mutation. Recovery verifies the native journal/publication or detach outcome and never reconstructs approval. On stale base, changed configuration/checkout/bytes, or failed publication, release and obtain a fresh exact preview and explicit decision. Recovered drafts or model/stdin frames cannot approve.
 
@@ -193,10 +199,10 @@ After the `presentation` is fully installed, send on descriptor 3:
 {"version":1,"type":"presented","invocationID":"fixture-review","claimID":"<claimID>","sequence":"<sequence>","revision":"<revision>","previewDigest":"<previewDigest>","displayDigest":"<displayDigest>","sessionID":"fixture-session","requestID":"fixture-request","messageReference":"fixture-display"}
 ```
 
-After its acknowledgement and a new live explicit human choice, send on descriptor 3:
+After its acknowledgement, the synthetic fixture can supply the following original reply on descriptor 3. A production bridge must obtain the text from the native host, not copy this example as approval:
 
 ```json
-{"version":1,"type":"choice","invocationID":"fixture-review","claimID":"<claimID>","sequence":"<sequence>","revision":"<revision>","previewDigest":"<previewDigest>","displayDigest":"<displayDigest>","sessionID":"fixture-session","requestID":"fixture-request","action":"approve","decisionID":"fixture-save-1","responseReference":"fixture-human-response","isInteractive":true}
+{"version":1,"type":"reply","invocationID":"fixture-review","claimID":"<claimID>","sequence":"<sequence>","revision":"<revision>","previewDigest":"<previewDigest>","displayDigest":"<displayDigest>","sessionID":"fixture-session","requestID":"fixture-request","originalText":"Save that memory","submittedText":"Save that memory","decisionID":"fixture-save-1","responseReference":"fixture-original-response"}
 ```
 
 If the host loses the result, reconnect with the same configuration and use stdin:

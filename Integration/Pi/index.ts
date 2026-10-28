@@ -6,7 +6,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { buildCommand, clearBuildResult, commandPath, commandReady } from "./command.ts";
 import { registerDreamHistory } from "./dream.ts";
 import { registerQueuedRuntime } from "./queued-runtime.ts";
-import { registerMemoryManagement } from "./management.ts";
 import { filterMemoryMessages, isSnapshotOnBranch, memoryMessage, withSavedSnapshot, type MemoryScope } from "./policy.ts";
 
 export type Render = (scope: MemoryScope, signal: AbortSignal) => Promise<string>;
@@ -42,7 +41,6 @@ function scopeOf(ctx: ExtensionContext): MemoryScope {
 
 export default function coreMemories(pi: ExtensionAPI, render: Render = renderApproved): void {
 	registerDreamHistory(pi);
-	registerMemoryManagement(pi);
 	registerQueuedRuntime(pi);
 	let controller: AbortController | undefined;
 	let warnedSessionId: string | undefined;

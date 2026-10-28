@@ -1,7 +1,7 @@
 {
   "name": "pi-core-memories",
   "version": "0.1.0",
-  "description": "Approved memories and inspectable dreams for Pi, with a native Mac editor.",
+  "description": "Approved memories and background dreaming through ordinary Pi conversation.",
   "type": "module",
   "license": "MIT",
   "keywords": [

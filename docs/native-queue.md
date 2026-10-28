@@ -2,7 +2,7 @@
 
 `memory-queue-worker` is the internal storage and approval protocol for the foreground conversation. It is not a slash command, review mode, or user-operated queue. It does not schedule intake, run a model, or establish that an input came from a human. The host owns request identity, exact visible chat rendering, and the later explicit user reply. Pending findings are not approved memories.
 
-The ordinary-chat approval transport remains incomplete. The host must establish a trusted original user submission and bind it to the exact displayed proposal. Model text, an interactive source label, restored messages, and autonomous guidance do not establish that authority. Until the transport can prove it, writes remain blocked. A separate dialog or manual command is not an alternate route.
+The Pi consumer keeps one native worker across exact proposal presentation and a later ordinary-chat reply. The native host supplies the original and submitted reply texts, bound to the displayed proposal. Model text, an interactive source label, restored messages, and autonomous guidance do not establish that authority. Hosts without the native conversation capability block publication, with no direct-write fallback. Candidate amendments are not yet connected to this consumer. A separate dialog or manual command is not an alternate route.
 
 ## Internal worker and roots
 

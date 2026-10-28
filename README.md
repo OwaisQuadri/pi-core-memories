@@ -17,11 +17,15 @@ diagnostic interfaces. They are not the user interface.
 
 ## Implementation status
 
-The native queue, checked publisher, background scheduler, and approved-memory
-loader exist. The ordinary-chat approval transport is not complete yet.
-Removing commands does not complete that transport. The old modal approval
-adapter is also removed. Queue inspection and checked receipt recovery remain
-available, but the queue tool does not expose review or write operations.
+The source includes an ordinary-chat consumer for unchanged findings and
+explicitly requested memory changes. It installs the exact native proposal in
+chat and keeps one worker for the user's reply on a later turn. The host supplies
+the original reply; the model cannot supply approval through tool arguments.
+The old modal approval adapter is removed, with no command or dialog fallback.
+
+Candidate-amendment wiring, complete installed background-to-chat verification,
+and migration still need acceptance. Source implementation does not authorize
+removal of the old application or its retained data.
 
 The conversation must have a trusted record of the exact proposal that was
 displayed and the user's later explicit reply. A model's description of a reply,

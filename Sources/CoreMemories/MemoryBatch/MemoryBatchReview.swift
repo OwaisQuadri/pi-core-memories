@@ -238,7 +238,9 @@ extension MemoryReviewController {
   }
 
   func indexLegacyPublications() throws {
-    var index: [String: VerifiedMemoryPublication] = [:]
+    let manager = try MemoryManagement(
+      repository: repository, environment: store.reviewGit.environment)
+    var index = try manager.verifiedDirectPublications()
     for attempt in approvals.values {
       guard index[attempt.resultCommit] == nil else { throw DreamRunError.corruption }
       let payload = attempt.preview

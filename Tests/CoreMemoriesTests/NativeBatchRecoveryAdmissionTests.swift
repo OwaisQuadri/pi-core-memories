@@ -457,51 +457,67 @@ func nativeRecoverySelectionIsReadOnlyAndAcknowledgedManualCreationReleasesDetai
   model.editorReason = "Retain the original request"
   model.editorChanged()
   let autosave = try #require(model.autosaveTask)
-  let deadline = ContinuousClock.now + .seconds(5)
-  while await control.requests.count == initialRequestCount && ContinuousClock.now < deadline {
-    await Task.yield()
+  let completion = Task {
+    await autosave.value
+    await control.pauseOperationCompleted()
   }
-  try #require(await control.requests.count == initialRequestCount + 1)
-  let pending = try #require(await model.workspace.pendingPersistence)
-  let generation = model.workspaceGeneration
-  let saveID = try memoryBatchDigest(pending.request.draft)
-  let receipt = MemoryBatchReceipt(
-    saveID: saveID, draftID: pending.request.draft.draftID,
-    revision: pending.request.draft.revision, base: pending.request.draft.baseCommit,
-    commit: nil, auditRef: nil)
-  await model.handleSave(.saved(receipt))
-  try #require(model.workspaceGeneration != generation)
-  try #require(model.message == "Saved changes in one commit")
-  try #require(model.draftFailure == nil)
-  await control.resumeWrites(
-    isFailing: !isAfterInstall, isFailingAfterInstall: isAfterInstall)
-  await autosave.value
-  #expect(
-    model.message == "Saved changes in one commit",
-    "A retired autosave must not repaint successful Save feedback")
-  #expect(model.draftFailure == nil, "A retired autosave must not attach a stale draft failure")
-  #expect(model.failure == nil)
-  #expect(model.batchProjection == nil)
-  #expect(model.isWaitingForIndependentManualWork)
-  #expect(model.draftRecoveries.map(\.failure.saveID) == [try memoryBatchDigest(retained.draft)])
-  #expect(await model.workspace.currentDraft?.draftID == pending.request.draft.draftID)
-  let failed = try #require(await model.workspace.pendingPersistence)
-  #expect(failed.id == pending.id)
-  #expect(failed.task == nil)
-  #expect(failed.request.sessionID == pending.request.sessionID)
-  #expect(failed.request.expectedDigest == pending.request.expectedDigest)
-  #expect(try memoryBatchDigest(failed.request.draft) == saveID)
-  await control.resumeWrites()
-  _ = try await model.workspace.persistBatch()
-  let requests = Array(await control.requests.dropFirst(initialRequestCount))
-  try #require(requests.count == 2)
-  #expect(try memoryBatchDigest(requests[0]) == memoryBatchDigest(requests[1]))
-  #expect(await model.workspace.pendingPersistence == nil)
-  #expect(await model.workspace.currentDraft?.draftID == pending.request.draft.draftID)
-  #expect(try fixture.main() == base, "The simulated Save must not claim core publication")
-  let after = try fixture.snapshot(journal)
-  for (path, bytes) in recoveryBefore { #expect(after[path] == bytes) }
-  try await model.shutdown()
+  do {
+    let isHeld = await control.isWritePaused(after: initialRequestCount)
+    try #require(
+      isHeld, "Autosave finished before writer admission: \(String(describing: model.draftFailure))"
+    )
+    let requestCount = await control.requests.count
+    try #require(requestCount == initialRequestCount + 1)
+    let pending = try #require(await model.workspace.pendingPersistence)
+    let generation = model.workspaceGeneration
+    let saveID = try memoryBatchDigest(pending.request.draft)
+    let receipt = MemoryBatchReceipt(
+      saveID: saveID, draftID: pending.request.draft.draftID,
+      revision: pending.request.draft.revision, base: pending.request.draft.baseCommit,
+      commit: nil, auditRef: nil)
+    await model.handleSave(.saved(receipt))
+    try #require(model.workspaceGeneration != generation)
+    try #require(model.message == "Saved changes in one commit")
+    try #require(model.draftFailure == nil)
+    await control.resumeWrites(
+      isFailing: !isAfterInstall, isFailingAfterInstall: isAfterInstall)
+    await autosave.value
+    await completion.value
+    #expect(
+      model.message == "Saved changes in one commit",
+      "A retired autosave must not repaint successful Save feedback")
+    #expect(model.draftFailure == nil, "A retired autosave must not attach a stale draft failure")
+    #expect(model.failure == nil)
+    #expect(model.batchProjection == nil)
+    #expect(model.isWaitingForIndependentManualWork)
+    #expect(model.draftRecoveries.map(\.failure.saveID) == [try memoryBatchDigest(retained.draft)])
+    #expect(await model.workspace.currentDraft?.draftID == pending.request.draft.draftID)
+    let failed = try #require(await model.workspace.pendingPersistence)
+    #expect(failed.id == pending.id)
+    #expect(failed.task == nil)
+    #expect(failed.request.sessionID == pending.request.sessionID)
+    #expect(failed.request.expectedDigest == pending.request.expectedDigest)
+    #expect(try memoryBatchDigest(failed.request.draft) == saveID)
+    await control.resumeWrites()
+    _ = try await model.workspace.persistBatch()
+    let requests = Array(await control.requests.dropFirst(initialRequestCount))
+    try #require(requests.count == 2)
+    #expect(try memoryBatchDigest(requests[0]) == memoryBatchDigest(requests[1]))
+    #expect(await model.workspace.pendingPersistence == nil)
+    #expect(await model.workspace.currentDraft?.draftID == pending.request.draft.draftID)
+    #expect(try fixture.main() == base, "The simulated Save must not claim core publication")
+    let after = try fixture.snapshot(journal)
+    for (path, bytes) in recoveryBefore { #expect(after[path] == bytes) }
+    try await model.shutdown()
+  } catch {
+    let pendingAutosave = model.autosaveTask
+    pendingAutosave?.cancel()
+    await control.resumeWrites()
+    await autosave.value
+    await pendingAutosave?.value
+    await completion.value
+    throw error
+  }
 }
 
 @Test(arguments: [false, true])
@@ -528,54 +544,71 @@ func nativeAutosaveCurrentOwnerFailureRetainsNewerInputAndExactRetry(isAfterInst
   model.editorReason = "First reason"
   model.editorChanged()
   let autosave = try #require(model.autosaveTask)
-  let deadline = ContinuousClock.now + .seconds(5)
-  while await control.requests.count == initialRequestCount && ContinuousClock.now < deadline {
-    await Task.yield()
+  let completion = Task {
+    await autosave.value
+    await control.pauseOperationCompleted()
   }
-  try #require(await control.requests.count == initialRequestCount + 1)
-  let pending = try #require(await model.workspace.pendingPersistence)
-  model.editorText = fact("Newer exact text while the first request is held.")
-  model.editorReason = "Newer exact reason"
-  model.editorChanged()
-  let newerAutosave = try #require(model.autosaveTask)
-  newerAutosave.cancel()
-  await control.resumeWrites(
-    isFailing: !isAfterInstall, isFailingAfterInstall: isAfterInstall)
-  await autosave.value
-  await newerAutosave.value
-  #expect(model.draftFailure != nil, "Cancellation does not acknowledge a current owner's failure")
-  #expect(model.message == "Draft not yet persisted")
-  #expect(model.failure == nil)
-  #expect(model.isInputDirty)
-  #expect(model.isDraftDirty)
-  #expect(model.editorText == fact("Newer exact text while the first request is held."))
-  #expect(model.editorReason == "Newer exact reason")
-  let failed = try #require(await model.workspace.pendingPersistence)
-  #expect(failed.id == pending.id)
-  #expect(failed.task == nil)
-  #expect(failed.request.sessionID == pending.request.sessionID)
-  #expect(failed.request.expectedDigest == pending.request.expectedDigest)
-  #expect(try memoryBatchDigest(failed.request.draft) == memoryBatchDigest(pending.request.draft))
-  await control.resumeWrites()
-  try await model.flushInputAndPersistence()
-  let requests = Array(await control.requests.dropFirst(initialRequestCount))
-  try #require(requests.count == 3)
-  #expect(try memoryBatchDigest(requests[0]) == memoryBatchDigest(requests[1]))
-  #expect(requests[2].revision > requests[1].revision)
-  #expect(Set(requests.map(\.draftID)) == [pending.request.draft.draftID])
-  guard case .manual(let latest) = requests[2].batch?.items.first?.intent else {
-    throw MemoryError("Expected retained newer manual input")
+  do {
+    let isHeld = await control.isWritePaused(after: initialRequestCount)
+    try #require(
+      isHeld, "Autosave finished before writer admission: \(String(describing: model.draftFailure))"
+    )
+    let requestCount = await control.requests.count
+    try #require(requestCount == initialRequestCount + 1)
+    let pending = try #require(await model.workspace.pendingPersistence)
+    model.editorText = fact("Newer exact text while the first request is held.")
+    model.editorReason = "Newer exact reason"
+    model.editorChanged()
+    let newerAutosave = try #require(model.autosaveTask)
+    newerAutosave.cancel()
+    await control.resumeWrites(
+      isFailing: !isAfterInstall, isFailingAfterInstall: isAfterInstall)
+    await autosave.value
+    await newerAutosave.value
+    await completion.value
+    #expect(
+      model.draftFailure != nil, "Cancellation does not acknowledge a current owner's failure")
+    #expect(model.message == "Draft not yet persisted")
+    #expect(model.failure == nil)
+    #expect(model.isInputDirty)
+    #expect(model.isDraftDirty)
+    #expect(model.editorText == fact("Newer exact text while the first request is held."))
+    #expect(model.editorReason == "Newer exact reason")
+    let failed = try #require(await model.workspace.pendingPersistence)
+    #expect(failed.id == pending.id)
+    #expect(failed.task == nil)
+    #expect(failed.request.sessionID == pending.request.sessionID)
+    #expect(failed.request.expectedDigest == pending.request.expectedDigest)
+    #expect(try memoryBatchDigest(failed.request.draft) == memoryBatchDigest(pending.request.draft))
+    await control.resumeWrites()
+    try await model.flushInputAndPersistence()
+    let requests = Array(await control.requests.dropFirst(initialRequestCount))
+    try #require(requests.count == 3)
+    #expect(try memoryBatchDigest(requests[0]) == memoryBatchDigest(requests[1]))
+    #expect(requests[2].revision > requests[1].revision)
+    #expect(Set(requests.map(\.draftID)) == [pending.request.draft.draftID])
+    guard case .manual(let latest) = requests[2].batch?.items.first?.intent else {
+      throw MemoryError("Expected retained newer manual input")
+    }
+    #expect(latest.request.replacement == model.editorText)
+    #expect(latest.request.reason == model.editorReason)
+    #expect(await control.maximumInFlight == 1)
+    #expect(await model.workspace.pendingPersistence == nil)
+    #expect(!model.isDraftDirty)
+    #expect(model.draftFailure == nil)
+    #expect(model.draftRecoveries.map(\.failure.saveID) == [try memoryBatchDigest(retained.draft)])
+    let after = try fixture.snapshot(journal)
+    for (path, bytes) in recoveryBefore { #expect(after[path] == bytes) }
+    try await model.shutdown()
+  } catch {
+    let pendingAutosave = model.autosaveTask
+    pendingAutosave?.cancel()
+    await control.resumeWrites()
+    await autosave.value
+    await pendingAutosave?.value
+    await completion.value
+    throw error
   }
-  #expect(latest.request.replacement == model.editorText)
-  #expect(latest.request.reason == model.editorReason)
-  #expect(await control.maximumInFlight == 1)
-  #expect(await model.workspace.pendingPersistence == nil)
-  #expect(!model.isDraftDirty)
-  #expect(model.draftFailure == nil)
-  #expect(model.draftRecoveries.map(\.failure.saveID) == [try memoryBatchDigest(retained.draft)])
-  let after = try fixture.snapshot(journal)
-  for (path, bytes) in recoveryBefore { #expect(after[path] == bytes) }
-  try await model.shutdown()
 }
 
 @Test(arguments: ["unloaded", "missing", "corrupt", "changed"])

@@ -230,6 +230,75 @@ package final class MemoryManagement {
       path: path, range: range, insertion: insertion, document: replacement, audit: auditBytes)
   }
 
+  func verifiedDirectPublications() throws -> [String: VerifiedMemoryPublication] {
+    let refs = try git.text([
+      "for-each-ref", "--count=10001", "--format=%(refname)", "refs/memory-management/changes/",
+    ]).split(separator: "\n").map(String.init)
+    guard refs.count <= 10_000 else { throw DreamRunError.limitExceeded }
+    guard !refs.isEmpty else { return [:] }
+    let main = try store.approvedCommit()
+    let objects = try ReviewGitObjects(git: git)
+    defer { objects.close() }
+    let title = Data("Core memory direct management\n\n".utf8)
+    var publications: [String: VerifiedMemoryPublication] = [:]
+    var retainedBytes = 0
+    for ref in refs {
+      guard let commit = try MemoryBatchReplay.directCommit(ref, git: git),
+        publications[commit] == nil,
+        try MemoryBatchReplay.isAncestor(commit, of: main, git: git)
+      else { throw DreamRunError.corruption }
+      let raw = try objects.contents(
+        commit, type: "commit", maximumBytes: MemoryReviewEncoding.maximumFileBytes)
+      guard let split = raw.range(of: Data([10, 10])) else {
+        throw DreamRunError.corruption
+      }
+      let message = Data(raw[split.upperBound...])
+      guard message.starts(with: title), message.last == 10 else {
+        throw DreamRunError.corruption
+      }
+      let auditBytes = Data(message.dropFirst(title.count).dropLast())
+      let audit = try MemoryReviewEncoding.decode(MemoryManagementAudit.self, bytes: auditBytes)
+      let headers = String(decoding: raw[..<split.lowerBound], as: UTF8.self).split(separator: "\n")
+      guard audit.schemaVersion == 1, audit.origin == "explicit-user-request-agent-rule",
+        [.add, .update, .delete].contains(audit.operation), MemoryStore.isFullOID(audit.base),
+        headers.filter({ $0.hasPrefix("parent ") }) == [Substring("parent " + audit.base)],
+        ref == "refs/memory-management/changes/\(SourceDigest(bytes: auditBytes).rawValue)"
+      else { throw DreamRunError.corruption }
+      let instant = try MemoryDocument.ReviewInstant(audit.revised)
+      guard let date = ISO8601DateFormatter().date(from: instant.rawValue),
+        audit.operation != .add || audit.identity != nil
+      else { throw DreamRunError.corruption }
+      let snapshot = try store.reviewSnapshot(base: audit.base)
+      let request = MemoryManagementRequest(
+        operation: audit.operation, base: audit.base, path: audit.path,
+        locator: audit.locator, expected: audit.operation == .add ? nil : audit.before,
+        replacement: audit.operation == .delete
+          ? nil : try MemoryDocument.editableEntry(Data(audit.after.utf8)), reason: audit.reason)
+      let change = try prepare(
+        request, snapshot: snapshot, date: date,
+        newIdentity: audit.identity ?? memoryBatchIdentity("direct:\(commit)"))
+      guard change.audit == auditBytes else { throw DreamRunError.corruption }
+      try MemoryBatchReplay.validateReplacements(
+        [change.path: change.document], base: audit.base, commit: commit, store: store)
+      let before = snapshot.documents.first { $0.path == change.path }?.bytes
+      let range = before == nil ? 0..<0 : change.range
+      let insertion = before == nil ? change.document : change.insertion
+      let original = before.map { Data($0[range]) } ?? Data()
+      retainedBytes += raw.count + original.count + insertion.count
+      guard retainedBytes <= MemoryReviewEncoding.maximumStateBytes else {
+        throw DreamRunError.limitExceeded
+      }
+      let effect = MemoryBatchEffect(
+        itemID: memoryBatchIdentity("direct:\(commit)"), path: change.path,
+        start: range.lowerBound, end: range.upperBound, before: original, after: insertion,
+        identity: audit.identity, originalReviewedProposal: nil, additionStyle: .manual,
+        readAnchors: [])
+      publications[commit] = VerifiedMemoryPublication(
+        base: audit.base, commit: commit, effects: [effect])
+    }
+    return publications
+  }
+
   private func publish(
     base: String, path: String, replacement: Data, auditBytes: Data,
     title: String = "Core memory direct management"

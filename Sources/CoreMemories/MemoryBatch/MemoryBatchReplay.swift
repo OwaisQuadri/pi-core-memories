@@ -88,11 +88,19 @@ enum MemoryBatchReplay {
       ],
       try Data(raw[split.upperBound...]) == message(manifest)
     else { throw DreamRunError.corruption }
-    let before = try store.reviewSnapshot(base: manifest.draft.baseCommit)
+    try validateReplacements(
+      composition.replacements, base: manifest.draft.baseCommit, commit: commit, store: store)
+  }
+
+  static func validateReplacements(
+    _ replacements: [String: Data], base: String, commit: String, store: MemoryStore
+  ) throws {
+    let git = store.reviewGit
+    let before = try store.reviewSnapshot(base: base)
     let after = try store.reviewSnapshot(base: commit)
     var layout = Dictionary(
       uniqueKeysWithValues: before.layoutEntries.map { ($0.path, ($0.mode, $0.blob)) })
-    for (path, bytes) in composition.replacements {
+    for (path, bytes) in replacements {
       layout[path] = (
         "100644", try git.text(["hash-object", "--stdin", "--no-filters"], input: bytes)
       )
@@ -102,7 +110,7 @@ enum MemoryBatchReplay {
         layout[entry.path].map { $0.0 == entry.mode && $0.1 == entry.blob } ?? false
       }),
       try git.committedChangedPathBytes(from: before.base, to: commit)
-        == Data((composition.replacements.keys.sorted().joined(separator: "\0") + "\0").utf8)
+        == Data((replacements.keys.sorted().joined(separator: "\0") + "\0").utf8)
     else { throw MemoryError("batch receipt tree differs from the complete reviewed composition") }
   }
 

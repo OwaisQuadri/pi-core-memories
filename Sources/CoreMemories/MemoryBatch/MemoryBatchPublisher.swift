@@ -303,7 +303,7 @@ final class MemoryBatchPublisher {
     let payload = preview.payload
     let intent = MemoryBatchCandidateIntent(
       candidateID: payload.candidateID, admissionHash: payload.admissionHash, choice: .accept,
-      identity: payload.identity, instant: payload.instant, amendment: nil)
+      identity: payload.identity, instant: payload.instant, amendment: payload.amendment)
     let item = MemoryBatchItem(
       itemID: memoryBatchIdentity("candidate:\(payload.candidateID)"), generation: 0,
       intent: .candidate(intent))

@@ -138,6 +138,7 @@ package struct MemoryQueuePresentation: Codable, Equatable {
   package let isDetachRequired: Bool
   package let checkoutCommit: String
   package let checkoutDigest: String
+  package var amendmentReason: String? = nil
 }
 
 package struct MemoryQueueDisplay: Codable, Equatable {
@@ -171,6 +172,11 @@ package struct MemoryQueueReceipt: Codable, Equatable {
   package let auditRef: String?
 }
 
+struct QueueAmendment: Codable {
+  let revision: String
+  let amendment: MemoryBatchAmendment
+}
+
 struct QueueLedger: Codable {
   let schemaVersion: Int
   let binding: String
@@ -178,4 +184,5 @@ struct QueueLedger: Codable {
   var shown: [QueueShown] = []
   var intents: [QueueDecisionIntent] = []
   var receipts: [MemoryQueueReceipt] = []
+  var amendments: [QueueAmendment]? = nil
 }

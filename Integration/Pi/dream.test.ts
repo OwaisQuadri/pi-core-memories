@@ -3,8 +3,9 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { join } from "node:path";
 import { test } from "node:test";
 import type { AssistantMessage, AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, SubscriptionSimpleStreamOptions } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DreamRequest, DreamSelection, DreamStart } from "./dream.ts";
+type SubscriptionSimpleStreamOptions = NonNullable<Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2]> & { onDispatch?: (physical: { provider: string; modelID: string; api: string }) => void };
 
 import { tuiURL } from "./test/host.ts";
 const dream = await import("./dream.ts");
@@ -127,10 +128,47 @@ test("missing done, mismatched done/result, post-terminal updates, partial tools
 	}
 });
 
-test("missing subscription guard refuses the old ordinary stream before dispatch", async () => {
+test("unsupported stock route refuses ordinary streaming before dispatch", async () => {
 	const ctx = { modelRegistry: { streamSimple: () => assert.fail("Ordinary streaming must not substitute for subscription dispatch") } } as unknown as ExtensionContext;
-	await assert.rejects(dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: subscription request guard is unavailable; update Pi before dreaming" });
+	await assert.rejects(dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: the selected route cannot guarantee subscription-only dreaming on this Pi SDK; nothing was dispatched" });
 });
+
+for (const scenario of ["valid", "api-key", "not-subscription", "changed", "missing-auth", "missing-key"]) {
+	test(`stock subscription provider ${scenario} uses only the captured public route`, async () => {
+		let calls = 0; let lookups = 0; let authCalls = 0;
+		const provider = {
+			id: model.provider,
+			auth: { oauth: { isSubscription: scenario !== "not-subscription" }, ...(scenario === "api-key" ? { apiKey: {} } : {}) },
+			streamSimple(current: typeof model, context: Context, options: { apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }) {
+				calls++; assert.equal(current.id, model.id); assert.equal(options.apiKey, "synthetic-subscription");
+				assert.equal(current.baseUrl, "https://selected-model.invalid");
+				assert.deepEqual(options.headers, { "x-selected-model": "synthetic-header" });
+				assert.deepEqual(options.env, { SYNTHETIC_REQUEST: "selected-model" });
+				assert.equal(context.messages[0].role, "system");
+				return { async *[Symbol.asyncIterator]() { yield { type: "done", reason: "stop", message: message() }; }, result: async () => message() };
+			},
+		};
+		const ctx = { modelRegistry: {
+			getProvider: () => { lookups++; return scenario === "changed" && lookups > 1 ? { ...provider } : provider; },
+			getRegisteredProviderConfig: () => undefined,
+			getRegisteredNativeProvider: () => undefined,
+			getProviderAuth: async () => assert.fail("Provider-only auth would drop selected-model headers."),
+			getApiKeyAndHeaders: async (current: typeof model) => {
+				authCalls++; assert.strictEqual(current, model);
+				return scenario === "missing-auth" ? { ok: false, error: "Synthetic auth unavailable." } : { ok: true, apiKey: scenario === "missing-key" ? undefined : "synthetic-subscription", baseUrl: "https://selected-model.invalid", headers: { "x-selected-model": "synthetic-header" }, env: { SYNTHETIC_REQUEST: "selected-model" } };
+			},
+			streamSimple: () => assert.fail("Stock dispatch must not resolve credentials a second time."),
+		} } as unknown as ExtensionContext;
+		if (scenario === "valid") {
+			assert.equal(await dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), " {🌱} \n");
+			assert.equal(calls, 1); assert.equal(authCalls, 1);
+		} else {
+			await assert.rejects(dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), /nothing was dispatched/);
+			assert.equal(calls, 0);
+			if (scenario === "api-key" || scenario === "not-subscription") assert.equal(authCalls, 0);
+		}
+	});
+}
 
 test("registry cancellation rejects a stalled stream immediately and passes a client-owned signal", async () => {
 	const controller = new AbortController(); let received: AbortSignal | undefined;
@@ -246,7 +284,7 @@ test("batch text follows the model context window and small models are refused b
 
 test("warm imports and full factories register tools but no commands or review modes under 50 ms", async (t) => {
 	const names: string[] = [];
-	const pi = { on: () => {}, registerFlag: () => assert.fail("Memory must not register an alternate review mode"), registerCommand: () => assert.fail("Memory must not register commands"), registerEntryRenderer: () => {}, registerTool: (tool: { name: string }) => names.push(tool.name) } as unknown as ExtensionAPI;
+	const pi = { on: () => {}, registerFlag: () => assert.fail("Memory must not register an alternate review mode"), registerCommand: () => assert.fail("Memory must not register commands"), registerEntryRenderer: () => {}, registerMessageRenderer: () => {}, registerTool: (tool: { name: string }) => names.push(tool.name) } as unknown as ExtensionAPI;
 	const expected = ["memory_add", "memory_delete", "memory_get", "memory_list", "memory_queue", "memory_update"];
 	coreMemories(pi);
 	assert.deepEqual(names.sort(), expected);

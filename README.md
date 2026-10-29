@@ -15,19 +15,37 @@ run a command, or start a second application to do memory work.
 The native executable and worker protocol are internal integration and
 diagnostic interfaces. They are not the user interface.
 
-## Implementation status
+## Public Pi integration
 
-The native queue, checked publisher, background scheduler, and approved-memory
-loader exist. The ordinary-chat approval transport is not complete yet.
-Removing commands does not complete that transport. The old modal approval
-adapter is also removed. Queue inspection and checked receipt recovery remain
-available, but the queue tool does not expose review or write operations.
+The extension uses public Pi extension interfaces. It does not require a Pi
+fork or a custom conversation interface. Supported package versions are the
+[peer dependencies in package.json](package.json).
 
-The conversation must have a trusted record of the exact proposal that was
-displayed and the user's later explicit reply. A model's description of a reply,
-an input marked interactive, a restored message, or an autonomous instruction
-does not supply that authority. If the host cannot establish it, the write stays
-blocked. A separate review dialog is not an alternate completion path.
+A registered custom-message renderer shows the exact native proposal in the
+normal transcript. One worker stays open for a later reply. Public input and
+session events bind that reply to the unchanged prompt, the exact user message,
+and the current displayed proposal. Model tool arguments cannot supply it.
+The old modal approval adapter is removed, with no command or dialog fallback.
+
+Proposal control material is excluded from model context. The user's reply
+remains an ordinary chat message. These checks trust the Pi process and its
+loaded extensions; they do not authenticate a person or prove that every line
+was painted or read.
+
+A wording change keeps the finding's native review owner. Native validation
+preserves the original finding, evidence, and source annotations. It stores an
+unapproved amendment and creates a new exact preview. That preview needs a new
+display and a later explicit approval. An earlier reply cannot approve it.
+
+The consumer still needs fresh independent review, complete installed
+background-to-chat verification, and migration acceptance. Source implementation
+does not authorize removal of the old application or its retained data.
+
+The adapter must find the exact proposal in the current durable transcript and
+capture a later eligible reply. A model's description of a reply, an interactive
+source label alone, a restored message, or an autonomous instruction does not
+supply that authority. Missing, transformed, queued, competing, or stale input
+blocks the write. A separate review dialog is not an alternate completion path.
 
 ## Background dreaming
 
@@ -46,6 +64,20 @@ Saved input, model requests, responses, pending findings, and recovery records
 remain durable. An interruption must not discard evidence, repeat a model call
 without authority, or manufacture approval. Source protection does not promise
 complete detection of transformed secrets.
+
+## Subscription-only model calls
+
+Dreaming uses the selected provider, model, and thinking level. It must not fall
+back to a paid application programming interface (API) key or switch selections.
+On public Pi, the selected route must be an OAuth (Open Authorization)-only
+subscription provider with no registered override. Authentication is resolved
+once for the selected model, including its headers and endpoint, before calling
+the captured provider.
+
+A host with an existing stronger subscription guard can use it, but that guard
+is optional. Mixed-authentication, virtual, changed, or unverified public routes
+stay blocked when the adapter cannot establish subscription-only dispatch.
+It does not install a fork or choose another provider to bypass that limit.
 
 ## Review in conversation
 

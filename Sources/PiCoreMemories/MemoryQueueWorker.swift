@@ -49,7 +49,7 @@ private final class QueueInput: @unchecked Sendable {
           } else {
             guard
               [
-                "list", "claim", "release", "recover", "inventory", "finish", "cancel",
+                "list", "claim", "amend", "release", "recover", "inventory", "finish", "cancel",
                 "approved-list", "approved-get", "manage-preview", "manage-recover",
               ].contains(
                 type)
@@ -216,6 +216,46 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             ["inventory": encoded(MemoryQueueInventory.readOnly(configuration: configuration))])
           continue
         }
+        var originalReplyAction: MemoryConversationAction?
+        if isControl, ["reply", "manage-reply"].contains(type) {
+          try WorkerJSON.fields(
+            object,
+            tuple.union(["originalText", "submittedText", "decisionID", "responseReference"]))
+          _ = try WorkerJSON.identifier(object, "decisionID")
+          _ = try WorkerJSON.identifier(object, "responseReference")
+          let expected: [String: String]
+          let operation: String
+          let isDetachRequired: Bool
+          if type == "manage-reply" {
+            guard let current = managementDisplay else { throw WorkerError.protocolFailure }
+            expected = managementTuple(current)
+            operation = current.operation
+            isDetachRequired = current.isDetachRequired
+          } else {
+            guard let current = display else { throw WorkerError.protocolFailure }
+            expected = queueTuple(current)
+            operation = current.presentation.finding.operation
+            isDetachRequired = current.presentation.isDetachRequired
+          }
+          try matchTuple(object, tuple: expected)
+          let action = interpretMemoryConversationReply(
+            originalText: try WorkerJSON.text(object, "originalText", maximum: 65_536),
+            submittedText: try WorkerJSON.text(object, "submittedText", maximum: 65_536),
+            operation: operation, isDetachRequired: isDetachRequired)
+          if action == .clarify {
+            input.expect(expected, type: type)
+            try emit("reply-clarify", ["status": "no-decision"])
+            continue
+          }
+          if type == "manage-reply", [MemoryConversationAction.reject, .postpone].contains(action) {
+            management?.release()
+            managementDisplay = nil
+            input.expect(nil)
+            try emit("manage-cancelled", ["status": "not-saved"])
+            continue
+          }
+          originalReplyAction = action
+        }
         if isControl, let current = managementDisplay, let management {
           try matchTuple(object, tuple: managementTuple(current))
           let managementFields = header.union(managementTuple(current).keys)
@@ -223,16 +263,11 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try WorkerJSON.fields(object, managementFields.union(["messageReference"]))
             try management.presented(
               current, messageReference: WorkerJSON.identifier(object, "messageReference"))
-            input.expect(managementTuple(current), type: "manage-choice")
+            input.expect(managementTuple(current), type: "manage-reply")
             try emit("manage-presented", ["displayDigest": current.displayDigest])
           } else {
-            try WorkerJSON.fields(
-              object,
-              managementFields.union(["action", "decisionID", "responseReference", "isInteractive"])
-            )
-            guard let isInteractive = object["isInteractive"] as? NSNumber,
-              CFGetTypeID(isInteractive) == CFBooleanGetTypeID(), isInteractive.boolValue
-            else { throw WorkerError.protocolFailure }
+            guard let originalReplyAction else { throw WorkerError.protocolFailure }
+            let action = originalReplyAction.rawValue
             let decisionID = try WorkerJSON.identifier(object, "decisionID")
             defer {
               management.release()
@@ -241,7 +276,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             }
             do {
               let receipt = try management.decide(
-                current, action: WorkerJSON.text(object, "action"), decisionID: decisionID,
+                current, action: action, decisionID: decisionID,
                 responseReference: WorkerJSON.identifier(object, "responseReference"))
               try emit("manage-decision", ["receipt": encoded(receipt)])
             } catch {
@@ -259,16 +294,12 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try WorkerJSON.fields(object, tuple.union(["messageReference"]))
             try queue.presented(
               current, messageReference: WorkerJSON.identifier(object, "messageReference"))
-            input.expect(queueTuple(current), type: "choice")
+            input.expect(queueTuple(current), type: "reply")
             try emit("presented", ["displayDigest": current.displayDigest])
           } else {
-            try WorkerJSON.fields(
-              object, tuple.union(["action", "decisionID", "responseReference", "isInteractive"]))
-            guard let isInteractive = object["isInteractive"] as? NSNumber,
-              CFGetTypeID(isInteractive) == CFBooleanGetTypeID(), isInteractive.boolValue
-            else { throw WorkerError.protocolFailure }
+            guard let originalReplyAction else { throw WorkerError.protocolFailure }
+            let action = originalReplyAction.rawValue
             let decisionID = try WorkerJSON.identifier(object, "decisionID")
-            let action = try WorkerJSON.text(object, "action")
             let response = try WorkerJSON.identifier(object, "responseReference")
             defer {
               display = nil
@@ -301,6 +332,29 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             management?.release()
             queue.release()
             try emit("released")
+          case "amend":
+            guard let current = display, managementDisplay == nil,
+              let amendment = object["amendment"] as? [String: Any]
+            else { throw WorkerError.protocolFailure }
+            try WorkerJSON.fields(object, tuple.union(["amendment"]))
+            try WorkerJSON.fields(amendment, ["replacement", "reason"])
+            try matchTuple(object, tuple: queueTuple(current))
+            input.expect(nil)
+            let amended = try queue.amend(
+              current,
+              amendment: MemoryBatchAmendment(
+                replacement: WorkerJSON.text(amendment, "replacement", maximum: 262_144),
+                reason: WorkerJSON.text(amendment, "reason", maximum: 16_384)))
+            display = amended
+            input.expect(queueTuple(amended))
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            try emit(
+              "presentation",
+              [
+                "display": encoded(amended),
+                "displayBytes": encoder.encode(amended.presentation).base64EncodedString(),
+              ])
           case "recover":
             try WorkerJSON.fields(object, header.union(["decisionID"]))
             let receipt = try queue.recover(decisionID: WorkerJSON.identifier(object, "decisionID"))

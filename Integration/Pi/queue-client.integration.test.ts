@@ -53,7 +53,7 @@ test("two native sessions share ownership and persisted same-request deferral af
 	const next = decodeQueuePreview(await second.request("claim", { ...nextIdentity, revision }), nextIdentity);
 	assert.notEqual(next.tuple.claimID, preview.tuple.claimID);
 	assert.equal((await second.request("presented", { ...next.tuple, messageReference: "visible-message" }, true)).displayDigest, next.digest);
-	const decision = await second.request("choice", { ...next.tuple, action: "defer", decisionID: "explicit-deferral", responseReference: "human-response", isInteractive: true }, true);
+	const decision = await second.request("reply", { ...next.tuple, originalText: "Leave that memory for later", submittedText: "Leave that memory for later", decisionID: "explicit-deferral", responseReference: "original-response" }, true);
 	assert.equal(queueObject(decision.receipt).status, "deferred");
 	await second.close();
 	const restarted = await openQueueClient(root, new AbortController().signal, config); t.after(() => restarted.close());

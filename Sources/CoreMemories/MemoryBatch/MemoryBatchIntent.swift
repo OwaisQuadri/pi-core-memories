@@ -4,7 +4,7 @@ package enum MemoryBatchChoice: String, Codable, Sendable {
   case accept, deferCandidate, reject
 }
 
-package struct MemoryBatchAmendment: Codable, Sendable {
+package struct MemoryBatchAmendment: Codable, Equatable, Sendable {
   package let replacement: String
   package let reason: String
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-core-memories",
   "version": "0.1.0",
-  "description": "Approved memories and inspectable dreams for Pi, with a native Mac editor.",
+  "description": "Approved memories and background dreaming through ordinary Pi conversation.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -14,9 +14,9 @@
     "url": "https://github.com/OwaisQuadri/pi-core-memories.git"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-ai": "^1.4.0",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@earendil-works/pi-tui": "^1.4.0"
   },
   "pi": {
     "extensions": [

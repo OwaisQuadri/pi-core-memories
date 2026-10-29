@@ -97,6 +97,7 @@ struct ReviewPreviewPayload: Codable, Equatable {
   let originalDocument: Data
   let replacement: Data
   let checkout: ReviewCheckoutWitness
+  var amendment: MemoryBatchAmendment? = nil
 }
 
 struct ReviewAttempt: Codable, Equatable {

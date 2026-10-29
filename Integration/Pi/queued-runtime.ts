@@ -80,6 +80,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let isAlive = false;
 	let isWorking = false;
+	let isPeerForeground = false;
+	let dreamStatus: string | undefined;
+	const membershipError = 'dreaming: error(code: membershipUnavailable, message: "Interactive membership is unavailable")';
 	let failures = 0;
 	let generation = 0;
 	let conversation: MemoryConversationState | undefined;
@@ -91,18 +94,40 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		if (previous) { previous.controller.abort(); conversationClose = previous.client.close(); }
 		return conversationClose;
 	}
-	function stopBackground(): void { clearTimeout(timer); timer = undefined; background?.abort(); }
+	function reportDreamStatus(value: string | undefined): void {
+		if (dreamStatus === value || value !== undefined && !isAlive) return;
+		dreamStatus = value;
+		try { if (context?.hasUI) context.ui.setStatus("pi-core-memories:dream", value); } catch {}
+	}
+	function stopBackground(): void {
+		clearTimeout(timer); timer = undefined; background?.abort();
+		if (dreamStatus === "dreaming: active") reportDreamStatus("dreaming: paused");
+	}
 	function invalidate(isConversationInvalidated = true): void {
 		foreground?.abort(); stopBackground();
 		if (isConversationInvalidated) { generation++; void closeConversation(); }
 	}
 	function updateMembership(): void {
-		if (context) membership?.set({ sessionID: context.sessionManager.getSessionId(), isForeground: isWorking || !!foreground || !!conversation || context.hasPendingMessages() });
+		if (!context) return;
+		const isForeground = isWorking || !!foreground || !!conversation || context.hasPendingMessages();
+		membership?.set({ sessionID: context.sessionManager.getSessionId(), isForeground });
+		if (isForeground && !dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: paused");
 	}
-	async function leaveMembership(): Promise<void> { const previous = membership; membership = undefined; await previous?.close(); }
+	async function leaveMembership(): Promise<void> {
+		const previous = membership; membership = undefined; isPeerForeground = false;
+		reportDreamStatus(undefined);
+		await previous?.close();
+	}
 	function schedule(): void {
 		clearTimeout(timer);
-		if (!isAlive || !membership || isWorking || foreground || conversation || !context || failures >= 3) return;
+		if (!isAlive || !context) return;
+		if (!membership) { reportDreamStatus(membershipError); return; }
+		if (isWorking || foreground || conversation || isPeerForeground || failures >= 3) {
+			if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: paused");
+			return;
+		}
+		if (background) return;
+		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus(failures || !context.isIdle() || context.hasPendingMessages() ? "dreaming: paused" : "dreaming: idle");
 		timer = setTimeout(() => { timer = undefined; void startBackground(); }, deps.idleMilliseconds * 2 ** failures);
 		timer.unref?.();
 	}
@@ -110,11 +135,18 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const ctx = context;
 		if (!ctx || !isAlive || isWorking || foreground || conversation || background || !ctx.isIdle() || ctx.hasPendingMessages()) { schedule(); return; }
 		const model = ctx.model;
-		if (!model || !["openai", "openai-codex", "anthropic"].includes(model.provider)) return;
+		if (!model || !["openai", "openai-codex", "anthropic"].includes(model.provider)) {
+			reportDreamStatus('dreaming: error(code: unsupportedProvider, message: "Selected provider cannot run dreaming")'); return;
+		}
 		const batchTextBytes = dreamBatchTextBytes(model.contextWindow);
-		if (batchTextBytes === null) return;
+		if (batchTextBytes === null) {
+			reportDreamStatus('dreaming: error(code: contextWindow, message: "Selected context window cannot run dreaming")'); return;
+		}
 		const selection: DreamSelection = { provider: model.provider, modelID: model.id, thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel() };
 		const current = new AbortController(); background = current;
+		const epoch = generation;
+		const isCurrent = () => isAlive && !current.signal.aborted && background === current && generation === epoch;
+		reportDreamStatus("dreaming: paused");
 		const sessionID = ctx.sessionManager.getSessionId();
 		backgroundCompletion = (async () => {
 			try {
@@ -123,7 +155,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				const live = membership;
 				if (!live) return;
 				updateMembership();
-				const admitted = await live.snapshot();
+				const admitted = await live.snapshot().catch((error) => { if (isCurrent()) reportDreamStatus(membershipError); throw error; });
+				isPeerForeground = admitted.isForeground;
 				if (admitted.isForeground || !admitted.sessionIDs.length || admitted.sessionIDs.length > 64) return;
 				const roots = await deps.roots(getAgentDir(), ctx.cwd);
 				const scope = await deps.scope(current.signal);
@@ -135,12 +168,26 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					const currentMembers = await live.snapshot();
 					if (currentMembers.isForeground || membership !== live || JSON.stringify(currentMembers.sessionIDs) !== JSON.stringify(admitted.sessionIDs) || signal.aborted || current.signal.aborted) throw new Error("Interactive memory membership changed.");
 					assertArchivedRequest(request, currentMembers.sessionIDs);
-					return deps.call(request, ctx, model, selection, signal);
+					if (isCurrent()) reportDreamStatus("dreaming: active");
+					try { return await deps.call(request, ctx, model, selection, signal); }
+					catch (error) {
+						if (isCurrent() && !signal.aborted) reportDreamStatus('dreaming: error(code: backendFailure, message: "Dream model invocation failed")');
+						throw error;
+					}
 				}, current.signal, () => {}, (value: unknown, signal: AbortSignal) => deps.protect(pi, invocationID, value, signal));
+				if (!isCurrent()) return;
 				if (["blocked", "pending"].includes(report.status)) failures = 3;
 				else if (report.status === "busy") failures++;
 				else failures = 0;
-			} catch { if (!current.signal.aborted) failures++; }
+				reportDreamStatus(report.status === "blocked"
+					? 'dreaming: error(code: blocked, message: "Native dream worker blocked the run")'
+					: report.status === "pending" || report.status === "busy" ? "dreaming: paused" : "dreaming: idle");
+			} catch {
+				if (isCurrent()) {
+					failures++;
+					if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus('dreaming: error(code: workerFailure, message: "Background dream run failed")');
+				}
+			}
 			finally { if (background === current) background = undefined; schedule(); }
 		})();
 		await backgroundCompletion;
@@ -318,11 +365,19 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		if (generation !== epoch) return;
 		context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; isWorking = !ctx.isIdle(); failures = 0;
 		if (!isAlive) return;
+		let joined: InteractiveMembership | undefined;
 		try {
-			const joined = await deps.membership(deps.membershipDirectory, { sessionID: ctx.sessionManager.getSessionId(), isForeground: isWorking }, () => { stopBackground(); schedule(); });
+			joined = await deps.membership(deps.membershipDirectory, { sessionID: ctx.sessionManager.getSessionId(), isForeground: isWorking }, (snapshot) => {
+				if (!joined || membership !== joined || !isAlive) return;
+				isPeerForeground = snapshot?.isForeground ?? true;
+				stopBackground();
+				if (!snapshot) reportDreamStatus(membershipError);
+				else if (dreamStatus === membershipError) reportDreamStatus("dreaming: paused");
+				schedule();
+			});
 			if (generation !== epoch || !isAlive) { await joined.close(); return; }
 			membership = joined;
-		} catch { return; }
+		} catch { if (generation === epoch && isAlive) reportDreamStatus(membershipError); return; }
 		updateMembership(); schedule();
 	});
 	pi.on("input", (event, ctx) => {
@@ -333,7 +388,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			const leaf = ctx.sessionManager.getBranch().at(-1);
 			if (entry && leaf) observedReply = { proposalId: state.proposalId, proposalEntryId: entry.id, previousLeafId: leaf.id, text: event.text, isRunStarted: false };
 		}
-		invalidate(false); failures = 0; isWorking = true; updateMembership();
+		invalidate(false); failures = 0; isWorking = true; reportDreamStatus("dreaming: paused"); updateMembership();
 	});
 	pi.on("before_agent_start", (event) => {
 		if (observedReply) {
@@ -364,8 +419,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		updateMembership();
 	});
 	pi.on("tool_execution_start", () => { stopBackground(); updateMembership(); });
-	pi.on("model_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; schedule(); });
-	pi.on("thinking_level_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; schedule(); });
+	pi.on("model_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: paused"); schedule(); });
+	pi.on("thinking_level_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: paused"); schedule(); });
 	pi.on("session_before_switch", async () => { isAlive = false; invalidate(); await leaveMembership(); });
 	pi.on("session_before_fork", async () => { isAlive = false; invalidate(); await leaveMembership(); });
 	pi.on("session_before_tree", () => { invalidate(); isWorking = true; updateMembership(); });

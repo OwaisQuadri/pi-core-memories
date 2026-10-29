@@ -17,7 +17,7 @@ function validState(value: unknown): InteractiveState {
 	if (Object.keys(state).sort().join() !== "isForeground,sessionID" || typeof state.sessionID !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(state.sessionID) || typeof state.isForeground !== "boolean") return blocked();
 	return { sessionID: state.sessionID, isForeground: state.isForeground };
 }
-export async function joinInteractiveMembership(directory: string, initial: InteractiveState, onChanged: () => void): Promise<InteractiveMembership> {
+export async function joinInteractiveMembership(directory: string, initial: InteractiveState, onChanged: (snapshot?: InteractiveSnapshot) => void): Promise<InteractiveMembership> {
 	const uid = process.getuid?.();
 	if (uid === undefined) return blocked();
 	await mkdir(dirname(directory), { recursive: true, mode: 0o700 });
@@ -100,7 +100,7 @@ export async function joinInteractiveMembership(directory: string, initial: Inte
 	const timer = setInterval(() => {
 		if (isPolling || isClosed) return;
 		isPolling = true;
-		void snapshot().then((value) => { const next = JSON.stringify(value); if (prior !== next || value.isForeground) onChanged(); prior = next; }, () => { prior = undefined; onChanged(); }).finally(() => { isPolling = false; });
+		void snapshot().then((value) => { const next = JSON.stringify(value); if (prior !== next || value.isForeground) onChanged(value); prior = next; }, () => { prior = undefined; onChanged(); }).finally(() => { isPolling = false; });
 	}, 200);
 	timer.unref(); server.unref();
 	return {

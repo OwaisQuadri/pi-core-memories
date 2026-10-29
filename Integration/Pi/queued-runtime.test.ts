@@ -5,14 +5,17 @@ import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DreamReport, DreamRequest, runDreamWorker } from "./dream.ts";
 import type { openQueueClient } from "./queue-client.ts";
+import type { InteractiveSnapshot } from "./interactive-membership.ts";
 import "./test/host.ts";
 const { memoryRequestIdentity, registerQueuedRuntime, assertArchivedRequest } = await import("./queued-runtime.ts");
 type TestEntry = Partial<Parameters<ExtensionAPI["sendMessage"]>[0]> & { type: string; id: string; message: { role: string; content?: string; timestamp?: number } };
 function context() {
 	const entries: TestEntry[] = [{ type: "message", id: "user-entry", message: { role: "user", content: "Start the conversation.", timestamp: 0 } }];
-	const ctx = { mode: "tui", hasUI: true, cwd: "/synthetic", model: { provider: "openai-codex", id: "selected", contextWindow: 262_144 }, thinkingLevel: "high", isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionId: () => "session", getBranch: () => entries } } as unknown as ExtensionContext;
+	const statuses = new Map<string, string>();
+	const ui = { setStatus(key: string, value: string | undefined) { if (value === undefined) statuses.delete(key); else statuses.set(key, value); } };
+	const ctx = { ui, mode: "tui", hasUI: true, cwd: "/synthetic", model: { provider: "openai-codex", id: "selected", contextWindow: 262_144 }, thinkingLevel: "high", isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionId: () => "session", getBranch: () => entries } } as unknown as ExtensionContext;
 	const toolContext: ExtensionToolContext = { ...ctx, tools: [], executeTool: async () => { assert.fail("Unexpected nested fixture tool call."); } };
-	return { ctx: toolContext, entries };
+	return { ctx: toolContext, entries, statuses };
 }
 test("same durable request survives tool leaves, compaction and runtime restart", () => {
 	const f = context();
@@ -49,17 +52,103 @@ function runtime(run: typeof runDreamWorker, mode = "tui", openFailure?: Error, 
 		registerFlag: () => assert.fail("Memory must not register a review mode"),
 		getFlag: () => assert.fail("Memory must not select a separate review mode"),
 		registerTool: (tool: ToolDefinition) => { registeredTool = tool; tools.set(tool.name, tool); }, getThinkingLevel: () => "high" } as unknown as ExtensionAPI;
-	const { ctx, entries } = context(); (ctx as { mode: string }).mode = mode;
-	let changed = () => {}; let isPeerForeground = false;
+	const { ctx, entries, statuses } = context(); (ctx as { mode: string }).mode = mode;
+	let changed: (snapshot?: InteractiveSnapshot) => void = () => {}; let isPeerForeground = false;
 	const stop = registerQueuedRuntime(pi, { run, idleMilliseconds: 5,
 		open: async (...args) => { opened.push(args); if (openFailure) throw openFailure; return { request: async () => ({ type: "queue", rows: [], nextOffset: null }), close: async () => { closed.push("closed"); } }; },
 		membership: async (directory, _initial, onChanged) => { memberships.push(directory); changed = onChanged; return { set: (state) => { states.push(state); }, snapshot: async () => ({ sessionIDs: ["session", "another-live-session"].sort(), isForeground: isPeerForeground }), close: async () => {} }; }, roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}), ...overrides });
-	return { ctx, entries, stop, opened, memberships, closed, tools, states, messages,
+	return { ctx, entries, stop, opened, memberships, closed, tools, states, messages, statuses,
 		deferDelivery: () => { isDeliveryDeferred = true; },
 		deliver: () => { isDeliveryDeferred = false; for (const message of pending.splice(0)) append(message); },
 		get tool() { assert.ok(registeredTool); return registeredTool; },
-		peerForeground: () => { isPeerForeground = true; changed(); }, emit: async (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx) };
+		peerForeground: () => { isPeerForeground = true; changed({ sessionIDs: ["another-live-session", "session"], isForeground: true }); },
+		peerIdle: () => { isPeerForeground = false; changed({ sessionIDs: ["another-live-session", "session"], isForeground: false }); },
+		emit: async (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx) };
 }
+
+test("dream status follows actual dispatch, peer pauses and blocked outcomes without exposing details", async () => {
+	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
+	let runs = 0;
+	const f = runtime(async (start, call, signal) => {
+		runs++;
+		if (runs > 1) return { status: "blocked", reason: "PRIVATE_REASON", detail: "PRIVATE_DETAIL" } as DreamReport;
+		await call({ version: 1, type: "modelRequest", invocationID: start.invocationID, requestID: "request", runID: "run", generation: "1", inputHash: "a".repeat(64), contextHash: "b".repeat(64), requestHash: "c".repeat(64), selection: start.selection, systemPrompt: "Synthetic status test", messages: [{ role: "user", text: JSON.stringify({ primaryEvidence: [{ source: { session: "archived", entry: "entry", part: 0 } }] }), timestampMilliseconds: 0 }] }, signal);
+		return { status: "noNewRecords" } as DreamReport;
+	}, "tui", undefined, { call: async (_request, _ctx, _model, _selection, signal) => {
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active");
+		enter(); await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+		return "{}";
+	} });
+	try {
+		await f.emit("session_start");
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
+		await Promise.race([entered, sleep(1000).then(() => assert.fail("No status dispatch"))]);
+		await f.emit("before_agent_start");
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
+		await f.emit("model_select");
+		f.peerForeground(); await f.emit("agent_end"); await sleep(30);
+		assert.equal(runs, 1);
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
+		f.peerIdle();
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
+		await sleep(30);
+		assert.equal(runs, 2);
+		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: blocked/);
+		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /PRIVATE/);
+		f.peerIdle();
+		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: blocked/);
+	} finally { await f.stop(); }
+	assert.equal(f.statuses.has("pi-core-memories:dream"), false);
+});
+
+for (const boundary of ["worker", "provider", "window", "membership"] as const) {
+	test(`dream status reports ${boundary} failures without raw error text`, async () => {
+		const f = runtime(async () => { throw new Error("PRIVATE_MODEL_PAYLOAD"); }, "tui", undefined,
+			boundary === "membership" ? { membership: async () => { throw new Error("PRIVATE_SOURCE_PATH"); } } : {});
+		if (boundary === "provider") Object.assign(f.ctx, { model: { ...f.ctx.model!, provider: "unsupported" } });
+		if (boundary === "window") Object.assign(f.ctx, { model: { ...f.ctx.model!, contextWindow: 1 } });
+		try {
+			await f.emit("session_start"); await sleep(30);
+			const expected = { worker: "workerFailure", provider: "unsupportedProvider", window: "contextWindow", membership: "membershipUnavailable" }[boundary];
+			assert.ok(f.statuses.get("pi-core-memories:dream")?.includes(`error(code: ${expected},`));
+			assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /PRIVATE/);
+		} finally { await f.stop(); }
+	});
+}
+
+test("old membership callbacks cannot change the replacement session status", async () => {
+	const callbacks: Array<(snapshot?: InteractiveSnapshot) => void> = [];
+	const f = runtime(async () => assert.fail("No status test may dispatch"), "tui", undefined, {
+		idleMilliseconds: 60_000,
+		membership: async (_directory, _initial, onChanged) => {
+			callbacks.push(onChanged);
+			return { set() {}, snapshot: async () => ({ sessionIDs: ["session"], isForeground: false }), close: async () => {} };
+		},
+	});
+	try {
+		await f.emit("session_start"); await f.emit("session_before_switch"); await f.emit("session_start");
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
+		callbacks[0]!();
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
+		await f.emit("model_select");
+		callbacks[1]!({ sessionIDs: ["session", "peer"], isForeground: true });
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
+		callbacks[1]!({ sessionIDs: ["session", "peer"], isForeground: false });
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
+	} finally { await f.stop(); }
+});
+
+test("dream status reports backend failure without exposing the model error", async () => {
+	const f = runtime(async (start, call, signal) => {
+		await call({ version: 1, type: "modelRequest", invocationID: start.invocationID, requestID: "request", runID: "run", generation: "1", inputHash: "a".repeat(64), contextHash: "b".repeat(64), requestHash: "c".repeat(64), selection: start.selection, systemPrompt: "Synthetic status test", messages: [{ role: "user", text: JSON.stringify({ primaryEvidence: [{ source: { session: "archived", entry: "entry", part: 0 } }] }), timestampMilliseconds: 0 }] }, signal);
+		return { status: "noNewRecords" } as DreamReport;
+	}, "tui", undefined, { call: async () => { throw new Error("PRIVATE_RESPONSE_TOKEN"); } });
+	try {
+		await f.emit("session_start"); await sleep(30);
+		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: backendFailure,/);
+		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /PRIVATE/);
+	} finally { await f.stop(); }
+});
 
 test("foreground work cancels idle background and shutdown stops rescheduling", async () => {
 	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });

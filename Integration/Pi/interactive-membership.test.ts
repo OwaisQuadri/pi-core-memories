@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { test } from "node:test";
-import { joinInteractiveMembership } from "./interactive-membership.ts";
+import { joinInteractiveMembership, type InteractiveSnapshot } from "./interactive-membership.ts";
 
 async function waitFor(check: () => boolean): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) { if (check()) return; await sleep(20); }
@@ -36,6 +36,23 @@ process.send("ready");`;
 		await writeFile(join(directory, "foreign.json"), "{}", { mode: 0o600 });
 		await assert.rejects(local.snapshot(), /unavailable or ambiguous/);
 	} finally { child.kill("SIGKILL"); await local.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("membership callbacks deliver the same idle snapshot after an error recovers", async () => {
+	const root = await mkdtemp("/private/tmp/pi-members-recovery-");
+	const directory = join(root, "hosts");
+	const snapshots: (InteractiveSnapshot | undefined)[] = [];
+	const local = await joinInteractiveMembership(directory, { sessionID: "one", isForeground: false }, (value) => { snapshots.push(value); });
+	try {
+		await waitFor(() => snapshots.length > 0);
+		assert.deepEqual(snapshots.at(-1), { sessionIDs: ["one"], isForeground: false });
+		await writeFile(join(directory, "foreign.json"), "{}", { mode: 0o600 });
+		await waitFor(() => snapshots.at(-1) === undefined);
+		const before = snapshots.length;
+		await rm(join(directory, "foreign.json"));
+		await waitFor(() => snapshots.length > before && snapshots.at(-1) !== undefined);
+		assert.deepEqual(snapshots.at(-1), { sessionIDs: ["one"], isForeground: false });
+	} finally { await local.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test("unsafe shared directory permissions fail closed without changing them", async () => {

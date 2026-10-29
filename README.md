@@ -65,6 +65,22 @@ remain durable. An interruption must not discard evidence, repeat a model call
 without authority, or manufacture approval. Source protection does not promise
 complete detection of transformed secrets.
 
+The runtime publishes this session's dreaming state through Pi's public
+extension-status key `pi-core-memories:dream`. A footer can display it without
+another command, review mode, or host change.
+
+- `dreaming: active` means a validated archived-model request is in progress.
+- `dreaming: idle` means the scheduler waits or finds no new records. It does
+  not prove a successful model call.
+- `dreaming: paused` means foreground work, pending review, or worker contention
+  prevents this session from dispatching.
+- `dreaming: error(code: X, message: "...")` reports a blocked or failed attempt.
+  The code and message use fixed safe text, not raw exceptions or source data.
+
+This is a session-local status, not an aggregate of other workers. Errors stay
+visible until an eligible reset. Shutdown clears the status. Completed request,
+response and native run records remain the evidence for successful dreaming.
+
 ## Subscription-only model calls
 
 Dreaming uses the selected provider, model, and thinking level. It must not fall

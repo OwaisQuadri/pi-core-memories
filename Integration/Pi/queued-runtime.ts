@@ -127,7 +127,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			return;
 		}
 		if (background) return;
-		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus(failures || !context.isIdle() || context.hasPendingMessages() ? "dreaming: paused" : "dreaming: idle");
+		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus(failures || context.hasPendingMessages() ? "dreaming: paused" : "dreaming: idle");
 		timer = setTimeout(() => { timer = undefined; void startBackground(); }, deps.idleMilliseconds * 2 ** failures);
 		timer.unref?.();
 	}

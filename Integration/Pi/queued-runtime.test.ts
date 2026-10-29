@@ -101,6 +101,24 @@ test("dream status follows actual dispatch, peer pauses and blocked outcomes wit
 	assert.equal(f.statuses.has("pi-core-memories:dream"), false);
 });
 
+test("foreground completion reports idle while retaining the live dispatch guard", async () => {
+	let isHostIdle = true;
+	let runs = 0;
+	const f = runtime(async () => { runs++; return { status: "noNewRecords" } as DreamReport; });
+	Object.assign(f.ctx, { isIdle: () => isHostIdle });
+	try {
+		await f.emit("session_start"); await f.emit("before_agent_start");
+		isHostIdle = false;
+		await f.emit("agent_end");
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
+		await sleep(30);
+		assert.equal(runs, 0);
+		isHostIdle = true;
+		await sleep(30);
+		assert.ok(runs > 0);
+	} finally { await f.stop(); }
+});
+
 for (const boundary of ["worker", "provider", "window", "membership"] as const) {
 	test(`dream status reports ${boundary} failures without raw error text`, async () => {
 		const f = runtime(async () => { throw new Error("PRIVATE_MODEL_PAYLOAD"); }, "tui", undefined,

@@ -228,21 +228,22 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid")[]
 		idleMilliseconds: 60_000,
 		open: async (directory, signal) => {
 			assert.ok(signal); signals.push(signal); f.opened.push([directory, signal]);
-			let isManagement = false; let digest = ""; let native: Record<string, unknown> | undefined; const clientIndex = signals.length;
+			let isManagement = false; let isRelocation = false; let digest = ""; let native: Record<string, unknown> | undefined; const clientIndex = signals.length;
 			return {
 				signal,
 				request: async (type, fields = {}, isPrivate) => {
 					frames.push({ type, fields, isPrivate });
-					if (type === "claim" || type === "manage-preview") {
+					if (type === "claim" || type === "manage-preview" || type === "relocation-preview") {
 						isManagement = type === "manage-preview";
+						isRelocation = type === "relocation-preview";
 						const request = fields.request as Record<string, unknown> | undefined;
 						const payload = {
 							claimID: "unit-claim", sequence: "1", request: { sessionID: fields.sessionID, requestID: fields.requestID }, isDetachRequired: false, previewDigest: "d".repeat(64),
-							...(isManagement ? { operation: request?.operation, path: "MEMORY.md", currentBase: "b".repeat(40), before: "", after: Buffer.from(String(request?.replacement ?? "")).toString("base64"), documentBefore: "", replacement: Buffer.from(String(request?.replacement ?? "")).toString("base64") } : { finding: { candidateID: "c".repeat(64), revision: "a".repeat(64), operation: "add" } }),
+							...(isRelocation ? { operation: "relocate-snippets", role: "snippets", currentBase: "a".repeat(64), preview: { replacement: fields.replacement, baselineRunID: fields.baselineRunID } } : isManagement ? { operation: request?.operation, path: "MEMORY.md", currentBase: "b".repeat(40), before: "", after: Buffer.from(String(request?.replacement ?? "")).toString("base64"), documentBefore: "", replacement: Buffer.from(String(request?.replacement ?? "")).toString("base64") } : { finding: { candidateID: "c".repeat(64), revision: "a".repeat(64), operation: "add" } }),
 						};
 						native = payload;
 						const bytes = Buffer.from(JSON.stringify(payload)); digest = createHash("sha256").update(bytes).digest("hex");
-						return { type: isManagement ? "manage-presentation" : "presentation", display: isManagement ? { ...payload, displayDigest: digest } : { presentation: payload, displayDigest: digest }, displayBytes: bytes.toString("base64"), displayDigest: digest };
+						return { type: isRelocation ? "relocation-presentation" : isManagement ? "manage-presentation" : "presentation", display: isManagement || isRelocation ? { ...payload, displayDigest: digest } : { presentation: payload, displayDigest: digest }, displayBytes: bytes.toString("base64"), displayDigest: digest };
 					}
 					if (type === "amend") {
 						assert.ok(native); assert.equal(isManagement, false); assert.equal(fields.displayDigest, digest); assert.equal(fields.claimID, native.claimID);
@@ -252,11 +253,11 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid")[]
 						const bytes = Buffer.from(JSON.stringify(native)); digest = createHash("sha256").update(bytes).digest("hex");
 						return { type: "presentation", display: { presentation: native, displayDigest: digest }, displayBytes: bytes.toString("base64") };
 					}
-					if (type === "presented" || type === "manage-presented") return { type, displayDigest: digest };
-					if (type === "reply" || type === "manage-reply") {
+					if (type === "presented" || type === "manage-presented" || type === "relocation-presented") return { type, displayDigest: digest };
+					if (type === "reply" || type === "manage-reply" || type === "relocation-reply") {
 						const response = responses.shift() ?? "approved";
 						if (response === "clarify") return { type: "reply-clarify", status: "no-decision" };
-						return { type: isManagement ? "manage-decision" : "decision", receipt: { decisionID: fields.decisionID, revision: "a".repeat(64), displayDigest: response === "invalid" ? "0".repeat(64) : digest, status: "approved", commit: "f".repeat(40), auditRef: "refs/core-memories/unit-audit" } };
+						return { type: isRelocation ? "relocation-decision" : isManagement ? "manage-decision" : "decision", receipt: { decisionID: fields.decisionID, sessionID: fields.sessionID, requestID: fields.requestID, responseReference: fields.responseReference, revision: "a".repeat(64), displayDigest: response === "invalid" ? "0".repeat(64) : digest, status: isRelocation ? "relocated" : "approved", commit: "f".repeat(40), auditRef: "refs/core-memories/unit-audit" } };
 					}
 					return { type: "released" };
 				},
@@ -280,6 +281,43 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid")[]
 		},
 	};
 }
+
+test("snippet relocation uses the existing durable reply boundary and typed private approval channel", async () => {
+	for (const source of ["interactive", "extension"]) {
+		const f = conversationalRuntime();
+		try {
+			await f.emit("session_start");
+			const shown = await f.call("memory_queue", { operation: "relocate-snippets", baselineRunID: "synthetic-baseline", replacement: "/synthetic/migrated-snippets" });
+			assert.equal((shown.details as Record<string, unknown>).status, "proposal-queued");
+			assert.match(f.displays[0]!, /relocate-snippets/);
+			assert.match(f.displays[0]!, /\/synthetic\/migrated-snippets/);
+			await f.call("memory_queue", { operation: "reply" });
+			assert.equal(f.frames.filter((frame) => frame.type === "relocation-reply").length, 0);
+			await f.reply("Approve this snippet relocation", undefined, source);
+			const result = await f.call("memory_queue", { operation: "reply" });
+			assert.equal((result.details as Record<string, unknown>).status, source === "interactive" ? "relocated" : "no-live-conversation-reply");
+			const replies = f.frames.filter((frame) => frame.type === "relocation-reply");
+			assert.equal(replies.length, source === "interactive" ? 1 : 0);
+			if (replies[0]) {
+				assert.equal(replies[0].isPrivate, true);
+				assert.equal(replies[0].fields.originalText, "Approve this snippet relocation");
+				assert.equal(f.frames.find((frame) => frame.type === "relocation-presented")?.isPrivate, true);
+			}
+		} finally { await f.stop(); }
+	}
+});
+
+test("relocation receipt mismatch cannot masquerade as memory approval", async () => {
+	const f = conversationalRuntime(["invalid"]);
+	try {
+		await f.emit("session_start");
+		await f.call("memory_queue", { operation: "relocate-snippets", baselineRunID: "synthetic-baseline", replacement: "/synthetic/snippets" });
+		await f.reply("Approve this snippet relocation");
+		const result = await f.call("memory_queue", { operation: "reply" });
+		assert.equal((result.details as Record<string, unknown>).status, "outcome-unresolved");
+		assert.equal((result.details as Record<string, unknown>).recovery, "relocation-recover");
+	} finally { await f.stop(); }
+});
 
 test("the same native claim spans a later reply turn without retaining the finished tool signal", async () => {
 	const f = conversationalRuntime(); const turn = new AbortController();

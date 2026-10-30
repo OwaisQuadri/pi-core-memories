@@ -94,6 +94,34 @@ private struct PromptRelocationFixture {
 }
 
 struct PromptSourceRelocationTests {
+  @Test func missingMigratedSnippetsBlockFreshIntakeDespiteApprovedPromptRelocation() throws {
+    let relocation = try PromptRelocationFixture()
+    let fixture = relocation.transaction
+    defer { fixture.clean() }
+    try relocation.confirm(relocation.preview())
+    let replacement = fixture.root.appendingPathComponent("replacement-snippets")
+    try FileManager.default.copyItem(at: fixture.snippets, to: replacement)
+    try FileManager.default.removeItem(at: fixture.snippets)
+    #expect(throws: (any Error).self) { try relocation.run() }
+    let store = try relocation.store()
+    let before = try fixture.snapshot(fixture.root)
+    let preview = try store.previewPromptRelocation(
+      baselineRunID: relocation.baselineRunID, replacement: replacement,
+      sourceRoles: relocation.roles, role: .snippets)
+    #expect(preview.isCompatible)
+    #expect(try fixture.snapshot(fixture.root) == before)
+    _ = try store.confirmPromptRelocation(
+      baselineRunID: relocation.baselineRunID, replacement: replacement,
+      sourceRoles: relocation.roles, expectedPreviewHash: #require(preview.previewHash),
+      authorization: .explicitCaller, role: .snippets)
+    var after = try fixture.snapshot(fixture.root)
+    #expect(after.removeValue(forKey: fixture.state.appendingPathComponent("snippet-relocation.json").path) != nil)
+    #expect(after == before)
+    guard case .noNewRecords = try relocation.run() else {
+      throw MemoryError("expected fresh intake through approved relocated sources")
+    }
+  }
+
   @Test(arguments: [false, true])
   func previewAndConfirmationPreserveHistoricalReviewAndManualAuthority(isSnippetsPresent: Bool)
     throws
@@ -271,6 +299,52 @@ struct PromptSourceRelocationTests {
         expectedPreviewHash: #require(preview.previewHash), authorization: .explicitCaller)
     }
     #expect(try fixture.snapshot(fixture.root) == before)
+  }
+
+  @Test(arguments: [false, true])
+  func unrelatedTransformedSnippetCaptureCannotDisqualifySelectedRawBaseline(isCompleted: Bool) throws {
+    let relocation = try PromptRelocationFixture()
+    let fixture = relocation.transaction
+    defer { fixture.clean() }
+    try relocation.confirm(relocation.preview())
+    try fixture.append(dreamUser("next", nil, dreamOld, "Another preference.") + "\n")
+    let result = try relocation.store().run(
+      selection: fixture.selection, sourceRoles: relocation.roles, protect: { _ in },
+      prepare: { progress, sources in
+        try SessionReader(sessions: sources.sessions, snippets: sources.snippets, prompts: sources.prompts, environment: [:]).prepareProtected(
+          progress: progress, limits: DreamInputLimits(), protect: { _ in },
+          admit: { $0.map { $0.replacingOccurrences(of: "Synthetic stripping body", with: "Admitted stripping body") } })
+      }, call: { request in
+        if !isCompleted { throw CancellationError() }
+        return try transactionNotes(request)
+      })
+    let transformedRunID: String
+    switch result {
+    case .completed(let report): transformedRunID = report.runID
+    case .pending(let report): transformedRunID = report.runID
+    default: throw MemoryError("missing transformed capture")
+    }
+    let replacement = fixture.root.appendingPathComponent("migrated-snippets")
+    try FileManager.default.copyItem(at: fixture.snippets, to: replacement)
+    try FileManager.default.removeItem(at: fixture.snippets)
+    let store = try relocation.store()
+    let before = try fixture.snapshot(fixture.root)
+    #expect(throws: (any Error).self) {
+      try store.previewPromptRelocation(
+        baselineRunID: transformedRunID, replacement: replacement,
+        sourceRoles: relocation.roles, role: .snippets)
+    }
+    let preview = try store.previewPromptRelocation(
+      baselineRunID: relocation.baselineRunID, replacement: replacement,
+      sourceRoles: relocation.roles, role: .snippets)
+    #expect(preview.isCompatible)
+    #expect(preview.coverage.differingInventories.contains { $0.runID == transformedRunID })
+    #expect(preview.coverage.limitations.contains("Other capture digests describe retained admitted bytes; original raw snippet equivalence is unproven."))
+    #expect(try fixture.snapshot(fixture.root) == before)
+    _ = try store.confirmPromptRelocation(
+      baselineRunID: relocation.baselineRunID, replacement: replacement,
+      sourceRoles: relocation.roles, expectedPreviewHash: #require(preview.previewHash),
+      authorization: .explicitCaller, role: .snippets)
   }
 
   @Test(arguments: [false, true])

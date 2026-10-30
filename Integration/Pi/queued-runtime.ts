@@ -39,7 +39,7 @@ type MemoryConversationState = {
 	controller: AbortController;
 	owner: string;
 	identity: ReturnType<typeof memoryRequestIdentity>;
-	startType: "claim" | "manage-preview";
+	startType: "claim" | "manage-preview" | "relocation-preview";
 	startFields: QueueObject;
 	preview: QueuePreview;
 	proposalId: string;
@@ -215,7 +215,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const entry = conversationEntry(state, ctx);
 		if (!entry) throw new Error("The exact memory proposal has not been appended to this conversation. Nothing was approved.");
 		if (state.isAcknowledged) return;
-		const type = state.preview.isManagement ? "manage-presented" : "presented";
+		const type = state.preview.isRelocation ? "relocation-presented" : state.preview.isManagement ? "manage-presented" : "presented";
 		const ack = await state.client.request(type, { ...state.preview.tuple, messageReference: entry.id }, true);
 		if (ack.type !== type || ack.displayDigest !== state.preview.digest) throw new Error("Native memory presentation was not acknowledged. Nothing was approved.");
 		state.isAcknowledged = true;
@@ -228,7 +228,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	}
 	async function refreshConversation(state: MemoryConversationState, requestID: string): Promise<QueueObject> {
 		const frame = await state.client.request(state.startType, { ...state.startFields, ...state.identity });
-		if (frame.type !== (state.startType === "claim" ? "presentation" : "manage-presentation")) {
+		if (frame.type !== (state.startType === "claim" ? "presentation" : state.startType === "relocation-preview" ? "relocation-presentation" : "manage-presentation")) {
 			const { invocationID: _invocation, version: _version, ...publicResult } = frame;
 			return publicResult;
 		}
@@ -256,11 +256,11 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			if (!isCurrent()) throw new Error("Memory request changed before ownership was acquired.");
 			if (conversation?.client.signal?.aborted || conversation && conversation.identity.sessionID !== identity.sessionID) await closeConversation();
 			if (operation === "cancel") { await closeConversation(); return { status: "cancelled", isSaved: false }; }
-			const isPresentation = ["present", "manage", "confirm-reviewed"].includes(operation);
+			const isPresentation = ["present", "manage", "confirm-reviewed", "relocate-snippets"].includes(operation);
 			if (isPresentation || operation === "reply" || operation === "amend") {
 				if (operation === "amend") {
 					const state = conversation;
-					if (!state || state.owner !== owner || state.preview.isManagement) throw new Error("Amend the live queued finding through its original memory tool. Nothing was approved.");
+					if (!state || state.owner !== owner || state.preview.isManagement || state.preview.isRelocation) throw new Error("Amend the live queued finding through its original memory tool. Nothing was approved.");
 					activeConversation = state.controller;
 					if (params.revision !== undefined && params.revision !== state.preview.tuple.revision) throw new Error("The amendment does not match the live finding.");
 					if (!takeConversationReply(state, ctx, identity.requestID)) return { status: "no-live-conversation-reply", tool: owner };
@@ -271,13 +271,13 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					if (frame.type !== "presentation") { await closeConversation(); const { invocationID: _invocation, version: _version, ...publicResult } = frame; return publicResult; }
 					if (!isCurrent()) throw new Error("Memory request changed before the amended presentation.");
 					const preview = decodeQueuePreview(frame, state.identity);
-					if (preview.isManagement || preview.tuple.claimID !== state.preview.tuple.claimID || preview.tuple.revision !== state.preview.tuple.revision || preview.tuple.sequence === state.preview.tuple.sequence || preview.digest === state.preview.digest) throw new Error("The amendment did not replace the exact live native display.");
+					if (preview.isManagement || preview.isRelocation || preview.tuple.claimID !== state.preview.tuple.claimID || preview.tuple.revision !== state.preview.tuple.revision || preview.tuple.sequence === state.preview.tuple.sequence || preview.digest === state.preview.digest) throw new Error("The amendment did not replace the exact live native display.");
 					state.preview = preview;
 					await showConversation(state, identity.requestID, true);
 					return { status: "proposal-queued", isSaved: false, tool: owner };
 				}
-				const startType = operation === "present" ? "claim" : "manage-preview";
-				const startFields = operation === "present" ? { revision: params.revision } : { mode: operation === "confirm-reviewed" ? "confirm-reviewed" : "crud", request: params.request };
+				const startType = operation === "present" ? "claim" : operation === "relocate-snippets" ? "relocation-preview" : "manage-preview";
+				const startFields = operation === "present" ? { revision: params.revision } : operation === "relocate-snippets" ? { baselineRunID: params.baselineRunID, replacement: params.replacement } : { mode: operation === "confirm-reviewed" ? "confirm-reviewed" : "crud", request: params.request };
 				const isSame = conversation?.owner === owner && conversation.startType === startType && isDeepStrictEqual(conversation.startFields, startFields);
 				if (operation === "reply" || operation === "manage" && isSame) {
 					const state = conversation;
@@ -288,27 +288,29 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					await acknowledgeConversation(state, ctx);
 					if (!isCurrent()) throw new Error("Memory request changed before its reply.");
 					const decisionID = randomUUID();
+					const recovery = state.preview.isRelocation ? "relocation-recover" : state.preview.isManagement ? "manage-recover" : "recover";
 					let result: QueueObject;
 					try {
-						result = await state.client.request(state.preview.isManagement ? "manage-reply" : "reply", { ...state.preview.tuple, originalText: reply.text, submittedText: reply.text, decisionID, responseReference: identity.requestID }, true);
+						result = await state.client.request(state.preview.isRelocation ? "relocation-reply" : state.preview.isManagement ? "manage-reply" : "reply", { ...state.preview.tuple, originalText: reply.text, submittedText: reply.text, decisionID, responseReference: identity.requestID }, true);
 					} catch {
 						await closeConversation();
-						return { status: "outcome-unresolved", decisionID, recovery: state.preview.isManagement ? "manage-recover" : "recover" };
+						return { status: "outcome-unresolved", decisionID, recovery };
 					}
 					if (!isCurrent() || result.type === "blocked") {
 						await closeConversation();
-						return { status: "outcome-unresolved", decisionID, recovery: state.preview.isManagement ? "manage-recover" : "recover" };
+						return { status: "outcome-unresolved", decisionID, recovery };
 					}
 					if (result.type === "reply-clarify" && result.status === "no-decision") { await showConversation(state, identity.requestID, false); return { status: "needs-memory-clarification", tool: owner }; }
-					if (state.preview.isManagement && result.type === "manage-cancelled" && result.status === "not-saved") { await closeConversation(); return { status: "not-saved" }; }
+					if ((state.preview.isManagement && result.type === "manage-cancelled" || state.preview.isRelocation && result.type === "relocation-cancelled") && result.status === "not-saved") { await closeConversation(); return { status: "not-saved" }; }
 					let receipt: QueueObject;
 					try {
 						receipt = queueObject(result.receipt);
-						if (result.type !== (state.preview.isManagement ? "manage-decision" : "decision") || receipt.decisionID !== decisionID || receipt.displayDigest !== state.preview.digest || !state.preview.isManagement && receipt.revision !== state.preview.tuple.revision || typeof receipt.status !== "string") throw new Error("Memory receipt identity changed.");
+						if (result.type !== (state.preview.isRelocation ? "relocation-decision" : state.preview.isManagement ? "manage-decision" : "decision") || receipt.decisionID !== decisionID || receipt.displayDigest !== state.preview.digest || !state.preview.isManagement && !state.preview.isRelocation && receipt.revision !== state.preview.tuple.revision || typeof receipt.status !== "string" || state.preview.isRelocation && receipt.status !== "relocated") throw new Error("Memory receipt identity changed.");
+						if (state.preview.isRelocation && (receipt.sessionID !== state.identity.sessionID || receipt.requestID !== state.identity.requestID || receipt.responseReference !== identity.requestID)) throw new Error("Relocation receipt request changed.");
 						if (receipt.status === "approved" && (typeof receipt.commit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(receipt.commit) || typeof receipt.auditRef !== "string" || !receipt.auditRef.startsWith("refs/"))) throw new Error("Approved memory receipt has no checked publication.");
 					} catch {
 						await closeConversation();
-						return { status: "outcome-unresolved", decisionID, recovery: state.preview.isManagement ? "manage-recover" : "recover" };
+						return { status: "outcome-unresolved", decisionID, recovery };
 					}
 					if (receipt && receipt.status === "detached") {
 						const next = await refreshConversation(state, identity.requestID);
@@ -327,7 +329,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					combined.throwIfAborted();
 					const fields = queueObject(JSON.parse(JSON.stringify(startFields)));
 					const frame = await client.request(startType, { ...fields, ...identity });
-					if (frame.type !== (startType === "claim" ? "presentation" : "manage-presentation")) { const { invocationID: _invocation, version: _version, ...publicResult } = frame; await client.close(); return publicResult; }
+					if (frame.type !== (startType === "claim" ? "presentation" : startType === "relocation-preview" ? "relocation-presentation" : "manage-presentation")) { const { invocationID: _invocation, version: _version, ...publicResult } = frame; await client.close(); return publicResult; }
 					if (!isCurrent()) throw new Error("Memory request changed before presentation.");
 					const state: MemoryConversationState = { client, controller, owner, identity, startType, startFields: fields, preview: decodeQueuePreview(frame, identity), proposalId: "", presentedForRequest: identity.requestID, isAcknowledged: false };
 					conversation = state;
@@ -335,15 +337,16 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					return { status: "proposal-queued", tool: owner };
 				} catch (cause) { controller.abort(); if (conversation?.client === client) await closeConversation(); else await client.close(); throw cause; }
 			}
-			if (conversation && !["approved-list", "approved-get", "recover", "manage-recover"].includes(operation)) return { status: "proposal-awaits-reply", tool: conversation.owner };
-			if (operation === "recover" || operation === "manage-recover") await closeConversation();
+			if (conversation && !["approved-list", "approved-get", "recover", "manage-recover", "relocation-recover"].includes(operation)) return { status: "proposal-awaits-reply", tool: conversation.owner };
+			if (operation === "recover" || operation === "manage-recover" || operation === "relocation-recover") await closeConversation();
 			const client = await deps.open(ctx.cwd, combined);
 			try {
 				const type = operation === "pending" ? "list" : operation;
-				const fields = type === "list" ? { ...identity, offset: params.offset ?? "0" } : type === "approved-get" ? { request: params.request } : type === "recover" || type === "manage-recover" ? { decisionID: params.decisionID } : {};
+				const fields = type === "list" ? { ...identity, offset: params.offset ?? "0" } : type === "approved-get" ? { request: params.request } : type === "recover" || type === "manage-recover" || type === "relocation-recover" ? { decisionID: params.decisionID } : {};
 				const result = await client.request(type, fields);
-				if (type === "recover" || type === "manage-recover") {
+				if (type === "recover" || type === "manage-recover" || type === "relocation-recover") {
 					const receipt = result.receipt ? queueObject(result.receipt) : null;
+					if (type === "relocation-recover" && (result.type !== "relocation-decision" || receipt?.decisionID !== params.decisionID || receipt?.status !== "relocated")) return { receipt: null, status: "outcome-unresolved" };
 					return { receipt, status: result.type === "blocked" || typeof receipt?.status !== "string" ? "outcome-unresolved" : receipt.status };
 				}
 				const { invocationID: _invocation, version: _version, ...publicResult } = result;
@@ -433,9 +436,11 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	registerMemoryManagement(pi, (owner, request, signal, ctx) => perform(owner, "manage", { request }, signal, ctx));
 	pi.registerTool({
 		name: "memory_queue", label: "Memory queue", executionMode: "sequential",
-		description: "Inspect pending findings, migration inventory and approved memories during ordinary conversation. Present only a relevant exact native proposal. Use reply after the user's later ordinary memory-specific response. The extension must match its observed interactive input to the exact durable user message after the complete proposal was appended; never supply approval text or a boolean in tool arguments. Queued, transformed, image-bearing or unmatched replies need a fresh ordinary response. Clarify ambiguous replies in chat. Use amend to replace wording in the live queued finding: preserve its source annotations and show the new exact native proposal. Amendment only prepares an unapproved draft; it needs a later approval. Cancel releases without saving. This tool opens no dialog or command workflow. Only a checked approved receipt proves a save; checkout preparation does not. Recovery checks an existing decision and never replays consent.",
+		description: "Inspect pending findings, migration inventory and approved memories during ordinary conversation. Present only a relevant exact native proposal. Use reply after the user's later ordinary memory-specific response. The extension must match its observed interactive input to the exact durable user message after the complete proposal was appended; never supply approval text or a boolean in tool arguments. Queued, transformed, image-bearing or unmatched replies need a fresh ordinary response. Clarify ambiguous replies in chat. Use amend to replace wording in the live queued finding: preserve its source annotations and show the new exact native proposal. Amendment only prepares an unapproved draft; it needs a later approval. Cancel releases without saving. This tool opens no dialog or command workflow. Only a checked approved receipt proves a save; checkout preparation does not. Recovery checks an existing decision and never replays consent. relocate-snippets previews only an authenticated exact original snippet inventory from a named authoritative capture at a canonical replacement directory. Never guess replacement evidence. It requires a later explicit snippet-relocation approval, not memory approval; reply uses the same original-user boundary. A relocated receipt changes only future source intake, not memories or history.",
 		parameters: Type.Object({
-			operation: Type.Union([Type.Literal("pending"), Type.Literal("inventory"), Type.Literal("approved-list"), Type.Literal("approved-get"), Type.Literal("present"), Type.Literal("amend"), Type.Literal("reply"), Type.Literal("cancel"), Type.Literal("confirm-reviewed"), Type.Literal("recover"), Type.Literal("manage-recover")]),
+			operation: Type.Union([Type.Literal("pending"), Type.Literal("inventory"), Type.Literal("approved-list"), Type.Literal("approved-get"), Type.Literal("present"), Type.Literal("amend"), Type.Literal("reply"), Type.Literal("cancel"), Type.Literal("confirm-reviewed"), Type.Literal("recover"), Type.Literal("manage-recover"), Type.Literal("relocate-snippets"), Type.Literal("relocation-recover")]),
+			baselineRunID: Type.Optional(Type.String({ maxLength: 256, description: "Authoritative admitted run with a complete exact original snippet inventory. Required for relocate-snippets." })),
+			replacement: Type.Optional(Type.String({ maxLength: 4096, description: "Exact canonical replacement snippet directory with authenticated original contents. Required for relocate-snippets. This is not permission to create or populate it." })),
 			revision: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "Exact native finding revision from pending. Required by present; when supplied to amend, it must match the live finding." })),
 			amendment: Type.Optional(Type.Object({
 				replacement: Type.String({ minLength: 1, maxLength: 262144, description: "Complete replacement entry. Preserve every original source annotation. Native validation and transport limits apply." }),

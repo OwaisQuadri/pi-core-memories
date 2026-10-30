@@ -1,4 +1,5 @@
 import CoreMemories
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -51,6 +52,7 @@ private final class QueueInput: @unchecked Sendable {
               [
                 "list", "claim", "amend", "release", "recover", "inventory", "finish", "cancel",
                 "approved-list", "approved-get", "manage-preview", "manage-recover",
+                "relocation-preview", "relocation-recover",
               ].contains(
                 type)
             else { throw WorkerError.protocolFailure }
@@ -158,6 +160,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
       MemoryQueueManagement(queue: $0, configurationURL: configURL, configuration: configuration)
     }
     var managementDisplay: MemoryManagementDisplay?
+    var relocation: (store: DreamRunStore, baseline: String, replacement: URL, roles: DreamSourceRoles, previewHash: String, tuple: [String: String])?
     let input = QueueInput(invocation: invocation)
     queue?.isCancelled = { input.isCancelled }
     Thread.detachNewThread { input.read(descriptor: STDIN_FILENO, isControl: false) }
@@ -202,6 +205,100 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             ])
           continue
         }
+        if !isControl, type == "relocation-recover" {
+          try WorkerJSON.fields(object, header.union(["decisionID"]))
+          let store = try configuration.reviewSources(stateRoot: configuration.stateURL, memoryRepository: configuration.memoryURL, isReadOnly: true)
+          let decision = try store.recoverRelocationDecision(
+            role: .snippets, decisionID: WorkerJSON.identifier(object, "decisionID"))
+          if let decision {
+            var receipt = try encoded(decision) as! [String: Any]
+            receipt["status"] = "relocated"
+            try emit("relocation-decision", ["receipt": receipt])
+          } else {
+            try emit("blocked", ["code": "outcome-unresolved"])
+          }
+          continue
+        }
+        if !isControl, type == "relocation-preview" {
+          guard display == nil, managementDisplay == nil, relocation == nil else { throw WorkerError.protocolFailure }
+          try WorkerJSON.fields(object, header.union(["sessionID", "requestID", "baselineRunID", "replacement"]))
+          let identity = try MemoryQueueRequest(
+            sessionID: WorkerJSON.identifier(object, "sessionID"),
+            requestID: WorkerJSON.identifier(object, "requestID"))
+          let baseline = try WorkerJSON.identifier(object, "baselineRunID")
+          let target = try WorkerJSON.text(object, "replacement", maximum: 4096)
+          guard target.hasPrefix("/") else { throw WorkerError.protocolFailure }
+          let replacement = URL(fileURLWithPath: target)
+          let store = try configuration.reviewSources(stateRoot: configuration.stateURL, memoryRepository: configuration.memoryURL, isReadOnly: true)
+          let historical = try store.historicalSourceIdentities
+          let roles = try configuration.queueSourceRoles(sessions: historical.sessions, stripping: historical.stripping)
+          let preview = try store.previewPromptRelocation(
+            baselineRunID: baseline, replacement: replacement, sourceRoles: roles, role: .snippets)
+          guard preview.isCompatible, let previewHash = preview.previewHash else {
+            try emit("blocked", ["code": "snippet-inventory-mismatch"])
+            continue
+          }
+          let claimID = UUID().uuidString.lowercased()
+          var payload: [String: Any] = try [
+            "claimID": claimID, "sequence": "0", "currentBase": previewHash,
+            "previewDigest": previewHash, "request": encoded(identity),
+            "isDetachRequired": false, "operation": "relocate-snippets", "role": "snippets",
+            "preview": encoded(preview),
+            "approval": "Approve this snippet relocation. This does not approve any memory change.",
+          ]
+          let bytes = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys, .withoutEscapingSlashes])
+          let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+          let expected = [
+            "claimID": claimID, "sequence": "0", "revision": previewHash,
+            "previewDigest": previewHash, "displayDigest": digest,
+            "sessionID": identity.sessionID, "requestID": identity.requestID,
+          ]
+          relocation = (store, baseline, replacement, roles, previewHash, expected)
+          payload["displayDigest"] = digest
+          input.expect(expected, type: "relocation-presented")
+          try emit("relocation-presentation", ["display": payload, "displayBytes": bytes.base64EncodedString()])
+          continue
+        }
+        if isControl, let current = relocation {
+          try matchTuple(object, tuple: current.tuple)
+          if type == "relocation-presented" {
+            try WorkerJSON.fields(object, tuple.union(["messageReference"]))
+            _ = try WorkerJSON.identifier(object, "messageReference")
+            input.expect(current.tuple, type: "relocation-reply")
+            try emit("relocation-presented", ["displayDigest": current.tuple["displayDigest"]!])
+          } else {
+            guard type == "relocation-reply" else { throw WorkerError.protocolFailure }
+            try WorkerJSON.fields(object, tuple.union(["originalText", "submittedText", "decisionID", "responseReference"]))
+            let action = interpretMemoryConversationReply(
+              originalText: try WorkerJSON.text(object, "originalText", maximum: 65_536),
+              submittedText: try WorkerJSON.text(object, "submittedText", maximum: 65_536),
+              operation: "relocate-snippets", isDetachRequired: false)
+            if action == .clarify {
+              input.expect(current.tuple, type: "relocation-reply")
+              try emit("reply-clarify", ["status": "no-decision"])
+              continue
+            }
+            defer { relocation = nil; input.expect(nil) }
+            if action != .approve {
+              try emit("relocation-cancelled", ["status": "not-saved"])
+              continue
+            }
+            let decision = DreamRelocationDecision(
+              decisionID: try WorkerJSON.identifier(object, "decisionID"),
+              displayDigest: current.tuple["displayDigest"]!,
+              sessionID: current.tuple["sessionID"]!, requestID: current.tuple["requestID"]!,
+              responseReference: try WorkerJSON.identifier(object, "responseReference"))
+            _ = try current.store.confirmPromptRelocation(
+              baselineRunID: current.baseline, replacement: current.replacement,
+              sourceRoles: current.roles, expectedPreviewHash: current.previewHash,
+              authorization: .explicitCaller, role: .snippets, decision: decision)
+            var receipt = try encoded(decision) as! [String: Any]
+            receipt["status"] = "relocated"
+            try emit("relocation-decision", ["receipt": receipt])
+          }
+          continue
+        }
+        guard relocation == nil else { throw WorkerError.protocolFailure }
         guard let queue else {
           guard !isControl, ["inventory", "finish"].contains(type) else {
             throw WorkerError.protocolFailure

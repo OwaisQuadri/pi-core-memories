@@ -122,7 +122,7 @@ export async function openQueueClient(cwd: string, signal: AbortSignal, config: 
 		const bytes = Buffer.from(JSON.stringify({ ...fields, version: 1, type, invocationID }) + "\n");
 		if (bytes.length >= 65_536) throw new Error("Memory operation is too large.");
 		return new Promise((resolve, reject) => {
-			pending = { resolve, reject, timer: setTimeout(fail, 15_000) };
+			pending = { resolve, reject, timer: setTimeout(fail, type === "inventory" ? 120_000 : 15_000) };
 			(isPrivate ? control : child.stdin).write(bytes, (cause) => { if (cause) fail(); });
 		});
 	}

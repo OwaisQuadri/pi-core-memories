@@ -76,7 +76,7 @@ test("management preview hashes native bytes with only displayDigest excluded an
 	assert.throws(() => decodeQueuePreview(frame, identity));
 });
 
-test("native child keeps private choices on descriptor three and sanitizes stderr failures", async () => {
+test("native child keeps private choices on descriptor three and sanitizes stderr failures", async (t) => {
 	const directory = await mkdtemp(join(tmpdir(), "memory-queue-client-"));
 	const executable = join(directory, "worker.mjs");
 	await writeFile(executable, `#!/usr/bin/env node
@@ -85,6 +85,7 @@ import { createReadStream } from "node:fs";
 function input(stream, channel) {
  createInterface({ input: stream }).on("line", (line) => {
   const frame = JSON.parse(line);
+  if (frame.isSilent) return;
   if (frame.type === "stderr") { process.stderr.write("synthetic-private-marker"); return; }
   if (frame.type === "oversized") { process.stdout.write("x".repeat(8 * 1048576 + 2)); return; }
   const fields = frame.type === "start" ? { policyVersion: 1, ownership: "whole-store", successors: "source-bound-v1", isReviewAvailable: true } : { channel };
@@ -100,16 +101,45 @@ input(createReadStream(null, { fd: 3 }), "private");
 	try {
 		const controller = new AbortController();
 		const client = await openQueueClient(directory, controller.signal);
-		assert.equal((await client.request("inventory")).channel, "stdin");
-		assert.equal((await client.request("presented", {}, true)).channel, "private");
-		await assert.rejects(client.request("stderr"), (error: Error) => !error.message.includes("synthetic-private-marker"));
+		await t.test("inventory survives the ordinary deadline but still expires at 120 seconds", async (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			try {
+				const inventory = client.request("inventory");
+				t.mock.timers.tick(15_000);
+				assert.equal((await inventory).channel, "stdin");
+				const expired = assert.rejects(client.request("inventory", { isSilent: true }), /Native memory service stopped/);
+				t.mock.timers.tick(119_999);
+				assert.equal(client.signal?.aborted, false);
+				t.mock.timers.tick(1);
+				await expired;
+				assert.equal(client.signal?.aborted, true);
+			} finally { t.mock.timers.reset(); }
+		});
 		await client.close();
+		await t.test("ordinary requests still expire at 15 seconds", async (t) => {
+			const ordinary = await openQueueClient(directory, controller.signal);
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			try {
+				const expired = assert.rejects(ordinary.request("presented", { isSilent: true }), /Native memory service stopped/);
+				t.mock.timers.tick(14_999);
+				assert.equal(ordinary.signal?.aborted, false);
+				t.mock.timers.tick(1);
+				await expired;
+				assert.equal(ordinary.signal?.aborted, true);
+			} finally { t.mock.timers.reset(); await ordinary.close(); }
+		});
+		const privateClient = await openQueueClient(directory, controller.signal);
+		assert.equal((await privateClient.request("presented", {}, true)).channel, "private");
+		await assert.rejects(privateClient.request("stderr"), (error: Error) => !error.message.includes("synthetic-private-marker"));
+		await privateClient.close();
 		const oversized = await openQueueClient(directory, new AbortController().signal);
 		await assert.rejects(oversized.request("oversized"), /Native memory service stopped/);
 		await oversized.close();
 		const cancelled = await openQueueClient(directory, controller.signal);
+		const interrupted = assert.rejects(cancelled.request("inventory", { isSilent: true }), /Native memory service stopped/);
 		controller.abort();
-		await assert.rejects(cancelled.request("inventory"));
+		await interrupted;
+		assert.equal(cancelled.signal?.aborted, true);
 		await cancelled.close();
 	} finally {
 		if (previous === undefined) delete process.env.PI_CORE_MEMORIES_EXECUTABLE;

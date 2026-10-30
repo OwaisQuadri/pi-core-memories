@@ -27,7 +27,8 @@ test("public SDK session delivers a proposal and binds the later ordinary reply"
 			run: async () => assert.fail("This fixture must not call a background model."),
 			roots: async () => ({ state: join(root, "state"), sessions: join(root, "sessions"), memory: join(root, "memory"), snippets: null, prompts: null, globalAgents: null }),
 			scope: async () => ({}),
-			membership: async () => ({ set: () => {}, snapshot: async () => ({ sessionIDs: [], isForeground: false }), close: async () => {} }),
+			mark: async () => ({ close: async () => {} }),
+			live: async () => [],
 			open: async (_directory, signal) => ({
 				signal,
 				request: async (type, fields = {}, isPrivate) => {

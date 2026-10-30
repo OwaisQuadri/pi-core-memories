@@ -699,7 +699,7 @@ final class PreparationDirectory {
     else { throw MemoryError("unsafe replacement prompt directory") }
   }
 
-  func checkedTemplates(maximumBytes: Int) throws -> [PreparationStrippingInput] {
+  func checkedTemplates(maximumBytes: Int, role: DreamRelocationRole = .prompts) throws -> [PreparationStrippingInput] {
     var held = stat()
     var named = stat()
     guard fstat(descriptor, &held) == 0, lstat(url.path, &named) == 0,
@@ -723,11 +723,11 @@ final class PreparationDirectory {
       let bytes = try capture(name, maximumBytes: maximumBytes - total, isCheckingStability: true)
       guard bytes.count == before.st_size,
         let text = String(data: bytes, encoding: .utf8), !text.contains("\0"),
-        SessionReader.templateBody(text) != nil
+        (role == .prompts ? SessionReader.templateBody(text) : SessionReader.snippetBody(text)) != nil
       else { throw MemoryError("unusable replacement prompt entry") }
       total += bytes.count
       statuses[name] = before
-      inputs.append(PreparationStrippingInput(kind: "templates", name: name, bytes: bytes))
+      inputs.append(PreparationStrippingInput(kind: role.inputKind, name: name, bytes: bytes))
     }
     for (name, before) in statuses {
       var after = stat()

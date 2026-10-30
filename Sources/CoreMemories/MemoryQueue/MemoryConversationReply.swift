@@ -31,6 +31,13 @@ private func memoryReplyText(_ text: String) -> String {
 package func interpretMemoryConversationReply(
   originalText: String, submittedText: String, operation: String, isDetachRequired: Bool
 ) -> MemoryConversationAction {
+  if operation == "relocate-snippets" {
+    let text = memoryReplyText(originalText)
+    guard !isDetachRequired, !text.isEmpty, text == memoryReplyText(submittedText) else { return .clarify }
+    if ["approve this snippet relocation", "approve the displayed snippet relocation"].contains(text) { return .approve }
+    if ["reject this snippet relocation", "cancel this snippet relocation"].contains(text) { return .reject }
+    return .clarify
+  }
   guard ["add", "update", "delete", "confirm-reviewed"].contains(operation) else {
     return .clarify
   }

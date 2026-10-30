@@ -28,6 +28,18 @@ package struct DreamFreshSources: Sendable {
   package var admittedViews: [DreamAdmittedView] = []
 }
 
+package enum DreamRelocationRole: String, Codable, CaseIterable, Sendable {
+  case prompts, snippets
+
+  var inputKind: String { self == .prompts ? "templates" : "snippets" }
+  var recordName: String { self == .prompts ? PromptRelocationRecord.name : "snippet-relocation.json" }
+  var recordKind: String { self == .prompts ? "prompt-source-relocation" : "snippet-source-relocation" }
+  func offset(_ roles: DreamSourceRoles) -> Int { self == .prompts ? roles.promptsOffset : 0 }
+  func isPresent(_ roles: DreamSourceRoles) -> Bool {
+    self == .prompts ? roles.isPromptsPresent : roles.isSnippetsPresent
+  }
+}
+
 package enum PromptRelocationAuthorization: String, Codable, Sendable {
   case explicitCaller
 }
@@ -44,17 +56,17 @@ struct PromptTemplateInventory: Codable, Equatable, Sendable {
   let digest: String
   let entries: [Entry]
 
-  init(inputs: [PreparationStrippingInput], maximumBytes: Int) throws {
+  init(inputs: [PreparationStrippingInput], maximumBytes: Int, role: DreamRelocationRole = .prompts) throws {
     guard inputs.count <= 10_000 else { throw DreamRunError.limitExceeded }
     let names = inputs.map(\.name)
     guard names == names.sorted(), Set(names.map { Data($0.utf8) }).count == names.count else {
       throw DreamRunError.corruption
     }
-    var bytes = Data("templates\0".utf8)
+    var bytes = Data("\(role.inputKind)\0".utf8)
     var total = 0
     var entries: [Entry] = []
     for input in inputs {
-      guard input.kind == "templates", !input.name.isEmpty, input.name.utf8.count <= 255,
+      guard input.kind == role.inputKind, !input.name.isEmpty, input.name.utf8.count <= 255,
         !input.name.contains("/"), !input.name.contains("\0"),
         input.name.lowercased().hasSuffix(".md"),
         input.bytes.count <= maximumBytes - total
@@ -164,6 +176,7 @@ struct PromptRelocationRecord: Codable, Equatable, Sendable {
   let payload: PromptRelocationPayload
   let previewHash: String
   let authorization: PromptRelocationAuthorization
+  var decision: DreamRelocationDecision? = nil
 
   func encoded() throws -> Data {
     let bytes = try DreamRunEncoding.encode(self)
@@ -171,7 +184,7 @@ struct PromptRelocationRecord: Codable, Equatable, Sendable {
     return bytes
   }
 
-  static func decode(_ bytes: Data) throws -> Self {
+  static func decode(_ bytes: Data, role: DreamRelocationRole = .prompts) throws -> Self {
     let record: Self
     do { record = try JSONDecoder().decode(Self.self, from: bytes) } catch {
       throw MemoryError("corrupt prompt relocation record")
@@ -179,8 +192,8 @@ struct PromptRelocationRecord: Codable, Equatable, Sendable {
     guard record.payload.schemaVersion == 1, record.payload.policyVersion == 1 else {
       throw MemoryError("unsupported prompt relocation record")
     }
-    guard bytes == (try record.encoded()), record.payload.role == "prompts",
-      record.payload.kind == "prompt-source-relocation", record.payload.isRecordAbsent,
+    guard bytes == (try record.encoded()), record.payload.role == role.rawValue,
+      record.payload.kind == role.recordKind, record.payload.isRecordAbsent,
       record.previewHash == (try record.payload.fingerprint.rawValue)
     else { throw MemoryError("corrupt prompt relocation record") }
     return record
@@ -224,6 +237,22 @@ package struct PromptRelocationPreview: Encodable, Sendable {
     self.mismatches = mismatches.map(MemoryStore.safeReviewDisplay)
     isCompatible = mismatches.isEmpty
     previewHash = mismatches.isEmpty ? try payload.fingerprint.rawValue : nil
+  }
+}
+
+package struct DreamRelocationDecision: Codable, Equatable, Sendable {
+  package let decisionID: String
+  package let displayDigest: String
+  package let sessionID: String
+  package let requestID: String
+  package let responseReference: String
+
+  package init(decisionID: String, displayDigest: String, sessionID: String, requestID: String, responseReference: String) {
+    self.decisionID = decisionID
+    self.displayDigest = displayDigest
+    self.sessionID = sessionID
+    self.requestID = requestID
+    self.responseReference = responseReference
   }
 }
 

@@ -123,6 +123,79 @@ private func queueWorkerConfig(_ fixture: TransactionFixture) throws -> URL {
   return url
 }
 
+@Test(arguments: ["approve", "reject", "stale", "mutation", "memory-approval", "stdin", "transformed", "extra"])
+func queueWorkerSnippetRelocationRequiresExactPresentedRoleSpecificPrivateReply(mode: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let roles = DreamSourceRoles(isSnippetsPresent: true, isPromptsPresent: false)
+  let result = try fixture.store().run(
+    selection: fixture.selection, sourceRoles: roles, protect: { _ in },
+    prepare: { progress, _ in
+      if mode == "transformed" {
+        return try SessionReader(sessions: fixture.sessions, snippets: fixture.snippets, environment: [:]).prepareProtected(
+          progress: progress, limits: DreamInputLimits(), protect: { _ in },
+          admit: { $0.map { $0.replacingOccurrences(of: "Synthetic stripping body", with: "Admitted stripping body") } })
+      }
+      return try fixture.prepare(progress)
+    }, call: transactionNotes)
+  guard case .completed(let baseline) = result else { throw MemoryError("missing synthetic baseline") }
+  let replacement = fixture.root.appendingPathComponent("migrated-snippets")
+  try FileManager.default.copyItem(at: fixture.snippets, to: replacement)
+  try FileManager.default.removeItem(at: fixture.snippets)
+  if mode == "extra" { try fixture.write("---\nname: extra\n---\n\nExtra snippet\n", file: replacement.appendingPathComponent("extra.md")) }
+  let config = try queueWorkerConfig(fixture)
+  let main = try fixture.main()
+  let before = try fixture.snapshot(fixture.root)
+  let worker = try QueueWorkerFixture(config: config)
+  try worker.send("relocation-preview", ["sessionID": "session", "requestID": "request", "baselineRunID": baseline.runID, "replacement": replacement.path])
+  let frame = try worker.frame()
+  if ["transformed", "extra"].contains(mode) {
+    #expect(frame["type"] as? String == "blocked")
+    #expect(try fixture.snapshot(fixture.root) == before)
+    return
+  }
+  #expect(frame["type"] as? String == "relocation-presentation")
+  let display = try #require(frame["display"] as? [String: Any])
+  let request = try #require(display["request"] as? [String: Any])
+  var tuple: [String: Any] = [
+    "claimID": display["claimID"]!, "sequence": display["sequence"]!, "revision": display["currentBase"]!,
+    "previewDigest": display["previewDigest"]!, "displayDigest": display["displayDigest"]!,
+    "sessionID": request["sessionID"]!, "requestID": request["requestID"]!,
+  ]
+  #expect(try fixture.snapshot(fixture.root) == before)
+  tuple["messageReference"] = "proposal-message"
+  try worker.send("relocation-presented", tuple, isControl: true)
+  #expect(try worker.frame()["type"] as? String == "relocation-presented")
+  tuple.removeValue(forKey: "messageReference")
+  let text = mode == "reject" ? "Reject this snippet relocation" : mode == "memory-approval" ? "Save this memory" : "Approve this snippet relocation"
+  tuple["originalText"] = text
+  tuple["submittedText"] = text
+  tuple["decisionID"] = "snippet-decision"
+  tuple["responseReference"] = "original-human-reply"
+  if mode == "stale" { tuple["previewDigest"] = String(repeating: "a", count: 64) }
+  if mode == "mutation" { try fixture.write("---\nname: changed\n---\n\nChanged body\n", file: replacement.appendingPathComponent("strip.md")) }
+  try worker.send("relocation-reply", tuple, isControl: mode != "stdin")
+  let outcome = try worker.frame()
+  let record = fixture.state.appendingPathComponent("snippet-relocation.json")
+  if mode == "approve" {
+    #expect(outcome["type"] as? String == "relocation-decision")
+    #expect((outcome["receipt"] as? [String: Any])?["status"] as? String == "relocated")
+    let recovered = try QueueWorkerFixture(config: config)
+    try recovered.send("relocation-recover", ["decisionID": "snippet-decision"])
+    #expect(try recovered.frame()["receipt"] as? NSDictionary == outcome["receipt"] as? NSDictionary)
+    #expect(FileManager.default.fileExists(atPath: record.path))
+    let fresh = try fixture.store().run(
+      selection: fixture.selection, sourceRoles: roles, protect: { _ in },
+      prepare: { progress, sources in try SessionReader(sessions: sources.sessions, snippets: sources.snippets, environment: [:]).prepare(progress: progress, limits: DreamInputLimits()) }, call: transactionUncalled)
+    guard case .noNewRecords = fresh else { throw MemoryError("relocation did not restore fresh intake") }
+  } else {
+    #expect(!FileManager.default.fileExists(atPath: record.path))
+    #expect(outcome["type"] as? String == (mode == "reject" ? "relocation-cancelled" : mode == "mutation" ? "blocked" : mode == "memory-approval" ? "reply-clarify" : "final"))
+  }
+  #expect(try fixture.main() == main)
+}
+
 @Test(arguments: ["host-eof", "control-eof", "helper-death"])
 func queueWorkerDuplicateOwnerIsBusyAndHostDeathReleasesWithoutApproving(mode: String) throws {
   let fixture = try TransactionFixture()

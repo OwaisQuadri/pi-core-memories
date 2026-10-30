@@ -51,10 +51,17 @@ blocks the write. A separate review dialog is not an alternate completion path.
 
 Dreaming is background work. It does not approve or write memories.
 
-- One temporary worker serves the local interactive Pi sessions.
+- One window at a time dreams. The native worker holds an exclusive,
+  non-blocking `flock` on its dream state; other windows stay `dreaming: idle`
+  and retry later. The operating system releases the lock when the process exits.
 - Intake includes existing sessions and new completed work.
-- Foreground work has priority over intake and model calls.
-- Live sessions are excluded from the background evidence batch.
+- Dreaming continues while you use this or another Pi window.
+- Live sessions are excluded from the background evidence batch. Each
+  interactive window writes a marker for its own session in
+  `~/.pi/memory-host` (directory mode 0700, owner checked). The marker holds
+  the window's process ID; the dreamer skips sessions whose process is alive and
+  removes stale markers.
+- Findings stay pending until you approve the exact proposal in conversation.
 - With no interactive Pi session open, no worker should continue.
 - There is no permanent service or cross-device queue.
 - The selected provider, model, and thinking level stay unchanged.
@@ -72,8 +79,8 @@ another command, review mode, or host change.
 - `dreaming: active` means a validated archived-model request is in progress.
 - `dreaming: idle` means the scheduler waits or finds no new records. It does
   not prove a successful model call.
-- `dreaming: paused` means foreground work, pending review, or worker contention
-  prevents this session from dispatching.
+- `dreaming: paused` means pending review, a model change, or repeated failures
+  delay this session's next dispatch.
 - `dreaming: error(code: X, message: "...")` reports a blocked or failed attempt.
   The code and message use fixed safe text, not raw exceptions or source data.
 
@@ -184,7 +191,7 @@ review must run against the current source state. A native protocol pass, a
 source-only inspection, or a video of a removed menu does not establish the
 installed conversational flow.
 
-Acceptance includes background intake, foreground priority, normal chat
+Acceptance includes background intake while windows are in use, normal chat
 handoff, exact displayed approval, conversational changes, rejection, deferral,
 ownership recovery, last-session shutdown, preserved data, and migration.
 Installation follows checked user-merged revisions. Application retirement

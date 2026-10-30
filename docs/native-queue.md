@@ -28,7 +28,7 @@ Direct `manage` mutations and legacy manual draft Save have no review-profile pr
 
 ## Conversation and background ownership
 
-[The runtime](../Integration/Pi/queued-runtime.ts) connects ordinary interactive sessions to shared background membership. There is no review-only launch flag or alternate Pi review configuration.
+[The runtime](../Integration/Pi/queued-runtime.ts) connects ordinary interactive sessions to background dreaming. Each window marks its own live session; the native worker's exclusive dream lock makes one window the dreamer at a time. There is no review-only launch flag or alternate Pi review configuration.
 
 Native configuration and migration APIs remain available to the internal worker and isolated protocol tests. They do not create a user-facing mode or authorize model calls. The approved-memory loader uses `PI_CORE_MEMORIES_REPO` independently; verification must isolate every affected store without changing personal settings or bypassing host approval.
 

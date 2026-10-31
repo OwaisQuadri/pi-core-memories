@@ -447,8 +447,9 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 
 type DreamSubscriptionOptions = NonNullable<Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2]> & { onDispatch?: (physical: { provider: string; modelID: string; api: string }) => void };
 type DreamSubscriptionRegistry = ExtensionContext["modelRegistry"] & { streamSubscriptionSimple?: (model: NonNullable<ExtensionContext["model"]>, context: Context, options: DreamSubscriptionOptions) => ReturnType<ExtensionContext["modelRegistry"]["streamSimple"]> };
+export class DreamCallFailure extends Error {}
 export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionContext, "modelRegistry">, model: NonNullable<ExtensionContext["model"]>, selection: DreamSelection, signal: AbortSignal): Promise<string> {
-	function modelFailure(cause: string): never { throw new Error(`Dream model call failed: ${cause}`); }
+	function modelFailure(cause: string): never { throw new DreamCallFailure(`Dream model call failed: ${cause}`); }
 	function incompleteResponse(reason: AssistantMessage["stopReason"], errorMessage?: string): never {
 		const causes = { stop: "unexpected stop reason", length: "response reached the output token limit", toolUse: "unexpected tool call", error: "provider error", aborted: "provider aborted the response", pending: "response is pending", deferred: "response was deferred" };
 		const diagnostic = reason === "error" || reason === "aborted"

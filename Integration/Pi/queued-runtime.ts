@@ -8,7 +8,7 @@ import { Type, type UserMessage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { callDreamModel, dreamBatchTextBytes, dreamRoots, escapeDreamDisplay, readDreamScope, runDreamWorker, type DreamReport, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
+import { callDreamModel, DreamCallFailure, dreamBatchTextBytes, dreamRoots, escapeDreamDisplay, readDreamScope, runDreamWorker, type DreamReport, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
 import { decodeQueuePreview, openQueueClient, queueBytes, queueObject, visible, type QueueConnection, type QueueObject, type QueuePreview } from "./queue-client.ts";
 import { registerMemoryManagement } from "./management.ts";
 import { protectDreamSources } from "./source-protection.ts";
@@ -214,7 +214,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					if (isCurrent()) reportDreamStatus("dreaming: active");
 					try { return await deps.call(request, ctx, model, selection, signal); }
 					catch (error) {
-						if (isCurrent() && !signal.aborted) reportDreamStatus('dreaming: error(code: backendFailure, message: "Dream model invocation failed")');
+						if (isCurrent() && !signal.aborted) reportDreamStatus(`dreaming: error(code: backendFailure, message: ${JSON.stringify(error instanceof DreamCallFailure ? escapeDreamDisplay(error.message) : "Dream model invocation failed")})`);
 						throw error;
 					}
 				}, current.signal, () => {}, (value: unknown, signal: AbortSignal) => deps.protect(pi, invocationID, value, signal));

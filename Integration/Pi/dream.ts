@@ -617,7 +617,8 @@ const dreamReasons: Record<string, string> = {
 	callbackFailure: "The model call failed before its reply was saved.",
 	interruptedCall: "A model call was interrupted before its reply was saved.",
 	invalidDecision: "The saved model reply failed validation.",
-	staleUnpublishedPlans: "Saved proposals were older than the approved memory and were dropped.",
+	staleUnpublishedPlans: "Saved proposals are waiting for saved-suggestion recovery in the Mac app.",
+	droppedBatch: "Proposals were dropped because approved memory or rejected findings changed before the batch was published; the evidence will be dreamt again.",
 };
 const noteReasons: Record<string, string> = {
 	notDurable: "not a durable preference", alreadyRepresented: "already in memory", insufficientEvidence: "not enough evidence", unresolvedScope: "unclear which project it belongs to",

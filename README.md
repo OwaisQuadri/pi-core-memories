@@ -119,6 +119,9 @@ another command, review mode, or host change.
   `dreaming: active · 1 to review`. `to review` counts pending proposals.
 - `dreaming: error(code: X, message: "...")` reports a blocked or failed attempt.
   The code and message use fixed safe text, not raw exceptions or source data.
+  The exception is `backendFailure`: its message is the cause that the model
+  call reported, escaped, with provider error text cut to 800 bytes. It never
+  contains the model's response.
 - `dreaming: error(code: blocked, reason: R, message: "...")` adds the native
   worker's reason code, for example `workerFailure`, `protocolFailure`,
   `cancelled`, `sourceProtection:invalidReply` or

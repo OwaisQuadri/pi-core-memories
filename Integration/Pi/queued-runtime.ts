@@ -230,6 +230,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				reportDreamStatus(isRescheduled ? "dreaming: idle"
 					: report.status === "blocked" ? `dreaming: error(code: blocked, reason: ${blockedReason}, message: "Native dream worker blocked the run")`
 					: report.reason === "interruptedCall" && recorded ? `dreaming: error(code: interruptedCall, message: ${JSON.stringify(escapeDreamDisplay(`Interrupted dream needs the model it started with: ${recorded.provider}/${recorded.modelID}, thinking ${recorded.thinkingLevel}`))})`
+					: report.reason === "callbackFailure" && report.detail ? `dreaming: error(code: backendFailure, message: ${JSON.stringify(escapeDreamDisplay(report.detail))})`
 					: `dreaming: error(code: pending, reason: ${blockedReason}, message: "Native dream worker kept the run pending")`);
 				if (report.status === "blocked") await recordBlockedDream(invocationID, report);
 			} catch {

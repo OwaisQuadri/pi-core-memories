@@ -100,7 +100,7 @@ test("interrupted call stays pending, explicit retry uses exact saved input afte
 	assert.equal(completed.status, "completed"); assert.equal(completed.generation, "1");
 });
 
-test("real worker withholds provider error text, saves no response, and calls again only on explicit retry", async (t) => {
+test("real worker reports the provider's error cause but never its response, saves no response, and calls again only on explicit retry", async (t) => {
 	const f = await fixture(t); let saved: DreamRequest | undefined; let calls = 0;
 	const model = { provider: f.start.selection.provider, id: f.start.selection.modelID, api: "offline" } as Parameters<typeof dream.callDreamModel>[2];
 	const memoryBefore = f.cli("render", "--repo", f.repo, "--cwd", f.root);
@@ -115,7 +115,7 @@ test("real worker withholds provider error text, saves no response, and calls ag
 		return dream.callDreamModel(request, { modelRegistry: registry as unknown as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, f.start.selection, signal);
 	}, new AbortController().signal);
 	assert.equal(report.status, "pending"); assert.equal(report.reason, "callbackFailure"); assert.equal(report.generation, "0"); assert.equal(calls, 1);
-	assert.equal(report.detail, "The dream model call did not complete.");
+	assert.equal(report.detail, "Dream model call failed: provider error: fixture provider quota exceeded");
 	const display = dream.dreamReviewText(report);
 	assert.ok(display.includes(`Cause: ${report.detail}`)); assert.ok(display.includes("Discuss recovery in conversation before another model call.")); assert.ok(!display.includes("/dream")); assert.ok(!display.includes("PRIVATE PARTIAL RESPONSE"));
 	const directory = join(f.roots.state, "runs", report.runID!);

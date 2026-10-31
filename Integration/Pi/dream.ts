@@ -361,9 +361,9 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 			if (controller.signal.aborted) return;
 			if (!result || !isWellFormedText(result) || Buffer.byteLength(result) > maximumTextBytes) failure();
 			response = { ...binding, type: "modelResponse", text: result };
-		} catch {
+		} catch (error) {
 			if (controller.signal.aborted) return;
-			modelError = "The dream model call did not complete.";
+			modelError = error instanceof DreamCallFailure ? error.message : "The dream model call did not complete.";
 			response = { ...binding, type: "modelFailure", category: "incomplete" };
 		}
 		if (final || isClosed || error || isReplySent) return rejectTransport("model reply arrived after the run ended");
@@ -471,7 +471,7 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	let rejectAbort!: (reason: Error) => void;
 	const cancelled = new Promise<never>((_done, fail) => { rejectAbort = fail; });
 	let isDispatchInvalid = false;
-	controller.signal.addEventListener("abort", () => rejectAbort(new Error(isDispatchInvalid ? "Dream model call failed: physical dispatch changed or was invalid" : "Dream call cancelled.")), { once: true });
+	controller.signal.addEventListener("abort", () => rejectAbort(isDispatchInvalid ? new DreamCallFailure("Dream model call failed: physical dispatch changed or was invalid") : new Error("Dream call cancelled.")), { once: true });
 	void cancelled.catch(() => {});
 	let dispatch: Parameters<NonNullable<DreamSubscriptionOptions["onDispatch"]>>[0] | undefined;
 	const onDispatch: NonNullable<DreamSubscriptionOptions["onDispatch"]> = (physical) => {

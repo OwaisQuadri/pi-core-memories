@@ -243,9 +243,10 @@ test("dream status reports backend failure without exposing the model error", as
 	} finally { await f.stop(); }
 });
 
-test("dream status shows the cause that the model call reported", async () => {
+test("dream status keeps the cause that the model call reported after the worker leaves the run pending", async () => {
 	const f = runtime(async (start, call, signal) => {
-		await call(archivedRequest(start), signal);
+		try { await call(archivedRequest(start), signal); }
+		catch (error) { return { status: "pending", reason: "callbackFailure", detail: (error as Error).message } as DreamReport; }
 		return { status: "noNewRecords" } as DreamReport;
 	}, "tui", undefined, { call: async () => { throw new DreamCallFailure("Dream model call failed: provider error: prompt is too long\u001b[2J"); } });
 	try {

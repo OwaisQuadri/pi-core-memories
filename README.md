@@ -133,8 +133,7 @@ another command, review mode, or host change.
   detail is either empty or fixed text from the worker or the extension, never
   source text.
 - `dreaming: error(code: pending, reason: R, message: "...")` reports a run that
-  the native worker kept pending, for example `callbackFailure`,
-  `invalidDecision` or `staleUnpublishedPlans` (saved proposals waiting for
+  the native worker kept pending, for example `invalidDecision` or `staleUnpublishedPlans` (saved proposals waiting for
   saved-suggestion recovery). Like a blocked run, it stops dispatch until your
   next input or a model or thinking level change. A `cancelled` run, and a
   `droppedBatch` run whose batch was dropped because approved memory or

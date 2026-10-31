@@ -211,7 +211,11 @@ for (const scenario of ["missing", "conflict", "unapproved", "eventMismatch", "r
 	} } } as unknown as ExtensionContext;
 	const work = dream.callDreamModel(request, ctx, virtualModel, selection, new AbortController().signal);
 	if (scenario === "same") assert.equal(await work, " {🌱} \n");
-	else await assert.rejects(work, { message: `Dream model call failed: ${scenario === "conflict" || scenario === "unapproved" ? "physical dispatch changed or was invalid" : "response identity does not match the dispatched model"}` });
+	else await assert.rejects(work, (error: unknown) => {
+		assert.ok(error instanceof dream.DreamCallFailure);
+		assert.equal(error.message, `Dream model call failed: ${scenario === "conflict" || scenario === "unapproved" ? "physical dispatch changed or was invalid" : "response identity does not match the dispatched model"}`);
+		return true;
+	});
 	assert.equal(calls, 1);
 });
 

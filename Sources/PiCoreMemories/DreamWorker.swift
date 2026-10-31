@@ -305,11 +305,13 @@ private final class WorkerInput: @unchecked Sendable {
     let id = UUID().uuidString.lowercased()
     let digest = DreamSourceProtection.digest(pieces).rawValue
     condition.lock()
-    guard protectionRequest == nil, request == nil, failure == nil, !isCancelledFlag,
-      protectionCount < Self.maximumProtectionRequests
-    else {
+    guard protectionRequest == nil, request == nil, failure == nil, !isCancelledFlag else {
       condition.unlock()
       throw DreamSourceProtectionError.unavailable
+    }
+    guard protectionCount < Self.maximumProtectionRequests else {
+      condition.unlock()
+      throw DreamSourceProtectionError.requestLimit
     }
     protectionCount += 1
     protectionRequest = (id, digest, pieces)

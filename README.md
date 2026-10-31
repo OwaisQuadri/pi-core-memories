@@ -125,7 +125,9 @@ another command, review mode, or host change.
   The code and message use fixed safe text, not raw exceptions or source data.
 - `dreaming: error(code: blocked, reason: R, message: "...")` adds the native
   worker's reason code, for example `workerFailure`, `protocolFailure`,
-  `cancelled` or `sourceProtection:invalidReply`. A reason outside letters,
+  `cancelled`, `sourceProtection:invalidReply` or
+  `sourceProtection:requestLimit` (the run reached its 16 source checks).
+  A reason outside letters,
   digits and `:._-`, or longer than 80 characters, shows as `unknown`. Each
   blocked run also replaces `~/.pi/memory-host/last-dream-blocked.json`
   (owner-only) with its time, invocation ID, status, reason and detail. The

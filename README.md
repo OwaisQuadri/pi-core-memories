@@ -162,8 +162,11 @@ its revision and the first line of its proposed entry (up to 120 characters).
 When a finding could be relevant to the current request, the model presents
 that exact proposal. The reminder is never approval, carries no proposal
 control material, and is not saved in the session. Listing is not a pure read:
-it takes the queue lock without waiting and may rewrite `queue.json`. When
-another window holds the lock, that prompt gets no new reminder. A new reminder
+it takes the queue lock without waiting and may rewrite `queue.json`. When the
+lock is busy (an open proposal in any window, a background dream, or another
+window's queue request), that prompt gets no freshly listed reminder; if the
+user answered a listed finding since the last reminder, a copy of that
+reminder without the answered findings is added instead. A new reminder
 is also left out when nothing is pending, while a proposal awaits a reply, or
 when the queue cannot be listed in time. The request is abandoned after two
 seconds and stopping the native worker can take about one more second, so a

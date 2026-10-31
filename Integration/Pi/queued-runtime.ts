@@ -462,7 +462,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		}
 		unanchoredReminder = undefined;
 		if (!pendingReminders.length) return;
-		return { messages: messages.flatMap((message, index) => message.role === "user" && lastUserIndex.get(message.timestamp) === index ? [message, ...pendingReminders.filter((reminder) => reminder.anchor === message.timestamp).map((reminder) => reminder.message)] : [message]) };
+		return { messages: messages.flatMap((message, index) => message.role === "user" && lastUserIndex.get(message.timestamp) === index ? [message, ...pendingReminders.filter((reminder) => reminder.anchor === message.timestamp).map((reminder) => ({ ...reminder.message }))] : [message]) };
 	});
 	pi.on("session_start", async (_event, ctx) => {
 		invalidate(); const epoch = generation; await leaveSession();
@@ -495,7 +495,11 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		}
 		unanchoredReminder = undefined;
 		if (!isAlive || event.messageType !== "user" || conversation) return;
-		try { unanchoredReminder = { text: await readPendingReminder(ctx) }; } catch {}
+		try { unanchoredReminder = { text: await readPendingReminder(ctx) }; } catch {
+			const lines = String(pendingReminders.at(-1)?.message.content ?? "").split("\n");
+			const kept = lines.filter((line) => !answeredRevisions.has(/^- ([a-f0-9]{64}):/.exec(line)?.[1] ?? ""));
+			if (kept.length !== lines.length) unanchoredReminder = { text: kept.some((line) => line.startsWith("- ")) ? kept.join("\n") : undefined };
+		}
 	});
 	pi.on("message_start", (event) => {
 		if (event.message.role !== "user" || !observedReply) return;

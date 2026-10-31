@@ -294,7 +294,7 @@ test("ordinary conversation keeps the shared queue and the live session marker",
 	} finally { await f.stop(); }
 });
 
-function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued" | "deferred" | "rejected")[] = [], rows: unknown[] = []) {
+function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued" | "deferred" | "rejected")[] = [], rows: unknown[] | (() => unknown[]) = []) {
 	let f: ReturnType<typeof runtime>;
 	const journal = { queued: 0, review: 0, needsDecision: 0, notices: [] as Record<string, unknown>[] };
 	const frames: { type: string; fields: Record<string, unknown>; isPrivate?: boolean }[] = [];
@@ -309,7 +309,7 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 				request: async (type, fields = {}, isPrivate) => {
 					frames.push({ type, fields, isPrivate });
 					if (type === "drain") return { type: "drained", queued: journal.queued, review: journal.review, needsDecision: journal.needsDecision, notices: journal.notices.filter((notice) => notice.sessionID === fields.sessionID) };
-					if (type === "list") return { type: "queue", rows, nextOffset: null };
+					if (type === "list") return { type: "queue", rows: typeof rows === "function" ? rows() : rows, nextOffset: null };
 					if (!clientIndex) { signals.push(signal); f.opened.push([directory, signal]); clientIndex = signals.length; }
 					if (type === "claim" || type === "manage-preview" || type === "relocation-preview") {
 						isManagement = type === "manage-preview";
@@ -688,6 +688,41 @@ test("a finding answered in this session leaves the reminder until a new session
 		assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
 		await f.emit("session_start");
 		assert.match((await turn()).reminder!, new RegExp(revision));
+	} finally { await f.stop(); }
+});
+
+test("a failed queue read after an answer still drops the answered finding from the current reminder", async () => {
+	const answered = "a".repeat(64); const other = "b".repeat(64);
+	let isBusy = false;
+	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return [pendingRow(answered, "Answered synthetic claim."), pendingRow(other, "Other synthetic claim.")]; });
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		assert.match(first.reminder!, new RegExp(answered));
+		await f.call("memory_queue", { operation: "present", revision: answered });
+		await f.reply("leave that for later");
+		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
+		isBusy = true;
+		const busy = await turn();
+		assert.equal(busy.reminder, first.reminder!.split("\n").filter((line) => !line.startsWith(`- ${answered}:`)).join("\n"));
+		assert.match(busy.reminder!, new RegExp(`- ${other}: Other synthetic claim`));
+		assert.equal((await turn()).reminder, undefined);
+	} finally { await f.stop(); }
+});
+
+test("a failed queue read after the last listed finding is answered adds the nothing-to-ask note", async () => {
+	let isBusy = false;
+	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return [pendingRow("a".repeat(64), "Synthetic pending claim.")]; });
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		assert.ok((await turn()).reminder);
+		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
+		await f.reply("leave that for later");
+		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
+		isBusy = true;
+		assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
 	} finally { await f.stop(); }
 });
 

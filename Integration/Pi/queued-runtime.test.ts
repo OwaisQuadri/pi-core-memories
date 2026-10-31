@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { after, test } from "node:test";
-import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { Extension, ExtensionAPI, ExtensionContext, ExtensionToolContext, ModelRegistry, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DreamReport, DreamRequest, DreamStart, runDreamWorker } from "./dream.ts";
 import type { openQueueClient } from "./queue-client.ts";
 import "./test/host.ts";
 const { memoryRequestIdentity, registerQueuedRuntime, assertArchivedRequest } = await import("./queued-runtime.ts");
+const { ExtensionRunner, createExtensionRuntime } = await import("@earendil-works/pi-coding-agent");
 const stateDirectory = await mkdtemp(join(tmpdir(), "pi-core-memories-runtime-"));
 after(() => rm(stateDirectory, { recursive: true, force: true }));
 type TestEntry = Partial<Parameters<ExtensionAPI["sendMessage"]>[0]> & { type: string; id: string; message: { role: string; content?: string; timestamp?: number } };
@@ -63,7 +65,7 @@ function runtime(run: typeof runDreamWorker, mode = "tui", openFailure?: Error, 
 		mark: async (_directory, sessionID) => { marks.push(sessionID); return { close: async () => { unmarks.push(sessionID); } }; },
 		live: async () => [...peers],
 		roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}), liveDirectory: stateDirectory, ...overrides });
-	return { ctx, entries, stop, opened, marks, unmarks, peers, closed, tools, messages, statuses,
+	return { ctx, entries, stop, opened, marks, unmarks, peers, closed, tools, messages, statuses, handlers,
 		deferDelivery: () => { isDeliveryDeferred = true; },
 		deliver: () => { isDeliveryDeferred = false; for (const message of pending.splice(0)) append(message); },
 		get tool() { assert.ok(registeredTool); return registeredTool; },
@@ -292,7 +294,7 @@ test("ordinary conversation keeps the shared queue and the live session marker",
 	} finally { await f.stop(); }
 });
 
-function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued")[] = []) {
+function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued" | "deferred" | "rejected")[] = [], rows: unknown[] | (() => unknown[]) = []) {
 	let f: ReturnType<typeof runtime>;
 	const journal = { queued: 0, review: 0, needsDecision: 0, notices: [] as Record<string, unknown>[] };
 	const frames: { type: string; fields: Record<string, unknown>; isPrivate?: boolean }[] = [];
@@ -307,6 +309,7 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 				request: async (type, fields = {}, isPrivate) => {
 					frames.push({ type, fields, isPrivate });
 					if (type === "drain") return { type: "drained", queued: journal.queued, review: journal.review, needsDecision: journal.needsDecision, notices: journal.notices.filter((notice) => notice.sessionID === fields.sessionID) };
+					if (type === "list") return { type: "queue", rows: typeof rows === "function" ? rows() : rows, nextOffset: null };
 					if (!clientIndex) { signals.push(signal); f.opened.push([directory, signal]); clientIndex = signals.length; }
 					if (type === "claim" || type === "manage-preview" || type === "relocation-preview") {
 						isManagement = type === "manage-preview";
@@ -332,7 +335,7 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 					if (type === "reply" || type === "manage-reply" || type === "relocation-reply") {
 						const response = responses.shift() ?? "approved";
 						if (response === "clarify") return { type: "reply-clarify", status: "no-decision" };
-						return { type: isRelocation ? "relocation-decision" : isManagement ? "manage-decision" : "decision", receipt: { decisionID: fields.decisionID, sessionID: fields.sessionID, requestID: fields.requestID, responseReference: fields.responseReference, revision: "a".repeat(64), displayDigest: response === "invalid" ? "0".repeat(64) : digest, status: isRelocation ? "relocated" : response === "queued" ? "queued" : "approved", commit: "f".repeat(40), auditRef: "refs/core-memories/unit-audit" } };
+						return { type: isRelocation ? "relocation-decision" : isManagement ? "manage-decision" : "decision", receipt: { decisionID: fields.decisionID, sessionID: fields.sessionID, requestID: fields.requestID, responseReference: fields.responseReference, revision: "a".repeat(64), displayDigest: response === "invalid" ? "0".repeat(64) : digest, status: isRelocation ? "relocated" : response === "queued" || response === "deferred" || response === "rejected" ? response : "approved", commit: "f".repeat(40), auditRef: "refs/core-memories/unit-audit" } };
 					}
 					return { type: "released" };
 				},
@@ -553,6 +556,259 @@ test("the exact proposal stays visible but is excluded from model context", asyn
 		assert.equal(messages.length, 3); assert.equal(f.displays.length, 1);
 	} finally { await f.stop(); }
 });
+
+const pendingRow = (revision: string, proposed: string, disposition = "pending", blockReason?: string) => ({ finding: { revision, proposed: Buffer.from(proposed).toString("base64") }, disposition, ...blockReason ? { blockReason } : {} });
+type ContextMessage = { role: string; customType?: string; content?: unknown; timestamp?: number };
+const reminders = (messages: ContextMessage[]) => messages.filter((message) => message.customType === "pi-core-memories:pending-reminder");
+function reminderTurns(f: ReturnType<typeof runtime>, transcript: ContextMessage[] = [{ role: "user", content: "Earlier request.", timestamp: 1 }, { role: "assistant", content: [], timestamp: 2 }]) {
+	const runner = new ExtensionRunner([{ path: "queued-runtime", handlers: new Map([...f.handlers].map(([name, handler]) => [name, [handler]])) } as unknown as Extension], createExtensionRuntime(), "/synthetic", f.ctx.sessionManager as unknown as SessionManager, {} as ModelRegistry);
+	runner.onError((error) => assert.fail(error.error));
+	let clock = transcript.at(-1)?.timestamp ?? 0;
+	const request = async () => {
+		const messages = await runner.emitContext(transcript as AgentMessage[]) as ContextMessage[];
+		const next = messages[messages.findLastIndex((message) => message.role === "user") + 1];
+		return { messages, transcript, reminder: next?.customType === "pi-core-memories:pending-reminder" ? String(next.content) : undefined };
+	};
+	return Object.assign(async (prompt = "Check the synthetic build settings.") => {
+		await f.emit("before_agent_start", { messageType: "user", prompt });
+		transcript.push({ role: "user", content: prompt, timestamp: ++clock }, { role: "toolResult", content: [], timestamp: ++clock });
+		return request();
+	}, { request });
+}
+function reminderRuntime(rows: () => unknown[], fail?: Error, mode = "tui") {
+	return runtime(async () => ({ status: "pending" }) as DreamReport, mode, undefined, { idleMilliseconds: 60_000,
+		open: async () => ({ request: async (type) => { if (fail) throw fail; return type === "list" ? { type: "queue", rows: rows(), nextOffset: null } : { type: "released" }; }, close: async () => {} }) });
+}
+
+test("a pending finding the user's request could match reaches the model each turn, and decided findings do not", async () => {
+	const pending = "a".repeat(64);
+	const rows = [pendingRow(pending, "The synthetic build host uses the staging profile.\nSecond line."), pendingRow("b".repeat(64), "Deferred earlier.", "deferred"), pendingRow("c".repeat(64), "Approved already.", "approved"), pendingRow("d".repeat(64), "Rejected already.", "rejected"), pendingRow("e".repeat(64), "Decision unresolved.", "pending", "outcome-unresolved")];
+	const f = reminderRuntime(() => rows);
+	try {
+		await f.emit("session_start");
+		const { reminder } = await reminderTurns(f)();
+		assert.ok(reminder);
+		assert.match(reminder, /memory_queue present/); assert.match(reminder, /not approval/); assert.match(reminder, /Only the latest pending-findings reminder is current/);
+		assert.match(reminder, new RegExp(`- ${pending}: The synthetic build host uses the staging profile\.\n- ${"b".repeat(64)}: Deferred earlier\.$`));
+		assert.doesNotMatch(reminder, /Second line|Approved|Rejected|unresolved/);
+	} finally { await f.stop(); }
+});
+
+test("an unchanged pending list keeps one reminder in place so earlier context stays a cacheable prefix", async () => {
+	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		assert.ok(first.reminder);
+		const second = await turn();
+		assert.equal(JSON.stringify(second.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
+		assert.equal(second.reminder, undefined);
+		assert.equal(reminders(second.messages).length, 1);
+	} finally { await f.stop(); }
+});
+
+test("a pending reminder leaves mid-conversation system messages in place through Pi's context runner", async () => {
+	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
+	try {
+		await f.emit("session_start");
+		const system = [{ role: "system", content: "Synthetic base prompt.", timestamp: 0 }, { role: "system", content: "Synthetic tool loadout update.", timestamp: 3 }];
+		const turn = reminderTurns(f, [system[0], { role: "user", content: "Earlier request.", timestamp: 1 }, { role: "assistant", content: [], timestamp: 2 }, system[1]]);
+		const first = await turn();
+		assert.ok(first.reminder);
+		assert.deepEqual([first.messages[0], first.messages[3]], system);
+		const second = await turn();
+		assert.equal(JSON.stringify(second.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
+	} finally { await f.stop(); }
+});
+
+test("a repeat context request in one run re-sends the same reminder once and never saves or sends it", async () => {
+	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		first.transcript.push({ role: "assistant", content: [], timestamp: 10 }, { role: "toolResult", content: [], timestamp: 11 });
+		const repeated = await turn.request();
+		assert.equal(JSON.stringify(repeated.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
+		assert.equal(reminders(repeated.messages).length, 1);
+		assert.doesNotMatch(JSON.stringify([f.entries, f.messages]), /pending-reminder|Synthetic pending claim/);
+	} finally { await f.stop(); }
+});
+
+test("a prompt still gets the current reminder after compaction removes the prompt its unchanged reminder was anchored on", async () => {
+	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		assert.equal((await turn()).reminder, undefined);
+		first.transcript.splice(0, 4);
+		const compacted = await turn();
+		assert.equal(compacted.reminder, first.reminder);
+		assert.equal(reminders(compacted.messages).length, 1);
+	} finally { await f.stop(); }
+});
+
+test("a changed pending list appends a new reminder and keeps earlier reminders in place until their prompt is compacted away", async () => {
+	let rows = [pendingRow("a".repeat(64), "First synthetic claim."), pendingRow("b".repeat(64), "Second synthetic claim.")];
+	const f = reminderRuntime(() => rows);
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		rows = rows.slice(0, 1);
+		const second = await turn();
+		assert.equal(JSON.stringify(second.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
+		assert.match(second.reminder!, /First synthetic claim/); assert.doesNotMatch(second.reminder!, /Second synthetic claim/);
+		assert.equal(reminders(second.messages).length, 2);
+		rows = [];
+		const emptied = await turn();
+		assert.match(emptied.reminder!, /no pending memory proposals need asking about now; earlier pending-findings reminders are out of date/);
+		assert.equal(JSON.stringify(emptied.messages.slice(0, second.messages.length)), JSON.stringify(second.messages));
+		const unchanged = await turn();
+		assert.equal(unchanged.reminder, undefined); assert.equal(reminders(unchanged.messages).length, 3);
+		unchanged.transcript.splice(0, 4);
+		const compacted = await turn();
+		assert.deepEqual(reminders(compacted.messages).map((message) => message.content), reminders(unchanged.messages).slice(1).map((message) => message.content));
+	} finally { await f.stop(); }
+});
+
+test("a finding answered in this session leaves the reminder until a new session", async () => {
+	const revision = "a".repeat(64);
+	const f = conversationalRuntime(["deferred"], [pendingRow(revision, "Synthetic pending claim.", "deferred")]);
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		assert.match((await turn()).reminder!, new RegExp(revision));
+		await f.call("memory_queue", { operation: "present", revision });
+		await f.reply("leave that for later");
+		const deferred = await f.call("memory_queue", { operation: "reply" });
+		assert.equal((deferred.details as Record<string, unknown>).status, "deferred");
+		assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
+		await f.emit("session_start");
+		assert.match((await turn()).reminder!, new RegExp(revision));
+	} finally { await f.stop(); }
+});
+
+test("a failed queue read after an answer still drops the answered finding from the current reminder", async () => {
+	const answered = "a".repeat(64); const other = "b".repeat(64);
+	let isBusy = false;
+	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return [pendingRow(answered, "Answered synthetic claim."), pendingRow(other, "Other synthetic claim.")]; });
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		assert.match(first.reminder!, new RegExp(answered));
+		await f.call("memory_queue", { operation: "present", revision: answered });
+		await f.reply("leave that for later");
+		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
+		isBusy = true;
+		const busy = await turn();
+		assert.equal(busy.reminder, first.reminder!.split("\n").filter((line) => !line.startsWith(`- ${answered}:`)).join("\n"));
+		assert.match(busy.reminder!, new RegExp(`- ${other}: Other synthetic claim`));
+		assert.equal((await turn()).reminder, undefined);
+	} finally { await f.stop(); }
+});
+
+test("a failed queue read filters the reminder that survives a branch move, not one the move removed", async () => {
+	const answered = "a".repeat(64); const other = "b".repeat(64);
+	let isBusy = false; let rows = [pendingRow(answered, "Answered synthetic claim."), pendingRow(other, "Other synthetic claim.")];
+	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return rows; });
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		await f.call("memory_queue", { operation: "present", revision: answered });
+		await f.reply("leave that for later");
+		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
+		rows = [rows[1]!];
+		const second = await turn();
+		assert.doesNotMatch(second.reminder!, new RegExp(answered));
+		second.transcript.splice(-2);
+		isBusy = true;
+		const moved = await turn();
+		assert.equal(moved.reminder, first.reminder!.split("\n").filter((line) => !line.startsWith(`- ${answered}:`)).join("\n"));
+		assert.equal(reminders(moved.messages).length, 2);
+	} finally { await f.stop(); }
+});
+
+test("a failed queue read after the last listed finding is answered adds the nothing-to-ask note", async () => {
+	let isBusy = false;
+	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return [pendingRow("a".repeat(64), "Synthetic pending claim.")]; });
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		assert.ok((await turn()).reminder);
+		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
+		await f.reply("leave that for later");
+		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
+		isBusy = true;
+		assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
+	} finally { await f.stop(); }
+});
+
+test("the pending reminder stays under 16 KB and counts the findings it leaves out", async () => {
+	const rows = Array.from({ length: 200 }, (_, index) => pendingRow(index.toString(16).padStart(64, "0"), "x".repeat(500)));
+	const f = reminderRuntime(() => rows);
+	try {
+		await f.emit("session_start");
+		const reminder = (await reminderTurns(f)()).reminder!;
+		assert.ok(Buffer.byteLength(reminder) <= 16_384);
+		const listed = reminder.split("\n").filter((line) => line.startsWith("- "));
+		assert.equal(listed[0], `- ${"0".repeat(64)}: ${"x".repeat(119)}\u2026`);
+		assert.match(reminder, new RegExp(`\\n${200 - listed.length} more pending findings are not listed\\.$`));
+	} finally { await f.stop(); }
+});
+
+test("an unreadable or hanging queue skips the pending reminder without failing the turn", async () => {
+	const hanging = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderTimeoutMilliseconds: 20,
+		open: async (_directory, signal) => ({ request: (type) => type === "list" ? new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) : Promise.resolve({ type: "released" }), close: async () => {} }) });
+	for (const f of [runtime(async () => ({ status: "pending" }) as DreamReport, "tui", new Error("Native queue unavailable."), { idleMilliseconds: 60_000 }), reminderRuntime(() => [], new Error("Native memory service stopped.")), hanging]) {
+		try {
+			await f.emit("session_start");
+			assert.equal((await reminderTurns(f)()).reminder, undefined);
+		} finally { await f.stop(); }
+	}
+});
+
+test("a non-interactive run gets no pending reminder", async () => {
+	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")], undefined, "rpc");
+	try {
+		await f.emit("session_start");
+		assert.equal(reminders((await reminderTurns(f)()).messages).length, 0);
+	} finally { await f.stop(); }
+});
+
+test("a proposal awaiting a reply suppresses the pending reminder", async () => {
+	const f = conversationalRuntime([], [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
+	try {
+		await f.emit("session_start");
+		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
+		assert.equal(reminders((await reminderTurns(f)()).messages).length, 0);
+		assert.equal(f.frames.some((frame) => frame.type === "list"), false);
+	} finally { await f.stop(); }
+});
+
+for (const outcome of ["approved", "rejected", "amended"] as const) {
+	test(`a finding ${outcome} in this session leaves the pending reminder`, async () => {
+		const revision = "a".repeat(64);
+		const f = conversationalRuntime(outcome === "amended" ? [] : [outcome], [pendingRow(revision, "Synthetic pending claim.")]);
+		try {
+			await f.emit("session_start");
+			const turn = reminderTurns(f);
+			assert.match((await turn()).reminder!, new RegExp(revision));
+			await f.call("memory_queue", { operation: "present", revision });
+			await f.reply("synthetic answer");
+			if (outcome === "amended") {
+				const amended = await f.call("memory_queue", { operation: "amend", revision, amendment: { replacement: "Changed synthetic entry.", reason: "Revise it." } });
+				assert.equal((amended.details as Record<string, unknown>).status, "proposal-queued");
+				await f.call("memory_queue", { operation: "cancel" });
+			} else assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, outcome);
+			assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
+		} finally { await f.stop(); }
+	});
+}
 
 for (const operation of ["reply", "amend"]) {
 	for (const kind of ["missing", "extension", "rpc", "queued", "transformed", "replaced", "competing"]) {

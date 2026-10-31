@@ -156,7 +156,7 @@ test("the footer combines dream state with nonzero queued and review counts from
 	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
 	const seen: string[] = [];
 	const f = runtime(async () => { await released; return { status: "noNewRecords" } as DreamReport; }, "tui", undefined, {
-		open: async () => ({ request: async (type: string) => { seen.push(f.statuses.get("pi-core-memories:dream")!); assert.equal(type, "drain"); return { type: "drained", queued: 1, review: 2 }; }, close: async () => {} }) as unknown as Awaited<ReturnType<typeof openQueueClient>>,
+		open: async () => ({ request: async (type: string) => { seen.push(f.statuses.get("pi-core-memories:dream")!); assert.equal(type, "drain"); return { type: "drained", queued: 1, review: 2, needsDecision: [] }; }, close: async () => {} }) as unknown as Awaited<ReturnType<typeof openQueueClient>>,
 	});
 	try {
 		await f.emit("session_start"); await sleep(30);
@@ -238,7 +238,7 @@ test("a native queue refusal never retries another context", async () => {
 	try {
 		await f.emit("session_start");
 		await assert.rejects(f.tool.execute("refused", { operation: "pending" }, undefined, undefined, f.ctx), /Native queue unavailable/);
-		assert.equal(f.opened.length, 1); assert.equal(f.opened[0]?.length, 2);
+		assert.equal(f.opened.length, 2); assert.equal(f.opened[0]?.length, 2);
 		assert.equal(f.closed.length, 0); assert.equal(f.marks.length, 1);
 	} finally { await f.stop(); }
 });
@@ -250,24 +250,27 @@ test("ordinary conversation keeps the shared queue and the live session marker",
 		assert.doesNotMatch(JSON.stringify(f.tool.parameters), /"review"|"manage"/);
 		assert.deepEqual([...f.tools.keys()].sort(), ["memory_add", "memory_delete", "memory_get", "memory_list", "memory_queue", "memory_update"]);
 		await f.tool.execute("default", { operation: "pending" }, undefined, undefined, f.ctx);
-		assert.equal(f.opened.length, 1); assert.equal(f.opened[0]?.length, 2);
-		assert.equal(f.marks.length, 1); assert.equal(f.closed.length, 1);
+		assert.equal(f.opened.length, 3); assert.equal(f.opened[0]?.length, 2);
+		assert.equal(f.marks.length, 1); assert.equal(f.closed.length, 3);
 	} finally { await f.stop(); }
 });
 
-function conversationalRuntime(responses: ("approved" | "clarify" | "invalid")[] = []) {
+function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued")[] = []) {
 	let f: ReturnType<typeof runtime>;
+	const journal = { queued: 0, review: 0, needsDecision: [] as Record<string, unknown>[] };
 	const frames: { type: string; fields: Record<string, unknown>; isPrivate?: boolean }[] = [];
 	const signals: AbortSignal[] = []; const closes: number[] = [];
 	f = runtime(async () => assert.fail("A native conversation must prevent background dispatch"), "tui", undefined, {
 		idleMilliseconds: 60_000,
 		open: async (directory, signal) => {
-			assert.ok(signal); signals.push(signal); f.opened.push([directory, signal]);
-			let isManagement = false; let isRelocation = false; let digest = ""; let native: Record<string, unknown> | undefined; const clientIndex = signals.length;
+			assert.ok(signal);
+			let isManagement = false; let isRelocation = false; let digest = ""; let native: Record<string, unknown> | undefined; let clientIndex = 0;
 			return {
 				signal,
 				request: async (type, fields = {}, isPrivate) => {
 					frames.push({ type, fields, isPrivate });
+					if (type === "drain") return { type: "drained", queued: journal.queued, review: journal.review, needsDecision: journal.needsDecision.splice(0) };
+					if (!clientIndex) { signals.push(signal); f.opened.push([directory, signal]); clientIndex = signals.length; }
 					if (type === "claim" || type === "manage-preview" || type === "relocation-preview") {
 						isManagement = type === "manage-preview";
 						isRelocation = type === "relocation-preview";
@@ -292,16 +295,16 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid")[]
 					if (type === "reply" || type === "manage-reply" || type === "relocation-reply") {
 						const response = responses.shift() ?? "approved";
 						if (response === "clarify") return { type: "reply-clarify", status: "no-decision" };
-						return { type: isRelocation ? "relocation-decision" : isManagement ? "manage-decision" : "decision", receipt: { decisionID: fields.decisionID, sessionID: fields.sessionID, requestID: fields.requestID, responseReference: fields.responseReference, revision: "a".repeat(64), displayDigest: response === "invalid" ? "0".repeat(64) : digest, status: isRelocation ? "relocated" : "approved", commit: "f".repeat(40), auditRef: "refs/core-memories/unit-audit" } };
+						return { type: isRelocation ? "relocation-decision" : isManagement ? "manage-decision" : "decision", receipt: { decisionID: fields.decisionID, sessionID: fields.sessionID, requestID: fields.requestID, responseReference: fields.responseReference, revision: "a".repeat(64), displayDigest: response === "invalid" ? "0".repeat(64) : digest, status: isRelocation ? "relocated" : response === "queued" ? "queued" : "approved", commit: "f".repeat(40), auditRef: "refs/core-memories/unit-audit" } };
 					}
 					return { type: "released" };
 				},
-				close: async () => { if (!closes.includes(clientIndex)) closes.push(clientIndex); },
+				close: async () => { if (clientIndex && !closes.includes(clientIndex)) closes.push(clientIndex); },
 			};
 		},
 	});
 	return {
-		...f, frames, signals, closes,
+		...f, frames, signals, closes, journal,
 		get displays() { return f.messages.map((message) => String(message.content)); },
 		reply: async (text: string, submitted = text, source = "interactive", streamingBehavior?: "steer" | "followUp") => {
 			await f.emit("input", { text, source, streamingBehavior });
@@ -351,6 +354,34 @@ test("relocation receipt mismatch cannot masquerade as memory approval", async (
 		const result = await f.call("memory_queue", { operation: "reply" });
 		assert.equal((result.details as Record<string, unknown>).status, "outcome-unresolved");
 		assert.equal((result.details as Record<string, unknown>).recovery, "relocation-recover");
+	} finally { await f.stop(); }
+});
+
+test("a journaled reply is counted, any memory operation drains the native journal, and a failed apply asks the user again", async () => {
+	const f = conversationalRuntime(["queued"]);
+	const revision = "a".repeat(64);
+	try {
+		await f.emit("session_start");
+		f.journal.review = 1;
+		await f.call("memory_queue", { operation: "pending" });
+		assert.equal(f.frames[0]?.type, "drain");
+		await f.call("memory_queue", { operation: "present", revision });
+		await f.reply("save that memory");
+		f.journal.queued = 1; f.journal.review = 0;
+		const queued = await f.call("memory_queue", { operation: "reply" });
+		assert.equal((queued.details as Record<string, unknown>).status, "decision-queued");
+		assert.match(f.statuses.get("pi-core-memories:dream")!, /1 queued/);
+		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /to review/);
+		f.journal.queued = 0; f.journal.review = 1;
+		f.journal.needsDecision.push({ decisionID: "journaled", revision, status: "needs-decision" });
+		await f.call("memory_queue", { operation: "pending" });
+		const notice = f.messages.find((message) => message.customType === "pi-core-memories:needs-decision");
+		assert.ok(notice); assert.equal(notice.display, true);
+		assert.match(String(notice.content), new RegExp(`not applied[\\s\\S]*Nothing was saved[\\s\\S]*${revision}`));
+		assert.match(f.statuses.get("pi-core-memories:dream")!, /1 need decision/);
+		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /queued/);
+		await f.call("memory_queue", { operation: "present", revision });
+		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /need decision/);
 	} finally { await f.stop(); }
 });
 

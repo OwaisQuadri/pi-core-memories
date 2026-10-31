@@ -82,6 +82,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let isAlive = false;
 	let dreamStatus: string | undefined;
 	let footerCounts = { queued: 0, review: 0 };
+	const needsDecision = new Set<string>();
 	let timerDelay = 0;
 	let marking: Promise<void> | undefined;
 	const markerError = 'dreaming: error(code: liveSessionUnavailable, message: "Live session marker is unavailable")';
@@ -90,7 +91,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let conversation: MemoryConversationState | undefined;
 	let observedReply: MemoryReplyInput | undefined;
 	let conversationClose = Promise.resolve();
-	pi.registerMessageRenderer("pi-core-memories:proposal", (message) => typeof message.content === "string" ? new Text(message.content, 0, 0) : undefined);
+	for (const type of ["pi-core-memories:proposal", "pi-core-memories:needs-decision"]) pi.registerMessageRenderer(type, (message) => typeof message.content === "string" ? new Text(message.content, 0, 0) : undefined);
 	function closeConversation(): Promise<void> {
 		const previous = conversation; conversation = undefined; observedReply = undefined;
 		if (previous) { previous.controller.abort(); conversationClose = previous.client.close(); }
@@ -99,7 +100,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	function reportDreamStatus(value: string | undefined): void {
 		if (value !== undefined && !isAlive) return;
 		dreamStatus = value;
-		const counts = [footerCounts.queued ? `${footerCounts.queued} queued` : "", footerCounts.review ? `${footerCounts.review} to review` : ""].filter(Boolean);
+		const counts = [footerCounts.queued ? `${footerCounts.queued} queued` : "", needsDecision.size ? `${needsDecision.size} need decision` : "", footerCounts.review ? `${footerCounts.review} to review` : ""].filter(Boolean);
 		const text = value === undefined || value.startsWith("dreaming: error(") ? value : [value, ...counts].join(" · ");
 		try { if (context?.hasUI) context.ui.setStatus("pi-core-memories:dream", text); } catch {}
 	}
@@ -107,8 +108,12 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const client = await deps.open(cwd, signal);
 		try {
 			const result = await client.request("drain", {});
-			if (result.type === "drained" && typeof result.queued === "number" && typeof result.review === "number") footerCounts = { queued: result.queued, review: result.review };
-		} finally { await client.close(); }
+			if (result.type !== "drained" || typeof result.queued !== "number" || typeof result.review !== "number" || !Array.isArray(result.needsDecision)) return;
+			const revisions = result.needsDecision.map((value) => queueObject(value).revision).filter((value): value is string => typeof value === "string");
+			footerCounts = { queued: result.queued, review: result.review };
+			for (const revision of revisions) needsDecision.add(revision);
+			for (const revision of revisions) pi.sendMessage({ customType: "pi-core-memories:needs-decision", content: `A memory decision you gave earlier was not applied: the proposal, its evidence or the memory store changed before it could be applied. Nothing was saved. To decide again, present revision ${revision} with memory_queue and answer the new proposal.`, display: true, details: { revision } }, { triggerTurn: false });
+		} finally { await client.close(); reportDreamStatus(dreamStatus); }
 	}
 	function stopBackground(): void {
 		clearTimeout(timer); timer = undefined; background?.abort();
@@ -198,6 +203,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					}
 				}, current.signal, () => {}, (value: unknown, signal: AbortSignal) => deps.protect(pi, invocationID, value, signal));
 				if (!isCurrent()) return;
+				await drainDecisions(ctx.cwd, current.signal).catch(() => {});
+				if (!isCurrent()) return;
 				if (["blocked", "pending"].includes(report.status)) failures = 3;
 				else failures = 0;
 				reportDreamStatus(report.status === "blocked"
@@ -272,9 +279,16 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const abortConversation = () => activeConversation?.abort();
 		combined.addEventListener("abort", abortConversation, { once: true });
 		clearTimeout(timer); timer = undefined;
+		const refreshCounts = () => conversation || background ? Promise.resolve() : drainDecisions(ctx.cwd, combined).catch(() => {});
+		if (operation === "present" && typeof params.revision === "string") needsDecision.delete(params.revision);
 		foregroundCompletion = (async () => {
 			await conversationClose;
-			if (footerCounts.queued && operation !== "reply" && !background) await drainDecisions(ctx.cwd, combined).then(() => reportDreamStatus(dreamStatus)).catch(() => {});
+			if (operation !== "reply") await refreshCounts();
+			const result = await run();
+			if (isCurrent()) await refreshCounts();
+			return result;
+		})();
+		async function run(): Promise<unknown> {
 			combined.throwIfAborted();
 			if (!isCurrent()) throw new Error("Memory request changed before ownership was acquired.");
 			if (conversation?.client.signal?.aborted || conversation && conversation.identity.sessionID !== identity.sessionID) await closeConversation();
@@ -337,7 +351,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					}
 					if (receipt.status === "queued") {
 						await closeConversation();
-						footerCounts = { ...footerCounts, queued: footerCounts.queued + 1 };
+						footerCounts = { ...footerCounts, queued: footerCounts.queued + 1, review: Math.max(0, footerCounts.review - 1) };
 						reportDreamStatus(dreamStatus);
 						return { status: "decision-queued", decisionID, recovery, message: "Your decision was recorded. A dream run holds the memory lock, so the decision will be applied shortly, after the same native checks. Nothing is saved yet." };
 					}
@@ -381,7 +395,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				const { invocationID: _invocation, version: _version, ...publicResult } = result;
 				return publicResult;
 			} finally { await client.close(); }
-		})();
+		}
 		try { return await foregroundCompletion; }
 		catch (cause) { if (activeConversation) await closeConversation(); throw cause; }
 		finally {

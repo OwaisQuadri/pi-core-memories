@@ -73,13 +73,22 @@ Dreaming is background work. It does not approve or write memories.
 - Decision journal: a dream run holds the memory lock for its whole run. If you
   answer a proposal while another window dreams, the window records your exact
   decision (proposal revision, display digest, the durable reply reference, and
-  the action) in the queue ledger and tells you it will apply shortly. The next
-  dream run applies journaled decisions first; any window that next gets the
-  lock also applies them. Each apply repeats the same native checks as an
-  immediate reply. If the proposal or its evidence changed, nothing is applied
-  and the decision shows as `needs-decision`, so you must decide again. A
-  decision is applied at most once; a crash between publication and receipt
-  recovers the published result.
+  the action) in the queue ledger and tells you it will apply shortly. Each
+  dream run applies journaled decisions before and after its run, and every
+  window applies them before and after each memory tool operation when no
+  proposal is open, whatever that window queued itself. Each apply repeats
+  the same native checks as an immediate reply. If the proposal or its
+  evidence changed, or the apply fails before it publishes, nothing is applied
+  and the decision gets a `needs-decision` receipt; later journaled decisions
+  still apply. The window that applies the journal posts a visible message in
+  its conversation that names the revision and asks you to decide again; the
+  agent presents the current proposal for a fresh reply. That window's footer
+  shows `N need decision` until the revision is presented again. A decision is
+  applied at most once; a crash between publication and receipt recovers the
+  published result.
+- Footer counts come from the native journal: `N queued` counts journaled
+  decisions not yet applied, and `N to review` counts pending findings without
+  one. They refresh after each journal apply.
 - With no interactive Pi session open, no worker should continue.
 - There is no permanent service or cross-device queue.
 - The selected provider, model, and thinking level stay unchanged.

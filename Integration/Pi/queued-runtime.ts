@@ -143,10 +143,11 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		await previous?.close();
 	}
 	function schedule(): void {
-		const isBlocked = !isAlive || !context || !marker || !!foreground || !!conversation || failures >= 3;
+		const isMarkerMissing = !marker && !!context?.sessionManager.getSessionFile();
+		const isBlocked = !isAlive || !context || isMarkerMissing || !!foreground || !!conversation || failures >= 3;
 		if (isBlocked) { clearTimeout(timer); timer = undefined; }
 		if (!isAlive || !context) return;
-		if (!marker) { reportDreamStatus(markerError); retryMark(); return; }
+		if (isMarkerMissing) { reportDreamStatus(markerError); retryMark(); return; }
 		if (isBlocked) {
 			if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: paused");
 			return;
@@ -411,12 +412,13 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		invalidate(); const epoch = generation; await leaveSession();
 		if (generation !== epoch) return;
 		context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; failures = 0;
-		if (!ctx.sessionManager.getSessionFile()) return;
-		try {
-			const created = await deps.mark(deps.liveDirectory, ctx.sessionManager.getSessionId());
-			if (generation !== epoch) { await created.close(); return; }
-			marker = created;
-		} catch { if (generation === epoch && isAlive) reportDreamStatus(markerError); }
+		if (ctx.sessionManager.getSessionFile()) {
+			try {
+				const created = await deps.mark(deps.liveDirectory, ctx.sessionManager.getSessionId());
+				if (generation !== epoch) { await created.close(); return; }
+				marker = created;
+			} catch { if (generation === epoch && isAlive) reportDreamStatus(markerError); }
+		}
 		schedule();
 	});
 	pi.on("input", (event, ctx) => {

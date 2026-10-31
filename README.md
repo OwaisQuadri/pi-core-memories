@@ -70,7 +70,8 @@ Dreaming is background work. It does not approve or write memories.
   that session excluded until the new process exits. This fails safe: it can
   delay intake of a finished session, but never admits a live one. If a window
   cannot write its marker, it shows `liveSessionUnavailable` and retries on
-  later schedules; this does not count as a worker failure.
+  later schedules; this does not count as a worker failure. A window with no
+  session file has no session to exclude; it writes no marker and still dreams.
 - Findings stay pending until you approve the exact proposal in conversation.
 - Decision journal: a dream run holds the memory lock for its whole run. If you
   answer a proposal while another window dreams, the window records your exact

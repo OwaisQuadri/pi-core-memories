@@ -143,6 +143,18 @@ test("a failed live marker is retried on later schedules", async () => {
 	} finally { await f.stop(); }
 });
 
+test("an interactive window with no session file dreams without a live marker error", async () => {
+	let runs = 0;
+	const f = runtime(async () => { runs++; return { status: "noNewRecords" } as DreamReport; });
+	Object.assign(f.ctx.sessionManager, { getSessionFile: () => undefined });
+	try {
+		await f.emit("session_start"); await f.emit("input", { source: "interactive", text: "keep working" }); await sleep(30);
+		assert.deepEqual(f.marks, []);
+		assert.ok(runs > 0);
+		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /error/);
+	} finally { await f.stop(); }
+});
+
 for (const mode of ["print", "rpc"]) {
 	test(`a ${mode} session with a session file writes a live marker but never dreams`, async () => {
 		const f = runtime(async () => assert.fail("Non-interactive sessions must not dream"), mode);

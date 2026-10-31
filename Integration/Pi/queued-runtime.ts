@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -6,7 +7,7 @@ import { Type, type UserMessage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { callDreamModel, dreamBatchTextBytes, dreamRoots, readDreamScope, runDreamWorker, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
+import { callDreamModel, dreamBatchTextBytes, dreamRoots, readDreamScope, runDreamWorker, type DreamReport, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
 import { decodeQueuePreview, openQueueClient, queueObject, type QueueConnection, type QueueObject, type QueuePreview } from "./queue-client.ts";
 import { registerMemoryManagement } from "./management.ts";
 import { protectDreamSources } from "./source-protection.ts";
@@ -117,6 +118,14 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			}
 		} finally { await client.close(); reportDreamStatus(dreamStatus); }
 	}
+	async function recordBlockedDream(invocationID: string, report: DreamReport): Promise<void> {
+		const path = join(deps.liveDirectory, "last-dream-blocked.json");
+		const staging = `${path}.${randomUUID()}.tmp`;
+		try {
+			await writeFile(staging, JSON.stringify({ time: new Date().toISOString(), invocationID, status: report.status, reason: report.reason, detail: report.detail }) + "\n", { mode: 0o600, flag: "wx" });
+			await rename(staging, path);
+		} catch { await unlink(staging).catch(() => {}); }
+	}
 	function stopBackground(): void {
 		clearTimeout(timer); timer = undefined; background?.abort();
 		if (dreamStatus === "dreaming: active") reportDreamStatus("dreaming: paused");
@@ -210,9 +219,11 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				if (!isCurrent()) return;
 				if (["blocked", "pending"].includes(report.status)) failures = 3;
 				else failures = 0;
+				const blockedReason = report.reason && /^[A-Za-z0-9:._-]{1,80}$/.test(report.reason) ? report.reason : "unknown";
 				reportDreamStatus(report.status === "blocked"
-					? 'dreaming: error(code: blocked, message: "Native dream worker blocked the run")'
+					? `dreaming: error(code: blocked, reason: ${blockedReason}, message: "Native dream worker blocked the run")`
 					: report.status === "pending" ? "dreaming: paused" : "dreaming: idle");
+				if (report.status === "blocked") await recordBlockedDream(invocationID, report);
 			} catch {
 				if (isCurrent() && isLiveUnavailable) reportDreamStatus(markerError);
 				else if (isCurrent()) {

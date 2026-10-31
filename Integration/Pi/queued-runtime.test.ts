@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DreamReport, DreamRequest, DreamStart, runDreamWorker } from "./dream.ts";
 import type { openQueueClient } from "./queue-client.ts";
 import "./test/host.ts";
 const { memoryRequestIdentity, registerQueuedRuntime, assertArchivedRequest } = await import("./queued-runtime.ts");
+const stateDirectory = await mkdtemp(join(tmpdir(), "pi-core-memories-runtime-"));
+after(() => rm(stateDirectory, { recursive: true, force: true }));
 type TestEntry = Partial<Parameters<ExtensionAPI["sendMessage"]>[0]> & { type: string; id: string; message: { role: string; content?: string; timestamp?: number } };
 function context() {
 	const entries: TestEntry[] = [{ type: "message", id: "user-entry", message: { role: "user", content: "Start the conversation.", timestamp: 0 } }];
@@ -57,7 +62,7 @@ function runtime(run: typeof runDreamWorker, mode = "tui", openFailure?: Error, 
 		open: async (...args) => { opened.push(args); if (openFailure) throw openFailure; return { request: async () => ({ type: "queue", rows: [], nextOffset: null }), close: async () => { closed.push("closed"); } }; },
 		mark: async (_directory, sessionID) => { marks.push(sessionID); return { close: async () => { unmarks.push(sessionID); } }; },
 		live: async () => [...peers],
-		roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}), ...overrides });
+		roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}), liveDirectory: stateDirectory, ...overrides });
 	return { ctx, entries, stop, opened, marks, unmarks, peers, closed, tools, messages, statuses,
 		deferDelivery: () => { isDeliveryDeferred = true; },
 		deliver: () => { isDeliveryDeferred = false; for (const message of pending.splice(0)) append(message); },
@@ -66,13 +71,13 @@ function runtime(run: typeof runDreamWorker, mode = "tui", openFailure?: Error, 
 }
 const archivedRequest = (start: DreamStart, session = "archived"): DreamRequest => ({ version: 1, type: "modelRequest", invocationID: start.invocationID, requestID: "request", runID: "run", generation: "1", inputHash: "a".repeat(64), contextHash: "b".repeat(64), requestHash: "c".repeat(64), selection: start.selection, systemPrompt: "Synthetic status test", messages: [{ role: "user", text: JSON.stringify({ primaryEvidence: [{ source: { session, entry: "entry", part: 0 } }] }), timestampMilliseconds: 0 }] });
 
-test("dreaming keeps running while this window works and reports blocked outcomes without details", async () => {
+test("dreaming keeps running while this window works and reports the blocked reason without details", async () => {
 	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
 	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
-	let runs = 0; let workerSignal: AbortSignal | undefined;
+	let runs = 0; let workerSignal: AbortSignal | undefined; let blockedInvocationID = "";
 	const f = runtime(async (start, call, signal) => {
 		runs++; workerSignal = signal;
-		if (runs > 1) return { status: "blocked", reason: "PRIVATE_REASON", detail: "PRIVATE_DETAIL" } as DreamReport;
+		if (runs > 1) { blockedInvocationID = start.invocationID; return { status: "blocked", reason: "sourceProtection:invalidReply", detail: "PRIVATE_DETAIL" } as DreamReport; }
 		await call(archivedRequest(start), signal);
 		return { status: "noNewRecords" } as DreamReport;
 	}, "tui", undefined, { call: async () => {
@@ -89,10 +94,22 @@ test("dreaming keeps running while this window works and reports blocked outcome
 		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active");
 		release(); await sleep(30);
 		assert.equal(runs, 2);
-		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: blocked/);
-		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /PRIVATE/);
+		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: blocked, reason: sourceProtection:invalidReply, message: "Native dream worker blocked the run")');
+		const path = join(stateDirectory, "last-dream-blocked.json");
+		assert.equal((await stat(path)).mode & 0o777, 0o600);
+		const { time, ...recorded } = JSON.parse(await readFile(path, "utf8"));
+		assert.ok(!Number.isNaN(Date.parse(time)));
+		assert.deepEqual(recorded, { invocationID: blockedInvocationID, status: "blocked", reason: "sourceProtection:invalidReply", detail: "PRIVATE_DETAIL" });
 	} finally { await f.stop(); }
 	assert.equal(f.statuses.has("pi-core-memories:dream"), false);
+});
+
+test("a blocked reason with unsafe characters cannot inject text into the footer", async () => {
+	const f = runtime(async () => ({ status: "blocked", reason: 'x") PRIVATE\nreason', detail: null }) as unknown as DreamReport);
+	try {
+		await f.emit("session_start"); await sleep(30);
+		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: blocked, reason: unknown, message: "Native dream worker blocked the run")');
+	} finally { await f.stop(); }
 });
 
 test("a window that loses the native dream lock stays idle and keeps retrying", async () => {

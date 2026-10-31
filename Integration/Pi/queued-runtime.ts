@@ -167,7 +167,10 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			if ((foreground || conversation) && !dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: paused");
 			return;
 		}
-		if (background) return;
+		if (background) {
+			if (dreamStatus === "dreaming: paused") reportDreamStatus("dreaming: active");
+			return;
+		}
 		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: idle");
 		const delay = deps.idleMilliseconds * 2 ** failures;
 		if (timer && timerDelay <= delay) return;

@@ -344,6 +344,20 @@ test("the footer shows paused only while a foreground memory write holds the que
 	} finally { await f.stop(); }
 });
 
+test("closing a proposal during a background run returns the footer from paused to active", async () => {
+	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
+	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
+	const f = conversationalRuntime([], [], { idleMilliseconds: 5, run: async () => { enter(); await released; return { status: "noNewRecords" } as DreamReport; } });
+	try {
+		await f.emit("session_start");
+		await Promise.race([entered, sleep(1000).then(() => assert.fail("No background run"))]);
+		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
+		await f.call("memory_queue", { operation: "cancel" });
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active");
+	} finally { release(); await f.stop(); }
+});
+
 
 test("a native queue refusal never retries another context", async () => {
 	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", new Error("Native queue unavailable."));
@@ -367,7 +381,7 @@ test("ordinary conversation keeps the shared queue and the live session marker",
 	} finally { await f.stop(); }
 });
 
-function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued" | "deferred" | "rejected")[] = [], rows: unknown[] | (() => unknown[]) = []) {
+function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued" | "deferred" | "rejected")[] = [], rows: unknown[] | (() => unknown[]) = [], overrides: NonNullable<Parameters<typeof registerQueuedRuntime>[1]> = {}) {
 	let f: ReturnType<typeof runtime>;
 	const journal = { queued: 0, review: 0, needsDecision: 0, notices: [] as Record<string, unknown>[] };
 	const frames: { type: string; fields: Record<string, unknown>; isPrivate?: boolean }[] = [];
@@ -415,6 +429,7 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 				close: async () => { if (clientIndex && !closes.includes(clientIndex)) closes.push(clientIndex); },
 			};
 		},
+		...overrides,
 	});
 	return {
 		...f, frames, signals, closes, journal,

@@ -1354,7 +1354,7 @@ public final class DreamRunStore {
       if isCancelled() { return pending(sealed, reason: .cancelled) }
       if try sealed.directory.isPresent(attempt.callName) {
         let callSelection = try loadCallSelection(sealed, attempt: attempt)
-        if resume != .retryInterruptedCall && !isReplacementStarted {
+        if resume == .retryInterruptedCall ? callSelection != selection : !isReplacementStarted {
           return pending(sealed, reason: .interruptedCall, callSelection: callSelection)
         }
       } else if attempt.number > 0, !isReplacementStarted, resume != .retryInterruptedCall {

@@ -151,7 +151,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		})().finally(() => { marking = undefined; if (generation === epoch) schedule(); });
 	}
 	function invalidateConversation(): void { foreground?.abort(); generation++; void closeConversation(); }
-	function invalidate(): void { invalidateConversation(); stopBackground(); }
+	function invalidate(): void { invalidateConversation(); stopBackground(); interruptedCallSelection = undefined; }
 	async function leaveSession(): Promise<void> {
 		const previous = marker; marker = undefined;
 		reportDreamStatus(undefined);

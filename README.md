@@ -80,12 +80,16 @@ Dreaming is background work. It does not approve or write memories.
   the same native checks as an immediate reply. If the proposal or its
   evidence changed, or the apply fails before it publishes, nothing is applied
   and the decision gets a `needs-decision` receipt; later journaled decisions
-  still apply. The window that applies the journal posts a visible message in
-  its conversation that names the revision and asks you to decide again; the
-  agent presents the current proposal for a fresh reply. That window's footer
-  shows `N need decision` until the revision is presented again. A decision is
-  applied at most once; a crash between publication and receipt recovers the
-  published result.
+  still apply. A `needs-decision` receipt is written only after a fresh check
+  shows that nothing was published, and a later published result replaces it.
+  Only the window whose session gave the answer posts a visible message, once
+  per revision: the earlier answer was not applied and does not count, nothing
+  was saved, and the agent will present the current proposal. The message never
+  counts as an answer; a new answer binds to the new proposal. If that session
+  is gone, no window posts a message, and the revision shows under
+  `N to review`. Every window's footer shows `N need decision` from the
+  journal until the revision gets a new decision. A decision is applied at most
+  once; a crash between publication and receipt recovers the published result.
 - Footer counts come from the native journal: `N queued` counts journaled
   decisions not yet applied, and `N to review` counts pending findings without
   one. They refresh after each journal apply.

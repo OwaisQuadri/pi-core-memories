@@ -81,8 +81,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let isAlive = false;
 	let dreamStatus: string | undefined;
-	let footerCounts = { queued: 0, review: 0 };
-	const needsDecision = new Set<string>();
+	let footerCounts = { queued: 0, review: 0, needsDecision: 0 };
+	const noticed = new Set<string>();
 	let timerDelay = 0;
 	let marking: Promise<void> | undefined;
 	const markerError = 'dreaming: error(code: liveSessionUnavailable, message: "Live session marker is unavailable")';
@@ -100,19 +100,21 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	function reportDreamStatus(value: string | undefined): void {
 		if (value !== undefined && !isAlive) return;
 		dreamStatus = value;
-		const counts = [footerCounts.queued ? `${footerCounts.queued} queued` : "", needsDecision.size ? `${needsDecision.size} need decision` : "", footerCounts.review ? `${footerCounts.review} to review` : ""].filter(Boolean);
+		const counts = [footerCounts.queued ? `${footerCounts.queued} queued` : "", footerCounts.needsDecision ? `${footerCounts.needsDecision} need decision` : "", footerCounts.review ? `${footerCounts.review} to review` : ""].filter(Boolean);
 		const text = value === undefined || value.startsWith("dreaming: error(") ? value : [value, ...counts].join(" · ");
 		try { if (context?.hasUI) context.ui.setStatus("pi-core-memories:dream", text); } catch {}
 	}
-	async function drainDecisions(cwd: string, signal: AbortSignal): Promise<void> {
-		const client = await deps.open(cwd, signal);
+	async function drainDecisions(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, signal: AbortSignal): Promise<void> {
+		const client = await deps.open(ctx.cwd, signal);
 		try {
-			const result = await client.request("drain", {});
-			if (result.type !== "drained" || typeof result.queued !== "number" || typeof result.review !== "number" || !Array.isArray(result.needsDecision)) return;
-			const revisions = result.needsDecision.map((value) => queueObject(value).revision).filter((value): value is string => typeof value === "string");
-			footerCounts = { queued: result.queued, review: result.review };
-			for (const revision of revisions) needsDecision.add(revision);
-			for (const revision of revisions) pi.sendMessage({ customType: "pi-core-memories:needs-decision", content: `A memory decision you gave earlier was not applied: the proposal, its evidence or the memory store changed before it could be applied. Nothing was saved. To decide again, present revision ${revision} with memory_queue and answer the new proposal.`, display: true, details: { revision } }, { triggerTurn: false });
+			const result = await client.request("drain", { sessionID: hash(ctx.sessionManager.getSessionId()) });
+			if (result.type !== "drained" || typeof result.queued !== "number" || typeof result.review !== "number" || typeof result.needsDecision !== "number" || !Array.isArray(result.notices)) return;
+			const revisions = result.notices.map((value) => queueObject(value).revision).filter((value): value is string => typeof value === "string" && !noticed.has(value));
+			footerCounts = { queued: result.queued, review: result.review, needsDecision: result.needsDecision };
+			for (const revision of revisions) {
+				noticed.add(revision);
+				pi.sendMessage({ customType: "pi-core-memories:needs-decision", content: `Your earlier memory decision for revision ${revision} was not applied and does not count: the proposal, its evidence or the memory store changed first. Nothing was saved. The agent will present the current proposal for a new answer.`, display: true, details: { revision } }, { triggerTurn: false });
+			}
 		} finally { await client.close(); reportDreamStatus(dreamStatus); }
 	}
 	function stopBackground(): void {
@@ -182,7 +184,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				await conversationClose;
 				current.signal.throwIfAborted();
 				if (isCurrent()) reportDreamStatus("dreaming: applying");
-				await drainDecisions(ctx.cwd, current.signal).catch(() => {});
+				await drainDecisions(ctx, current.signal).catch(() => {});
 				current.signal.throwIfAborted();
 				if (isCurrent()) reportDreamStatus("dreaming: active");
 				const excludedSessionIDs = await liveSessions();
@@ -203,7 +205,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					}
 				}, current.signal, () => {}, (value: unknown, signal: AbortSignal) => deps.protect(pi, invocationID, value, signal));
 				if (!isCurrent()) return;
-				await drainDecisions(ctx.cwd, current.signal).catch(() => {});
+				await drainDecisions(ctx, current.signal).catch(() => {});
 				if (!isCurrent()) return;
 				if (["blocked", "pending"].includes(report.status)) failures = 3;
 				else failures = 0;
@@ -279,8 +281,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const abortConversation = () => activeConversation?.abort();
 		combined.addEventListener("abort", abortConversation, { once: true });
 		clearTimeout(timer); timer = undefined;
-		const refreshCounts = () => conversation || background ? Promise.resolve() : drainDecisions(ctx.cwd, combined).catch(() => {});
-		if (operation === "present" && typeof params.revision === "string") needsDecision.delete(params.revision);
+		const refreshCounts = () => conversation || background ? Promise.resolve() : drainDecisions(ctx, combined).catch(() => {});
 		foregroundCompletion = (async () => {
 			await conversationClose;
 			if (operation !== "reply") await refreshCounts();

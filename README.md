@@ -106,6 +106,14 @@ remain durable. An interruption must not discard evidence, repeat a model call
 without authority, or manufacture approval. Source protection does not promise
 complete detection of transformed secrets.
 
+If a model call stops before its reply is saved (for example, Pi restarts), the
+next run in that window sends the same saved request again. It does this only
+when the window's provider, model and thinking level are the same as the ones
+recorded for that call. If they are different, nothing is sent and the footer
+shows `dreaming: error(code: interruptedCall, message: "Interrupted dream needs
+the model it started with: P/M, thinking L")`. Select that model and thinking
+level again and the retry starts.
+
 The runtime publishes this session's dreaming state through Pi's public
 extension-status key `pi-core-memories:dream`. A footer can display it without
 another command, review mode, or host change.
@@ -114,8 +122,10 @@ another command, review mode, or host change.
 - `dreaming: active` means a validated archived-model request is in progress.
 - `dreaming: idle` means the scheduler waits or finds no new records. It does
   not prove a successful model call.
-- `dreaming: paused` means pending review, a model change, or repeated failures
-  delay this session's next dispatch.
+- `dreaming: paused` means a memory operation in this window (a memory tool
+  call or an open proposal) holds the queue, so no new run starts. The footer
+  shows it at no other time. When the operation ends, the state goes back to
+  `idle`.
 - Nonzero counts follow the state, for example
   `dreaming: active · 1 queued · 1 to review · 1 need decision`. `queued`
   counts recorded decisions that wait for the lock; `to review` counts pending
@@ -133,6 +143,12 @@ another command, review mode, or host change.
   (owner-only) with its time, invocation ID, status, reason and detail. The
   detail is either empty or fixed text from the worker or the extension, never
   source text.
+- `dreaming: error(code: pending, reason: R, message: "...")` reports a run that
+  the native worker kept pending, for example `callbackFailure`,
+  `invalidDecision` or `staleUnpublishedPlans`. Like a blocked run, it stops
+  dispatch until your next input or a model or thinking level change. A
+  `cancelled` run goes back
+  to `idle` and runs again later.
 
 This is a session-local status, not an aggregate of other workers. Errors stay
 visible until an eligible reset. Shutdown clears the status. Completed request,

@@ -8,7 +8,7 @@ import { Type, type UserMessage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { callDreamModel, dreamBatchTextBytes, dreamRoots, readDreamScope, runDreamWorker, type DreamReport, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
+import { callDreamModel, dreamBatchTextBytes, dreamRoots, escapeDreamDisplay, readDreamScope, runDreamWorker, type DreamReport, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
 import { decodeQueuePreview, openQueueClient, queueBytes, queueObject, visible, type QueueConnection, type QueueObject, type QueuePreview } from "./queue-client.ts";
 import { registerMemoryManagement } from "./management.ts";
 import { protectDreamSources } from "./source-protection.ts";
@@ -90,6 +90,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let marking: Promise<void> | undefined;
 	const markerError = 'dreaming: error(code: liveSessionUnavailable, message: "Live session marker is unavailable")';
 	let failures = 0;
+	let interruptedCallSelection: DreamSelection | undefined;
 	let generation = 0;
 	let conversation: MemoryConversationState | undefined;
 	let observedReply: MemoryReplyInput | undefined;
@@ -133,7 +134,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	}
 	function stopBackground(): void {
 		clearTimeout(timer); timer = undefined; background?.abort();
-		if (dreamStatus === "dreaming: active") reportDreamStatus("dreaming: paused");
+		if (dreamStatus === "dreaming: active") reportDreamStatus("dreaming: idle");
 	}
 	function retryMark(): void {
 		const ctx = context;
@@ -163,11 +164,11 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		if (!isAlive || !context) return;
 		if (isMarkerMissing) { reportDreamStatus(markerError); retryMark(); return; }
 		if (isBlocked) {
-			if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: paused");
+			if ((foreground || conversation) && !dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: paused");
 			return;
 		}
 		if (background) return;
-		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus(failures ? "dreaming: paused" : "dreaming: idle");
+		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: idle");
 		const delay = deps.idleMilliseconds * 2 ** failures;
 		if (timer && timerDelay <= delay) return;
 		clearTimeout(timer); timerDelay = delay;
@@ -207,7 +208,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				const scope = await deps.scope(current.signal);
 				current.signal.throwIfAborted();
 				const invocationID = randomUUID();
-				const start: DreamStart & { excludedSessionIDs: string[] } = { version: 1, type: "start", invocationID, roots, selection, resume: "inspectOrContinue", batchTextBytes, ...scope, excludedSessionIDs };
+				const resume = isDeepStrictEqual(interruptedCallSelection, selection) ? "retryInterruptedCall" : "inspectOrContinue";
+				interruptedCallSelection = undefined;
+				const start: DreamStart & { excludedSessionIDs: string[] } = { version: 1, type: "start", invocationID, roots, selection, resume, batchTextBytes, ...scope, excludedSessionIDs };
 				const report = await deps.run(start, async (request, signal) => {
 					if (!isAlive || current.signal.aborted || ctx.sessionManager.getSessionId() !== sessionID || ctx.model?.id !== model.id || ctx.model?.provider !== model.provider || (ctx.thinkingLevel ?? pi.getThinkingLevel()) !== selection.thinkingLevel) throw new Error("Memory worker selection or lifecycle changed.");
 					assertArchivedRequest(request, await liveSessions());
@@ -222,12 +225,16 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				if (!isCurrent()) return;
 				await drainDecisions(ctx, current.signal).catch(() => {});
 				if (!isCurrent()) return;
-				if (["blocked", "pending"].includes(report.status)) failures = 3;
-				else failures = 0;
+				const recorded = report.callSelection;
+				const isRetrying = report.status === "pending" && report.reason === "interruptedCall" && (!recorded || isDeepStrictEqual(recorded, selection));
+				if (isRetrying) interruptedCallSelection = selection;
+				const isRescheduled = report.status !== "blocked" && (report.status !== "pending" || isRetrying || report.reason === "cancelled");
+				failures = isRescheduled ? 0 : 3;
 				const blockedReason = report.reason && /^[A-Za-z0-9:._-]{1,80}$/.test(report.reason) ? report.reason : "unknown";
-				reportDreamStatus(report.status === "blocked"
-					? `dreaming: error(code: blocked, reason: ${blockedReason}, message: "Native dream worker blocked the run")`
-					: report.status === "pending" ? "dreaming: paused" : "dreaming: idle");
+				reportDreamStatus(isRescheduled ? "dreaming: idle"
+					: report.status === "blocked" ? `dreaming: error(code: blocked, reason: ${blockedReason}, message: "Native dream worker blocked the run")`
+					: report.reason === "interruptedCall" && recorded ? `dreaming: error(code: interruptedCall, message: ${JSON.stringify(escapeDreamDisplay(`Interrupted dream needs the model it started with: ${recorded.provider}/${recorded.modelID}, thinking ${recorded.thinkingLevel}`))})`
+					: `dreaming: error(code: pending, reason: ${blockedReason}, message: "Native dream worker kept the run pending")`);
 				if (report.status === "blocked") await recordBlockedDream(invocationID, report);
 			} catch {
 				if (isCurrent() && isLiveUnavailable) reportDreamStatus(markerError);
@@ -523,8 +530,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		if (requestID !== conversation.presentedForRequest) await closeConversation();
 		schedule();
 	});
-	pi.on("model_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: paused"); schedule(); });
-	pi.on("thinking_level_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: paused"); schedule(); });
+	pi.on("model_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: idle"); schedule(); });
+	pi.on("thinking_level_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: idle"); schedule(); });
 	pi.on("session_before_switch", async () => { isAlive = false; invalidate(); await leaveSession(); });
 	pi.on("session_before_fork", async () => { isAlive = false; invalidate(); await leaveSession(); });
 	pi.on("session_before_tree", invalidateConversation);

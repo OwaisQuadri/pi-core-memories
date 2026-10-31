@@ -160,6 +160,7 @@ public struct DreamPendingReport: Sendable {
   public let proposals: [DreamProposalReceipt]
   public let reason: DreamPendingReason
   public let validationError: DreamDecisionError?
+  public let callSelection: DreamSelectedCall?
 }
 
 public enum DreamTransactionResult: Sendable {
@@ -1352,9 +1353,9 @@ public final class DreamRunStore {
       else { throw DreamRunError.missingPayload }
       if isCancelled() { return pending(sealed, reason: .cancelled) }
       if try sealed.directory.isPresent(attempt.callName) {
-        _ = try loadCallSelection(sealed, attempt: attempt)
+        let callSelection = try loadCallSelection(sealed, attempt: attempt)
         if resume != .retryInterruptedCall && !isReplacementStarted {
-          return pending(sealed, reason: .interruptedCall)
+          return pending(sealed, reason: .interruptedCall, callSelection: callSelection)
         }
       } else if attempt.number > 0, !isReplacementStarted, resume != .retryInterruptedCall {
         return pending(sealed, reason: .interruptedCall)
@@ -1890,14 +1891,15 @@ public final class DreamRunStore {
 
   private func pending(
     _ sealed: SealedRun, reason: DreamPendingReason, proposals: [DreamProposalReceipt] = [],
-    validationError: DreamDecisionError? = nil
+    validationError: DreamDecisionError? = nil, callSelection: DreamSelectedCall? = nil
   ) -> DreamTransactionResult {
     .pending(
       DreamPendingReport(
         runID: sealed.run.runID, generation: sealed.run.progress.generation,
         approvedBase: sealed.run.approvedBase, inputHash: sealed.run.inputHash,
         contextHash: sealed.context.contextHash, requestHash: sealed.request.requestHash,
-        proposals: proposals, reason: reason, validationError: validationError))
+        proposals: proposals, reason: reason, validationError: validationError,
+        callSelection: callSelection))
   }
 
   private func loadChain(

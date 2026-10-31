@@ -120,9 +120,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	}
 	async function recordBlockedDream(invocationID: string, report: DreamReport): Promise<void> {
 		const path = join(deps.liveDirectory, "last-dream-blocked.json");
-		const staging = `${path}.${process.pid}.tmp`;
+		const staging = `${path}.${process.pid}-${randomUUID()}.tmp`;
 		try {
-			await unlink(staging).catch(() => {});
 			await writeFile(staging, JSON.stringify({ time: new Date().toISOString(), invocationID, status: report.status, reason: report.reason, detail: report.detail }) + "\n", { mode: 0o600, flag: "wx" });
 			await rename(staging, path);
 		} catch { await unlink(staging).catch(() => {}); }

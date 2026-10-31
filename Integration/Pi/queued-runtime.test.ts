@@ -382,7 +382,7 @@ test("a journaled reply is counted, only its origin session posts one needs-deci
 		const notices = f.messages.filter((message) => message.customType === "pi-core-memories:needs-decision");
 		assert.equal(notices.length, 1); assert.equal(notices[0]!.display, true);
 		assert.match(String(notices[0]!.content), new RegExp(`${revision} was not applied and does not count[\\s\\S]*Nothing was saved[\\s\\S]*present the current proposal`));
-		assert.match(f.statuses.get("pi-core-memories:dream")!, /2 need decision/);
+		assert.match(f.statuses.get("pi-core-memories:dream")!, /1 to review · 2 need decision$/);
 		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /queued/);
 		f.journal.needsDecision = 0; f.journal.notices.length = 0;
 		await f.call("memory_queue", { operation: "pending" });

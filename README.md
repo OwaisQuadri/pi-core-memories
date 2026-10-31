@@ -114,8 +114,10 @@ another command, review mode, or host change.
 - `dreaming: paused` means pending review, a model change, or repeated failures
   delay this session's next dispatch.
 - Nonzero counts follow the state, for example
-  `dreaming: active · 1 queued · 1 to review`. `queued` counts recorded
-  decisions that wait for the lock; `to review` counts pending proposals.
+  `dreaming: active · 1 queued · 1 to review · 1 need decision`. `queued`
+  counts recorded decisions that wait for the lock; `to review` counts pending
+  proposals; `need decision` counts revisions whose recorded answer was not
+  applied and needs a new decision.
 - `dreaming: error(code: X, message: "...")` reports a blocked or failed attempt.
   The code and message use fixed safe text, not raw exceptions or source data.
 

@@ -100,7 +100,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	function reportDreamStatus(value: string | undefined): void {
 		if (value !== undefined && !isAlive) return;
 		dreamStatus = value;
-		const counts = [footerCounts.queued ? `${footerCounts.queued} queued` : "", footerCounts.needsDecision ? `${footerCounts.needsDecision} need decision` : "", footerCounts.review ? `${footerCounts.review} to review` : ""].filter(Boolean);
+		const counts = [footerCounts.queued ? `${footerCounts.queued} queued` : "", footerCounts.review ? `${footerCounts.review} to review` : "", footerCounts.needsDecision ? `${footerCounts.needsDecision} need decision` : ""].filter(Boolean);
 		const text = value === undefined || value.startsWith("dreaming: error(") ? value : [value, ...counts].join(" · ");
 		try { if (context?.hasUI) context.ui.setStatus("pi-core-memories:dream", text); } catch {}
 	}

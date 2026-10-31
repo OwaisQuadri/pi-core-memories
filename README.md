@@ -123,6 +123,14 @@ another command, review mode, or host change.
   applied and needs a new decision.
 - `dreaming: error(code: X, message: "...")` reports a blocked or failed attempt.
   The code and message use fixed safe text, not raw exceptions or source data.
+- `dreaming: error(code: blocked, reason: R, message: "...")` adds the native
+  worker's reason code, for example `workerFailure`, `protocolFailure`,
+  `cancelled` or `sourceProtection:invalidReply`. A reason outside letters,
+  digits and `:._-`, or longer than 80 characters, shows as `unknown`. Each
+  blocked run also replaces `~/.pi/memory-host/last-dream-blocked.json`
+  (owner-only) with its time, invocation ID, status, reason and detail. The
+  detail is either empty or fixed text from the worker or the extension, never
+  source text.
 
 This is a session-local status, not an aggregate of other workers. Errors stay
 visible until an eligible reset. Shutdown clears the status. Completed request,

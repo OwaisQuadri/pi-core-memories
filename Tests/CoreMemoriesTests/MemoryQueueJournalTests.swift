@@ -126,6 +126,80 @@ private func journaledApproval(_ fixture: TransactionFixture) throws -> MemoryQu
   #expect(try queue.recover(decisionID: "journaled").status == "approved")
 }
 
+@Test func publicationBeforeTheNeedsDecisionWriteIsReceiptedAsPublished() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  _ = try journaledApproval(fixture)
+  let stale = try queueFixture(fixture, sources: fixture.store())
+  let intent = try stale.ledger(stale.controller()) { $0.intents.first! }
+  let staleReview = try stale.controller()
+  let ledgerLock = try stale.directory.openLock().descriptor
+  defer { close(ledgerLock) }
+  #expect(flock(ledgerLock, LOCK_EX) == 0)
+  let done = DispatchSemaphore(value: 0)
+  var writeError: (any Error)?
+  Thread.detachNewThread {
+    do { try stale.needsDecision(intent, review: staleReview) } catch { writeError = error }
+    done.signal()
+  }
+  usleep(50_000)
+  let candidate = try #require(
+    try staleReview.list().first {
+      $0.change.id.rawValue == intent.display.presentation.finding.revision
+    })
+  _ = try staleReview.apply(
+    staleReview.preview(
+      candidateID: candidate.change.id,
+      clockDate: Date(timeIntervalSince1970: intent.queuedClock!), amendment: nil))
+  flock(ledgerLock, LOCK_UN)
+  done.wait()
+  #expect(writeError == nil)
+  let written = try stale.ledger(staleReview) { state in
+    state.receipts.first { $0.decisionID == "journaled" }
+  }
+  #expect(written?.status == "approved")
+  #expect(written?.commit == (try fixture.main()))
+}
+
+@Test func briefLedgerHoldAfterApplyStillReturnsThePublishedReceipt() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  do {
+    let review = try MemoryReviewController(
+      repository: fixture.memory, stateRoot: fixture.root.appendingPathComponent("review"),
+      sources: sources, environment: [:])
+    try review.confirmDetach(review.checkoutPreview())
+  }
+  let live = try queueFixture(fixture, sources: sources)
+  let held = DispatchSemaphore(value: 0)
+  let released = DispatchSemaphore(value: 0)
+  live.configureReview = { review in
+    review.persistenceFault = { event in
+      guard case .beforeWrite(let name) = event, name.hasPrefix("outcome-") else { return }
+      let ledgerLock = try live.directory.openLock().descriptor
+      Thread.detachNewThread {
+        flock(ledgerLock, LOCK_EX)
+        held.signal()
+        usleep(2_000_000)
+        flock(ledgerLock, LOCK_UN)
+        close(ledgerLock)
+        released.signal()
+      }
+      #expect(held.wait(timeout: .now() + 2) == .success)
+    }
+  }
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let row = try #require(live.list(request: request).first)
+  let display = try live.claim(revision: row.finding.revision, request: request)
+  try live.presented(display, messageReference: "message")
+  let receipt = try live.decide(
+    display, action: "approve", decisionID: "held", responseReference: "answer")
+  #expect(released.wait(timeout: .now() + 5) == .success)
+  #expect(receipt.status == "approved")
+  #expect(receipt.commit == (try fixture.main()))
+}
+
 private func presentedApproval(
   _ fixture: TransactionFixture, fault: @escaping () throws -> Void
 ) throws -> (MemoryQueue, MemoryQueueDisplay) {

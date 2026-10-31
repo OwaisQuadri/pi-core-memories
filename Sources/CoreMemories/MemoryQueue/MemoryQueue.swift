@@ -412,11 +412,12 @@ package final class MemoryQueue {
     } catch DreamRunError.busy {
       return receipt(intent, status: "queued")
     } catch {
-      let recovered = try recover(decisionID: decisionID, review: current.controller)
+      let recovered = try recover(
+        decisionID: decisionID, review: current.controller, isWaiting: true)
       guard recovered.status != "queued" else { throw error }
       return recovered
     }
-    return try recover(decisionID: decisionID, review: current.controller)
+    return try recover(decisionID: decisionID, review: current.controller, isWaiting: true)
   }
 
   private func perform(
@@ -489,9 +490,9 @@ package final class MemoryQueue {
   func needsDecision(_ intent: QueueDecisionIntent, review: MemoryReviewController)
     throws
   {
-    _ = try review.list()
-    try ledger(review) { state in
+    try ledger(review, isWaiting: true) { state in
       guard !state.receipts.contains(where: { $0.decisionID == intent.decisionID }) else { return }
+      _ = try review.list()
       state.receipts.append(
         try published(intent, review: review) ?? receipt(intent, status: "needs-decision"))
     }
@@ -555,11 +556,11 @@ package final class MemoryQueue {
     return try recover(decisionID: decisionID, review: controller())
   }
 
-  private func recover(decisionID: String, review: MemoryReviewController) throws
-    -> MemoryQueueReceipt
-  {
+  private func recover(
+    decisionID: String, review: MemoryReviewController, isWaiting: Bool = false
+  ) throws -> MemoryQueueReceipt {
     _ = try review.list()
-    return try ledger(review) { state in
+    return try ledger(review, isWaiting: isWaiting) { state in
       guard let intent = state.intents.first(where: { $0.decisionID == decisionID }) else {
         throw MemoryError("unknown decision key")
       }

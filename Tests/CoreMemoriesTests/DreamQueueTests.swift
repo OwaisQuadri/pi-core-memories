@@ -215,7 +215,7 @@ func dreamQueueSnapshotFailsClosedWithoutInitializingOrRepairingState(_ variant:
   _ = try transactionPending(
     fixture.store().run(
       selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
-    reason: .staleUnpublishedPlans)
+    reason: .droppedBatch)
   let files = try fixture.snapshot(fixture.root)
   let after = DreamQueueSnapshot.read(configuration: queueConfiguration(fixture))
   #expect(before.coverage?.segments?.undreamt == after.coverage?.segments?.undreamt)

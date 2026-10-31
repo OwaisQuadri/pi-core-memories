@@ -495,7 +495,7 @@ func transactionUncalled(_ request: DreamModelRequest) throws -> DreamCompletedR
   #expect(!FileManager.default.fileExists(atPath: try fixture.payload("call-started.json").path))
 }
 
-@Test func dreamTransactionExactAllPlanRecoveryPrecedesStaleSiblingRefusal() throws {
+@Test func dreamTransactionStaleSiblingDropsTheWholeBatchAfterExactRecovery() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   let project = fixture.root.appendingPathComponent("project")
@@ -524,9 +524,15 @@ func transactionUncalled(_ request: DreamModelRequest) throws -> DreamCompletedR
   let pending = try transactionPending(
     fixture.store().run(
       selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
-    reason: .staleUnpublishedPlans)
-  #expect(pending.proposals.count == 1 && pending.proposals[0].commit == published.commit)
-  #expect(pending.proposals[0].path == saved.path)
+    reason: .droppedBatch)
+  #expect(pending.proposals.isEmpty)
+  #expect(
+    try Git(repo: fixture.memory, environment: [:]).text([
+      "for-each-ref", "--format=%(objectname)", "refs/heads/proposals/",
+    ]) == published.commit)
+  #expect(
+    !FileManager.default.fileExists(
+      atPath: fixture.state.appendingPathComponent("admissions/0.json").path))
   #expect(
     !FileManager.default.fileExists(
       atPath: fixture.state.appendingPathComponent("generations/1.json").path))
@@ -674,7 +680,7 @@ func transactionUncalled(_ request: DreamModelRequest) throws -> DreamCompletedR
   #expect(report.generation == 2 && report.runID == pending.runID)
 }
 
-@Test func dreamTransactionMainRaceRetainsSiblingAndDoesNotConsumeProgress() throws {
+@Test func dreamTransactionMainRaceDropsTheBatchAndDoesNotConsumeProgress() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   let project = fixture.root.appendingPathComponent("project")
@@ -686,8 +692,8 @@ func transactionUncalled(_ request: DreamModelRequest) throws -> DreamCompletedR
   let report = try transactionPending(
     store.run(
       selection: fixture.selection, prepare: { try fixture.prepare($0) },
-      call: { try transactionAdd($0, isProject: true) }), reason: .staleUnpublishedPlans)
-  #expect(report.proposals.count == 1 && report.proposals[0].path == "MEMORY.md")
+      call: { try transactionAdd($0, isProject: true) }), reason: .droppedBatch)
+  #expect(report.proposals.isEmpty)
   #expect(
     !FileManager.default.fileExists(
       atPath: fixture.state.appendingPathComponent("generations/1.json").path))

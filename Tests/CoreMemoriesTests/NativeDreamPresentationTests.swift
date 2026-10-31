@@ -68,10 +68,7 @@ private func savedNativeReport(
       call: { try transactionAdd($0) })
   }
   try fixture.advance()
-  let pending = try transactionPending(
-    fixture.store().run(
-      selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
-    reason: .staleUnpublishedPlans)
+  let pending = try savedRun(fixture)
   let configuration = queueConfiguration(fixture)
   _ = try savedNativeReport(configuration: configuration, runID: pending.runID)
   let url = fixture.root.appendingPathComponent("profile/config.json")

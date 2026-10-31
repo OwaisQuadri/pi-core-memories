@@ -44,14 +44,57 @@ enum MemoryQueueAuthority {
     return binding
   }
 
+  static func rejectedNames(git: Git, repository: URL, sourceBinding: String) throws
+    -> [String]
+  {
+    try withBoundReview(git: git, repository: repository, sourceBinding: sourceBinding) {
+      reviewRoot, _, _ in
+      try reviewRoot.names().filter { $0.hasPrefix("rejected-") && $0.hasSuffix(".json") }
+        .sorted()
+    } ?? []
+  }
+
   static func rejectedFindings(git: Git, repository: URL, sourceBinding: String) throws
     -> [MemoryQueueFinding]
   {
+    try withBoundReview(git: git, repository: repository, sourceBinding: sourceBinding) {
+      reviewRoot, queue, review in
+      guard try queue.isPresent("queue.json") else { return [] }
+      let ledger = try MemoryReviewEncoding.decode(
+        QueueLedger.self,
+        bytes: queue.read("queue.json", maximum: MemoryReviewEncoding.maximumFileBytes))
+      guard ledger.schemaVersion == 1,
+        ledger.binding == SourceDigest(bytes: try MemoryReviewEncoding.encode(review)).rawValue,
+        ledger.findings.count <= 10_000,
+        Set(ledger.findings.map(\.revision)).count == ledger.findings.count,
+        ledger.findings.allSatisfy({ $0.revision == $0.candidateID })
+      else { throw MemoryError("queue binding conflict") }
+      return try ledger.findings.filter { finding in
+        let name = "rejected-\(finding.revision).json"
+        guard MemoryDocument.isMatch(#"\A[0-9a-f]{64}\z"#, finding.revision) else {
+          throw DreamRunError.corruption
+        }
+        guard try reviewRoot.isPresent(name) else { return false }
+        let selection = try MemoryReviewEncoding.decode(
+          ReviewSelection.self,
+          bytes: reviewRoot.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
+        guard selection.candidateID == finding.revision, selection.disposition == .rejected else {
+          throw DreamRunError.corruption
+        }
+        return true
+      }
+    } ?? []
+  }
+
+  private static func withBoundReview<T>(
+    git: Git, repository: URL, sourceBinding: String,
+    _ operation: (DreamStateDirectory, DreamStateDirectory, ReviewRootBinding) throws -> T
+  ) throws -> T? {
     guard let common = try git.commonDirectory(),
       FileManager.default.fileExists(atPath: common.appendingPathComponent("memory-queue").path)
-    else { return [] }
-    return try locked(git: git) { root in
-      guard let binding = try binding(root) else { return [] }
+    else { return nil }
+    return try locked(git: git) { root -> T? in
+      guard let binding = try binding(root) else { return nil }
       let review = binding.review
       guard review.schemaVersion == 2 else { throw DreamRunError.unsupportedSchema }
       guard review.repository == repository.path, review.sourceBinding == sourceBinding else {
@@ -92,30 +135,7 @@ enum MemoryQueueAuthority {
       else { throw DreamRunError.unsafeState }
       _ = try reviewRoot.retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
       _ = try queue.retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
-      guard try queue.isPresent("queue.json") else { return [] }
-      let ledger = try MemoryReviewEncoding.decode(
-        QueueLedger.self,
-        bytes: queue.read("queue.json", maximum: MemoryReviewEncoding.maximumFileBytes))
-      guard ledger.schemaVersion == 1,
-        ledger.binding == SourceDigest(bytes: try MemoryReviewEncoding.encode(review)).rawValue,
-        ledger.findings.count <= 10_000,
-        Set(ledger.findings.map(\.revision)).count == ledger.findings.count,
-        ledger.findings.allSatisfy({ $0.revision == $0.candidateID })
-      else { throw MemoryError("queue binding conflict") }
-      return try ledger.findings.filter { finding in
-        let name = "rejected-\(finding.revision).json"
-        guard MemoryDocument.isMatch(#"\A[0-9a-f]{64}\z"#, finding.revision) else {
-          throw DreamRunError.corruption
-        }
-        guard try reviewRoot.isPresent(name) else { return false }
-        let selection = try MemoryReviewEncoding.decode(
-          ReviewSelection.self,
-          bytes: reviewRoot.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
-        guard selection.candidateID == finding.revision, selection.disposition == .rejected else {
-          throw DreamRunError.corruption
-        }
-        return true
-      }
+      return try operation(reviewRoot, queue, review)
     }
   }
 

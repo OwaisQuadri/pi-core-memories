@@ -3,8 +3,15 @@ import Testing
 
 @testable import CoreMemories
 
+func savedRun(_ fixture: TransactionFixture) throws -> (runID: String, approvedBase: String) {
+  let admission = try DreamRunEncoding.decode(
+    DreamRunEncoding.Admission.self,
+    bytes: Data(contentsOf: fixture.state.appendingPathComponent("admissions/0.json")))
+  return (admission.runID, admission.base)
+}
+
 func savedRecoveryPendingAddition(_ fixture: TransactionFixture) throws
-  -> (DreamRunStore, DreamPendingReport)
+  -> (DreamRunStore, (runID: String, approvedBase: String))
 {
   try fixture.populate()
   let store = try fixture.store()
@@ -15,11 +22,7 @@ func savedRecoveryPendingAddition(_ fixture: TransactionFixture) throws
       call: { try transactionAdd($0) })
   }
   try fixture.advance()
-  let pending = try transactionPending(
-    store.run(
-      selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
-    reason: .staleUnpublishedPlans)
-  return (store, pending)
+  return (store, try savedRun(fixture))
 }
 
 @Test func savedRecoveryOutsideMainAdvanceRequiresFreshPreviewAndExplicitEntryApproval() throws {
@@ -81,10 +84,7 @@ func savedRecoveryPendingAddition(_ fixture: TransactionFixture) throws
     .map { try Data(contentsOf: fixture.payload($0)) }
   let originalBase = try fixture.main()
   try fixture.advance()
-  let pending = try transactionPending(
-    store.run(selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
-    reason: .staleUnpublishedPlans)
-  #expect(pending.proposals.count == 1)
+  let pending = try savedRun(fixture)
   let preview = try store.previewSavedRecovery(runID: pending.runID)
   #expect(preview.suggestions.count == 2)
   #expect(preview.suggestions.allSatisfy { $0.blocker == nil })
@@ -126,9 +126,7 @@ func savedRecoveryPendingAddition(_ fixture: TransactionFixture) throws
       prepare: transactionUncalledPrepare, call: { try transactionAdd($0) })
   }
   try fixture.advance()
-  let pending = try transactionPending(store.run(
-    selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
-    reason: .staleUnpublishedPlans)
+  let pending = try savedRun(fixture)
   let names = ["response.json", "rejected-1.json", "replacement-1.json", "replacement-1-response.json"]
   let before = try names.map { try Data(contentsOf: fixture.payload($0)) }
   _ = try transactionCompleted(store.confirmSavedRecovery(store.previewSavedRecovery(runID: pending.runID)))
@@ -192,7 +190,14 @@ func savedRecoveryInterruptionNeverFallsThroughToOrdinaryPropose(_ boundary: Str
   reopened.beforePublication = { _ in Issue.record("recovery must never call ordinary propose") }
   let resumed = try reopened.run(
     selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled)
-  if boundary == "before-checkpoint" || boundary == "after-checkpoint" {
+  if boundary == "before-checkpoint" {
+    let dropped = try transactionPending(resumed, reason: .droppedBatch)
+    #expect(dropped.proposals.isEmpty)
+    #expect(throws: (any Error).self) { try reopened.previewSavedRecovery(runID: pending.runID) }
+    #expect(try fixture.protectedState() == resumedBefore)
+    return
+  }
+  if boundary == "after-checkpoint" {
     _ = try transactionPending(resumed, reason: .staleUnpublishedPlans)
     let confirmed = try reopened.previewSavedRecovery(runID: pending.runID)
     _ = try transactionCompleted(reopened.confirmSavedRecovery(confirmed))
@@ -286,9 +291,7 @@ func savedRecoveryExactTargetsBlockOnlyAffectedEntries(_ variant: String) throws
   try fixture.write(current, file: file)
   _ = try git.data(["add", "."])
   _ = try git.data(["commit", "-m", "Outside anchor movement"], additions: Git.proposalIdentity)
-  let pending = try transactionPending(
-    store.run(selection: fixture.selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
-    reason: .staleUnpublishedPlans)
+  let pending = try savedRun(fixture)
   let preview = try store.previewSavedRecovery(runID: pending.runID)
   let isCompatible = ["moved", "nil-identity", "forged-approval"].contains(variant)
   #expect(preview.suggestions.filter { $0.blocker == nil }.count == (isCompatible ? 2 : 1))

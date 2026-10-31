@@ -112,7 +112,7 @@ test("a blocked reason with unsafe characters cannot inject text into the footer
 	} finally { await f.stop(); }
 });
 
-test("a blocked report that cannot be saved still shows its reason", async () => {
+test("a blocked report that cannot be saved still shows its reason in the footer", async () => {
 	const f = runtime(async () => ({ status: "blocked", reason: "workerFailure", detail: null }) as unknown as DreamReport, "tui", undefined, { liveDirectory: join(stateDirectory, "missing") });
 	try {
 		await f.emit("session_start"); await sleep(30);

@@ -112,6 +112,14 @@ test("a blocked reason with unsafe characters cannot inject text into the footer
 	} finally { await f.stop(); }
 });
 
+test("a blocked report that cannot be saved still shows its reason", async () => {
+	const f = runtime(async () => ({ status: "blocked", reason: "workerFailure", detail: null }) as unknown as DreamReport, "tui", undefined, { liveDirectory: join(stateDirectory, "missing") });
+	try {
+		await f.emit("session_start"); await sleep(30);
+		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: blocked, reason: workerFailure, message: "Native dream worker blocked the run")');
+	} finally { await f.stop(); }
+});
+
 test("a window that loses the native dream lock stays idle and keeps retrying", async () => {
 	let runs = 0;
 	const f = runtime(async () => { runs++; return { status: "busy" } as DreamReport; });

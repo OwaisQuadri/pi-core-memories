@@ -129,7 +129,8 @@ another command, review mode, or host change.
   digits and `:._-`, or longer than 80 characters, shows as `unknown`. Each
   blocked run also replaces `~/.pi/memory-host/last-dream-blocked.json`
   (owner-only) with its time, invocation ID, status, reason and detail. The
-  detail is either empty or a fixed worker message, never source text.
+  detail is either empty or fixed text from the worker or the extension, never
+  source text.
 
 This is a session-local status, not an aggregate of other workers. Errors stay
 visible until an eligible reset. Shutdown clears the status. Completed request,

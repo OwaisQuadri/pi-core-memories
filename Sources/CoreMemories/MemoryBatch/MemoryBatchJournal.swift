@@ -37,7 +37,7 @@ extension MemoryDraftStore {
     _ draft: MemoryDraft, expectedDigest: String, review: MemoryReviewController?,
     checkout: ReviewCheckoutWitness, authorized: Set<UUID>, didPersist: ((String) -> Void)?
   ) throws -> MemoryBatchSaveResult {
-    try withBatchJournal(review) { state in
+    try withBatchJournal(review, isWaitingForWriter: true) { state in
       let publisher = batchPublisher(review)
       do {
         if let recovered = try publisher.recover(draft) { return recovered }
@@ -105,7 +105,9 @@ extension MemoryDraftStore {
       throw MemoryError("legacy draft recovery uses its original receipt")
     }
     do {
-      return try withBatchJournal(review) { _ in try batchPublisher(review).recover(draft) }
+      return try withBatchJournal(review, isWaitingForWriter: false) { _ in
+        try batchPublisher(review).recover(draft)
+      }
     } catch {
       return .outcomeUnknown(saveID: try memoryBatchDigest(draft), details: "\(error)")
     }
@@ -147,14 +149,17 @@ extension MemoryDraftStore {
   }
 
   func withBatchJournal<T>(
-    _ review: MemoryReviewController?, operation: (DreamStateDirectory) throws -> T
+    _ review: MemoryReviewController?, isWaitingForWriter: Bool,
+    operation: (DreamStateDirectory) throws -> T
   ) throws -> T {
     try verifyMemoryBatchRepository(store, review: review)
     func acquireJournal() throws -> T {
       try locked {
         try store.reviewGit.reviewCheckout().withLeaseState { state in
           if let review {
-            return try review.withBatchSources(state: state) { try operation(state) }
+            return try review.withBatchSources(
+              state: state, isWaitingForWriter: isWaitingForWriter
+            ) { try operation(state) }
           }
           return try operation(state)
         }

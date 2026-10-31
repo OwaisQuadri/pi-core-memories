@@ -229,6 +229,18 @@ func resumedDreamDropsTheWholeBatchAfterARejection(isPartlyPublished: Bool) thro
       atPath: fixture.state.appendingPathComponent("admissions/\(dropped.generation).json").path))
 }
 
+@Test func dreamAfterOnlyAQueueCountReadsTheBoundQueue() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  _ = try queueFixture(fixture, sources: sources).reviewCount()
+  try fixture.append(dreamUser("next", nil, dreamOld, "Prefer short replies.") + "\n")
+  _ = try transactionCompleted(
+    fixture.store().run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { try transactionAdd($0) }))
+}
+
 @Test func queueAdmittingAnAlreadyRejectedFindingKeepsTheDreamBatch() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
@@ -256,4 +268,50 @@ func resumedDreamDropsTheWholeBatchAfterARejection(isPartlyPublished: Bool) thro
         return try transactionAdd(request)
       }))
   #expect(!report.proposals.isEmpty)
+}
+
+@Test func foregroundDecisionStopsWaitingForTheDreamWriterLockAtItsBound() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  do {
+    let review = try MemoryReviewController(
+      repository: fixture.memory, stateRoot: fixture.root.appendingPathComponent("review"),
+      sources: sources, environment: [:])
+    try review.confirmDetach(review.checkoutPreview())
+  }
+  sources.writerLockWaitLimit = .seconds(2)
+  let queue = try queueFixture(fixture, sources: sources)
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let row = try #require(
+    queue.list(request: request).first { $0.blockReason == nil && $0.disposition == "pending" })
+  let display = try queue.claim(revision: row.finding.revision, request: request)
+  try queue.presented(display, messageReference: "message")
+  let original = try fixture.main()
+  let writer = open(fixture.state.appendingPathComponent("writer.lock").path, O_RDONLY | O_CLOEXEC)
+  #expect(flock(writer, LOCK_EX | LOCK_NB) == 0)
+  let started = ContinuousClock.now
+  #expect(throws: DreamRunError.busy) {
+    try queue.decide(display, action: "approve", decisionID: "live", responseReference: "answer")
+  }
+  #expect(started.duration(to: .now) < .milliseconds(3500))
+  close(writer)
+  #expect(try queue.recover(decisionID: "live").status == "needs-decision")
+  #expect(try fixture.main() == original)
+}
+
+@Test func queueListDuringTheDreamWriterLockFailsFastAsBusy() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  sources.writerLockWaitLimit = .seconds(2)
+  let queue = try queueFixture(fixture, sources: sources)
+  let writer = open(fixture.state.appendingPathComponent("writer.lock").path, O_RDONLY | O_CLOEXEC)
+  defer { close(writer) }
+  #expect(flock(writer, LOCK_EX | LOCK_NB) == 0)
+  let started = ContinuousClock.now
+  #expect(throws: DreamRunError.busy) {
+    try queue.list(request: MemoryQueueRequest(sessionID: "session", requestID: "request"))
+  }
+  #expect(started.duration(to: .now) < .seconds(1))
 }

@@ -128,6 +128,21 @@ input(createReadStream(null, { fd: 3 }), "private");
 				assert.equal(ordinary.signal?.aborted, true);
 			} finally { t.mock.timers.reset(); await ordinary.close(); }
 		});
+		for (const type of ["reply", "manage-reply"]) {
+			await t.test(`${type} outlasts the native writer lock wait and still rejects promptly on cancel`, async (t) => {
+				const cancellation = new AbortController();
+				const decision = await openQueueClient(directory, cancellation.signal);
+				t.mock.timers.enable({ apis: ["setTimeout"] });
+				try {
+					const cancelled = assert.rejects(decision.request(type, { isSilent: true }, true), /Native memory service stopped/);
+					t.mock.timers.tick(329_999);
+					assert.equal(decision.signal?.aborted, false);
+					cancellation.abort();
+					await cancelled;
+					assert.equal(decision.signal?.aborted, true);
+				} finally { t.mock.timers.reset(); await decision.close(); }
+			});
+		}
 		const privateClient = await openQueueClient(directory, controller.signal);
 		assert.equal((await privateClient.request("presented", {}, true)).channel, "private");
 		await assert.rejects(privateClient.request("stderr"), (error: Error) => !error.message.includes("synthetic-private-marker"));

@@ -233,6 +233,7 @@ public final class DreamRunStore {
   var persistenceFault: ((DreamPersistenceEvent) throws -> Void)?
   var clock: () -> Date = { Date() }
   var isCancelled: () -> Bool = { false }
+  var writerLockWaitLimit: Duration = .seconds(300)
   var beforePublication: ((String) throws -> Void)?
   var recoveryCount = 0
   var beforeFinalReport: (() throws -> Void)?
@@ -431,11 +432,11 @@ public final class DreamRunStore {
   }
 
   package func verifiedCompletedReviewCandidates() throws -> [VerifiedDreamReviewCandidates] {
-    try withVerifiedReviewCandidates { $0 }
+    try withVerifiedReviewCandidates(isWaitingForWriter: false) { $0 }
   }
 
   func withVerifiedReviewCandidates<T>(
-    _ operation: ([VerifiedDreamReviewCandidates]) throws -> T
+    isWaitingForWriter: Bool, _ operation: ([VerifiedDreamReviewCandidates]) throws -> T
   ) throws -> T {
     guard operationLock.try() else { throw DreamRunError.busy }
     defer { operationLock.unlock() }
@@ -444,8 +445,11 @@ public final class DreamRunStore {
       _ = flock(lock, LOCK_UN)
       _ = close(lock)
     }
+    let deadline = ContinuousClock.now + (isWaitingForWriter ? writerLockWaitLimit : .zero)
     while flock(lock, LOCK_EX | LOCK_NB) != 0 {
-      guard errno == EWOULDBLOCK, !isCancelled() else { throw DreamRunError.busy }
+      guard errno == EWOULDBLOCK, !isCancelled(), ContinuousClock.now < deadline else {
+        throw DreamRunError.busy
+      }
       usleep(10_000)
     }
     var bundles: [VerifiedDreamReviewCandidates] = []

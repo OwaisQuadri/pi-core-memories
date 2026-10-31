@@ -61,14 +61,16 @@ Dreaming is background work. It does not approve or write memories.
   process with a session file (interactive, print, or RPC) writes a marker for
   its session in `~/.pi/memory-host` (directory mode 0700, owner checked). Only
   interactive windows dream. The marker name holds the process ID; the dreamer
-  skips sessions whose process is alive and removes markers and orphan
-  `.live.tmp` staging files of dead processes. A marker that is not a regular
-  file you own with mode 0600 and a valid session ID is skipped, not trusted
-  and not deleted. If the operating system reuses a dead window's process ID,
-  its stale marker keeps that session excluded until the new process exits. This
-  fails safe: it can delay intake of a finished session, but never admits a live
-  one. If a window cannot write its marker, it shows `liveSessionUnavailable`
-  and retries on later schedules; this does not count as a worker failure.
+  skips sessions whose process is alive and deletes any regular file you own
+  with a marker or orphan `.live.tmp` name whose process is dead, before
+  checking its mode or content. A file that is not a regular file you own is
+  skipped and not deleted. A live process's marker that fails the mode 0600,
+  link, size or session ID check is skipped, not trusted and not deleted. If the
+  operating system reuses a dead window's process ID, its stale marker keeps
+  that session excluded until the new process exits. This fails safe: it can
+  delay intake of a finished session, but never admits a live one. If a window
+  cannot write its marker, it shows `liveSessionUnavailable` and retries on
+  later schedules; this does not count as a worker failure.
 - Findings stay pending until you approve the exact proposal in conversation.
 - Decision journal: a dream run holds the memory lock for its whole run. If you
   answer a proposal while another window dreams, the window records your exact

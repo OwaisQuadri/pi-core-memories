@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { after, test } from "node:test";
-import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { Extension, ExtensionAPI, ExtensionContext, ExtensionToolContext, ModelRegistry, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { DreamReport, DreamRequest, DreamStart, runDreamWorker } from "./dream.ts";
 import type { openQueueClient } from "./queue-client.ts";
 import "./test/host.ts";
 const { memoryRequestIdentity, registerQueuedRuntime, assertArchivedRequest } = await import("./queued-runtime.ts");
+const { ExtensionRunner, createExtensionRuntime } = await import("@earendil-works/pi-coding-agent");
 const stateDirectory = await mkdtemp(join(tmpdir(), "pi-core-memories-runtime-"));
 after(() => rm(stateDirectory, { recursive: true, force: true }));
 type TestEntry = Partial<Parameters<ExtensionAPI["sendMessage"]>[0]> & { type: string; id: string; message: { role: string; content?: string; timestamp?: number } };
@@ -63,7 +65,7 @@ function runtime(run: typeof runDreamWorker, mode = "tui", openFailure?: Error, 
 		mark: async (_directory, sessionID) => { marks.push(sessionID); return { close: async () => { unmarks.push(sessionID); } }; },
 		live: async () => [...peers],
 		roots: async () => ({ state: "/state", sessions: "/sessions", memory: "/memory", snippets: null, prompts: null, globalAgents: null }), scope: async () => ({}), liveDirectory: stateDirectory, ...overrides });
-	return { ctx, entries, stop, opened, marks, unmarks, peers, closed, tools, messages, statuses,
+	return { ctx, entries, stop, opened, marks, unmarks, peers, closed, tools, messages, statuses, handlers,
 		deferDelivery: () => { isDeliveryDeferred = true; },
 		deliver: () => { isDeliveryDeferred = false; for (const message of pending.splice(0)) append(message); },
 		get tool() { assert.ok(registeredTool); return registeredTool; },
@@ -558,16 +560,20 @@ test("the exact proposal stays visible but is excluded from model context", asyn
 const pendingRow = (revision: string, proposed: string, disposition = "pending", blockReason?: string) => ({ finding: { revision, proposed: Buffer.from(proposed).toString("base64") }, disposition, ...blockReason ? { blockReason } : {} });
 type ContextMessage = { role: string; customType?: string; content?: unknown; timestamp?: number };
 const reminders = (messages: ContextMessage[]) => messages.filter((message) => message.customType === "pi-core-memories:pending-reminder");
-function reminderTurns(f: ReturnType<typeof runtime>) {
-	const transcript: ContextMessage[] = [{ role: "user", content: "Earlier request.", timestamp: 1 }, { role: "assistant", content: [], timestamp: 2 }];
-	let clock = 2;
-	return async (prompt = "Check the synthetic build settings.") => {
-		await f.emit("before_agent_start", { messageType: "user", prompt });
-		transcript.push({ role: "user", content: prompt, timestamp: ++clock }, { role: "toolResult", content: [], timestamp: ++clock });
-		const { messages } = await f.emit("context", { messages: structuredClone(transcript) }) as { messages: ContextMessage[] };
+function reminderTurns(f: ReturnType<typeof runtime>, transcript: ContextMessage[] = [{ role: "user", content: "Earlier request.", timestamp: 1 }, { role: "assistant", content: [], timestamp: 2 }]) {
+	const runner = new ExtensionRunner([{ path: "queued-runtime", handlers: new Map([...f.handlers].map(([name, handler]) => [name, [handler]])) } as unknown as Extension], createExtensionRuntime(), "/synthetic", f.ctx.sessionManager as unknown as SessionManager, {} as ModelRegistry);
+	runner.onError((error) => assert.fail(error.error));
+	let clock = transcript.at(-1)?.timestamp ?? 0;
+	const request = async () => {
+		const messages = await runner.emitContext(transcript as AgentMessage[]) as ContextMessage[];
 		const next = messages[messages.findLastIndex((message) => message.role === "user") + 1];
 		return { messages, transcript, reminder: next?.customType === "pi-core-memories:pending-reminder" ? String(next.content) : undefined };
 	};
+	return Object.assign(async (prompt = "Check the synthetic build settings.") => {
+		await f.emit("before_agent_start", { messageType: "user", prompt });
+		transcript.push({ role: "user", content: prompt, timestamp: ++clock }, { role: "toolResult", content: [], timestamp: ++clock });
+		return request();
+	}, { request });
 }
 function reminderRuntime(rows: () => unknown[], fail?: Error, mode = "tui") {
 	return runtime(async () => ({ status: "pending" }) as DreamReport, mode, undefined, { idleMilliseconds: 60_000,
@@ -602,6 +608,48 @@ test("an unchanged pending list keeps one reminder in place so earlier context s
 	} finally { await f.stop(); }
 });
 
+test("a pending reminder leaves mid-conversation system messages in place through Pi's context runner", async () => {
+	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
+	try {
+		await f.emit("session_start");
+		const system = [{ role: "system", content: "Synthetic base prompt.", timestamp: 0 }, { role: "system", content: "Synthetic tool loadout update.", timestamp: 3 }];
+		const turn = reminderTurns(f, [system[0], { role: "user", content: "Earlier request.", timestamp: 1 }, { role: "assistant", content: [], timestamp: 2 }, system[1]]);
+		const first = await turn();
+		assert.ok(first.reminder);
+		assert.deepEqual([first.messages[0], first.messages[3]], system);
+		const second = await turn();
+		assert.equal(JSON.stringify(second.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
+	} finally { await f.stop(); }
+});
+
+test("a repeat context request in one run re-sends the same reminder once and never saves or sends it", async () => {
+	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		first.transcript.push({ role: "assistant", content: [], timestamp: 10 }, { role: "toolResult", content: [], timestamp: 11 });
+		const repeated = await turn.request();
+		assert.equal(JSON.stringify(repeated.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
+		assert.equal(reminders(repeated.messages).length, 1);
+		assert.doesNotMatch(JSON.stringify([f.entries, f.messages]), /pending-reminder|Synthetic pending claim/);
+	} finally { await f.stop(); }
+});
+
+test("a prompt still gets the current reminder after compaction removes the prompt its unchanged reminder was anchored on", async () => {
+	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		assert.equal((await turn()).reminder, undefined);
+		first.transcript.splice(0, 4);
+		const compacted = await turn();
+		assert.equal(compacted.reminder, first.reminder);
+		assert.equal(reminders(compacted.messages).length, 1);
+	} finally { await f.stop(); }
+});
+
 test("a changed pending list appends a new reminder and keeps earlier reminders in place until their prompt is compacted away", async () => {
 	let rows = [pendingRow("a".repeat(64), "First synthetic claim."), pendingRow("b".repeat(64), "Second synthetic claim.")];
 	const f = reminderRuntime(() => rows);
@@ -616,7 +664,7 @@ test("a changed pending list appends a new reminder and keeps earlier reminders 
 		assert.equal(reminders(second.messages).length, 2);
 		rows = [];
 		const emptied = await turn();
-		assert.match(emptied.reminder!, /no memory proposals are pending now; earlier pending-findings reminders are out of date/);
+		assert.match(emptied.reminder!, /no pending memory proposals need asking about now; earlier pending-findings reminders are out of date/);
 		assert.equal(JSON.stringify(emptied.messages.slice(0, second.messages.length)), JSON.stringify(second.messages));
 		const unchanged = await turn();
 		assert.equal(unchanged.reminder, undefined); assert.equal(reminders(unchanged.messages).length, 3);
@@ -637,7 +685,7 @@ test("a finding answered in this session leaves the reminder until a new session
 		await f.reply("leave that for later");
 		const deferred = await f.call("memory_queue", { operation: "reply" });
 		assert.equal((deferred.details as Record<string, unknown>).status, "deferred");
-		assert.match((await turn()).reminder!, /no memory proposals are pending now/);
+		assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
 		await f.emit("session_start");
 		assert.match((await turn()).reminder!, new RegExp(revision));
 	} finally { await f.stop(); }
@@ -700,7 +748,7 @@ for (const outcome of ["approved", "rejected", "amended"] as const) {
 				assert.equal((amended.details as Record<string, unknown>).status, "proposal-queued");
 				await f.call("memory_queue", { operation: "cancel" });
 			} else assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, outcome);
-			assert.match((await turn()).reminder!, /no memory proposals are pending now/);
+			assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
 		} finally { await f.stop(); }
 	});
 }

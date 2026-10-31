@@ -258,7 +258,7 @@ func sourceProtectionProtectedReadNeverSendsBodyToHostOrFreezesIt(path: String) 
   try worker.finish()
 }
 
-@Test(arguments: [6, 16])
+@Test(arguments: [6, 8, 16])
 func sourceProtectionRequestBudgetDropsRelatedWindowsBeforeTheLimit(limit: Int) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
@@ -297,17 +297,27 @@ func sourceProtectionRequestBudgetDropsRelatedWindowsBeforeTheLimit(limit: Int) 
   budget = limit
   used = 0
   requests = []
-  if limit < 16 {
+  if limit == 6 {
     #expect(throws: DreamSourceProtectionError.requestLimit) { try run(transactionUncalled) }
     #expect(!requests.contains(related))
     #expect(
       !FileManager.default.fileExists(
         atPath: fixture.state.appendingPathComponent("admissions/1.json").path))
   } else {
-    guard case .completed = try run(transactionNotes) else {
+    var limitations: [String] = []
+    let result = try run { request in
+      limitations = try transactionObject(request)["limitations"] as! [String]
+      return try transactionNotes(request)
+    }
+    guard case .completed = result else {
       Issue.record("related run did not complete")
       return
     }
-    #expect(requests.contains(related))
+    let isRelatedDropped = limit < 16
+    #expect(requests.contains(related) != isRelatedDropped)
+    #expect(
+      limitations.contains(
+        "A related retained window exceeded the source-check limit and was not supplied.")
+        == isRelatedDropped)
   }
 }

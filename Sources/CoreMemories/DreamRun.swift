@@ -1440,8 +1440,12 @@ public final class DreamRunStore {
       limitations: &limitations)
     if let remainingProtections {
       let protectionsAfterRelated = 3
-      relatedBatches = Array(
-        relatedBatches.prefix(max(0, remainingProtections() - protectionsAfterRelated)))
+      let suppliedCount = max(0, remainingProtections() - protectionsAfterRelated)
+      if relatedBatches.count > suppliedCount {
+        relatedBatches = Array(relatedBatches.prefix(suppliedCount))
+        limitations.append(
+          "A related retained window exceeded the source-check limit and was not supplied.")
+      }
     }
     let catalogue =
       try relatedBatches.isEmpty

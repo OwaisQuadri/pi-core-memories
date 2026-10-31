@@ -12,7 +12,7 @@ function context() {
 	const entries: TestEntry[] = [{ type: "message", id: "user-entry", message: { role: "user", content: "Start the conversation.", timestamp: 0 } }];
 	const statuses = new Map<string, string>();
 	const ui = { setStatus(key: string, value: string | undefined) { if (value === undefined) statuses.delete(key); else statuses.set(key, value); } };
-	const ctx = { ui, mode: "tui", hasUI: true, cwd: "/synthetic", model: { provider: "openai-codex", id: "selected", contextWindow: 262_144 }, thinkingLevel: "high", isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionId: () => "session", getBranch: () => entries } } as unknown as ExtensionContext;
+	const ctx = { ui, mode: "tui", hasUI: true, cwd: "/synthetic", model: { provider: "openai-codex", id: "selected", contextWindow: 262_144 }, thinkingLevel: "high", isIdle: () => true, hasPendingMessages: () => false, sessionManager: { getSessionId: () => "session", getSessionFile: () => "/sessions/session.jsonl", getBranch: () => entries } } as unknown as ExtensionContext;
 	const toolContext: ExtensionToolContext = { ...ctx, tools: [], executeTool: async () => { assert.fail("Unexpected nested fixture tool call."); } };
 	return { ctx: toolContext, entries, statuses };
 }
@@ -120,6 +120,65 @@ for (const boundary of ["worker", "provider", "window", "marker"] as const) {
 	});
 }
 
+test("live marker read failures report liveSessionUnavailable without counting worker failures", async () => {
+	let runs = 0;
+	const f = runtime(async () => { runs++; return { status: "noNewRecords" } as DreamReport; }, "tui", undefined, { live: async () => { throw new Error("PRIVATE_PATH"); } });
+	try {
+		await f.emit("session_start"); await sleep(120);
+		assert.equal(runs, 0);
+		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: liveSessionUnavailable,/);
+		assert.ok(f.opened.length > 3, "dreaming keeps retrying with no worker-failure backoff stop");
+	} finally { await f.stop(); }
+});
+
+test("a failed live marker is retried on later schedules", async () => {
+	let attempts = 0;
+	const f = runtime(async () => ({ status: "noNewRecords" }) as DreamReport, "tui", undefined, { mark: async () => { if (++attempts === 1) throw new Error("busy"); return { close: async () => {} }; } });
+	try {
+		await f.emit("session_start");
+		assert.match(f.statuses.get("pi-core-memories:dream")!, /liveSessionUnavailable/);
+		await sleep(60);
+		assert.equal(attempts, 2);
+		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /error/);
+	} finally { await f.stop(); }
+});
+
+for (const mode of ["print", "rpc"]) {
+	test(`a ${mode} session with a session file writes a live marker but never dreams`, async () => {
+		const f = runtime(async () => assert.fail("Non-interactive sessions must not dream"), mode);
+		try { await f.emit("session_start"); await sleep(30); assert.deepEqual(f.marks, ["session"]); }
+		finally { await f.stop(); }
+		assert.deepEqual(f.unmarks, ["session"]);
+	});
+}
+
+test("the footer combines dream state with nonzero queued and review counts from the decision journal", async () => {
+	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
+	const seen: string[] = [];
+	const f = runtime(async () => { await released; return { status: "noNewRecords" } as DreamReport; }, "tui", undefined, {
+		open: async () => ({ request: async (type: string) => { seen.push(f.statuses.get("pi-core-memories:dream")!); assert.equal(type, "drain"); return { type: "drained", queued: 1, review: 2 }; }, close: async () => {} }) as unknown as Awaited<ReturnType<typeof openQueueClient>>,
+	});
+	try {
+		await f.emit("session_start"); await sleep(30);
+		assert.equal(seen[0], "dreaming: applying");
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active \u00b7 1 queued \u00b7 2 to review");
+		release(); await sleep(5);
+	} finally { release(); await f.stop(); }
+});
+
+test("a long backoff timer shrinks when input resets failures", async () => {
+	let runs = 0;
+	const f = runtime(async () => { runs++; throw new Error("fail"); }, "tui", undefined, { idleMilliseconds: 20 });
+	try {
+		await f.emit("session_start"); await sleep(70);
+		const before = runs;
+		assert.equal(before, 2, "the third run waits for an 80 ms backoff");
+		await f.emit("input", { source: "interactive", text: "next" });
+		await sleep(40);
+		assert.ok(runs > before, "input reschedules the shorter delay");
+	} finally { await f.stop(); }
+});
+
 test("a session switch removes the old live marker before marking the replacement", async () => {
 	const f = runtime(async () => assert.fail("No status test may dispatch"), "tui", undefined, { idleMilliseconds: 60_000 });
 	try {
@@ -173,11 +232,6 @@ test("model selection changes cancel a running worker and shutdown stops resched
 	await f.stop(); const after = runs; await sleep(20); assert.equal(runs, after);
 });
 
-test("noninteractive hosts never start background or mark a live session", async () => {
-	const rpc = runtime(async () => assert.fail("RPC must not schedule"), "rpc");
-	await rpc.emit("session_start"); await sleep(20); await rpc.stop();
-	assert.deepEqual(rpc.marks, []);
-});
 
 test("a native queue refusal never retries another context", async () => {
 	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", new Error("Native queue unavailable."));

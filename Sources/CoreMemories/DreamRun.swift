@@ -1029,13 +1029,15 @@ public final class DreamRunStore {
   ) throws -> DreamTransactionResult {
     try performRun(
       selection: selection, resume: resume, sourceRoles: nil, excludedSessionIDs: [],
-      prepare: { progress, _ in try prepare(progress) }, protect: nil, call: call, observe: observe)
+      prepare: { progress, _ in try prepare(progress) }, protect: nil, remainingProtections: nil,
+      call: call, observe: observe)
   }
 
   package func run(
     selection: DreamSelectedCall, resume: DreamResumeAction = .inspectOrContinue,
     sourceRoles: DreamSourceRoles, excludedSessionIDs: Set<String> = [],
     protect: @escaping ([String]) throws -> Void,
+    remainingProtections: (() -> Int)? = nil,
     prepare: (DreamProgress, DreamFreshSources) throws -> PreparedSessionBatch,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void = { _, _, _, _ in }
@@ -1046,14 +1048,15 @@ public final class DreamRunStore {
       prepare: { progress, sources in
         guard let sources else { throw DreamRunError.unsafeState }
         return try prepare(progress, sources)
-      }, protect: protect, call: call, observe: observe)
+      }, protect: protect, remainingProtections: remainingProtections, call: call,
+      observe: observe)
   }
 
   private func performRun(
     selection: DreamSelectedCall, resume: DreamResumeAction, sourceRoles: DreamSourceRoles?,
     excludedSessionIDs: Set<String>,
     prepare: (DreamProgress, DreamFreshSources?) throws -> PreparedSessionBatch,
-    protect: (([String]) throws -> Void)?,
+    protect: (([String]) throws -> Void)?, remainingProtections: (() -> Int)?,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void
   ) throws -> DreamTransactionResult {
@@ -1081,7 +1084,7 @@ public final class DreamRunStore {
     let result = try runLocked(
       selection: selection, resume: resume, isLockCreated: ownership.isCreated,
       sourceRoles: sourceRoles, excludedSessionIDs: excludedSessionIDs,
-      prepare: prepare, protect: protect,
+      prepare: prepare, protect: protect, remainingProtections: remainingProtections,
       call: { request in
         let started = ContinuousClock.now
         let response = try call(request)
@@ -1127,7 +1130,7 @@ public final class DreamRunStore {
     selection: DreamSelectedCall, resume: DreamResumeAction, isLockCreated: Bool,
     sourceRoles: DreamSourceRoles?, excludedSessionIDs: Set<String>,
     prepare: (DreamProgress, DreamFreshSources?) throws -> PreparedSessionBatch,
-    protect: (([String]) throws -> Void)?,
+    protect: (([String]) throws -> Void)?, remainingProtections: (() -> Int)?,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool) throws -> Void
   ) throws -> DreamTransactionResult {
@@ -1253,7 +1256,8 @@ public final class DreamRunStore {
       let date = clock()
       let context = try capture(
         run: run, memory: memory, date: date, retainedBatches: retainedBatches,
-        excludedSessionIDs: excludedSessionIDs, protect: protect)
+        excludedSessionIDs: excludedSessionIDs, protect: protect,
+        remainingProtections: remainingProtections)
       let milliseconds = date.timeIntervalSince1970 * 1_000
       guard milliseconds.isFinite, milliseconds >= Double(Int64.min),
         milliseconds < Double(Int64.max)
@@ -1423,7 +1427,7 @@ public final class DreamRunStore {
   private func capture(
     run: FrozenDreamRun, memory: MemoryStore, date: Date,
     retainedBatches: [PreparedSessionBatch], excludedSessionIDs: Set<String>,
-    protect: (([String]) throws -> Void)?
+    protect: (([String]) throws -> Void)?, remainingProtections: (() -> Int)?
   ) throws
     -> DreamDecisionContext
   {
@@ -1431,9 +1435,14 @@ public final class DreamRunStore {
       maximumResponseBytes: limits.maximumResponseBytes,
       maximumFrozenBytes: limits.maximumFrozenBytes)
     var limitations: [String] = []
-    let relatedBatches = try selectRetainedBatches(
+    var relatedBatches = try selectRetainedBatches(
       current: run.batch, retained: retainedBatches, excludedSessionIDs: excludedSessionIDs,
       limitations: &limitations)
+    if let remainingProtections {
+      let protectionsAfterRelated = 3
+      relatedBatches = Array(
+        relatedBatches.prefix(max(0, remainingProtections() - protectionsAfterRelated)))
+    }
     let catalogue =
       try relatedBatches.isEmpty
       ? run.batch.evidence
@@ -1547,7 +1556,6 @@ public final class DreamRunStore {
       guard let text = String(data: bytes, encoding: .utf8), !text.contains("\0") else {
         throw DreamRunError.unsafeState
       }
-      if let protect { try protect([canonical.path, text]) }
       let key = SourceDigest(bytes: Data(canonical.path.utf8)).rawValue
       let reference = canonical.lastPathComponent + " (" + key + ")"
       owners.append(

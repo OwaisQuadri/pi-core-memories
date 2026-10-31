@@ -17,6 +17,30 @@ private func admittedBatch(
       }, priorViews: prior)
 }
 
+@Test func admittedStrippingRootIsCheckedInOneRequestAndRedactsOnlyItsSecretFile() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let secret = "---\nname: secret\n---\n\nSYNTHETIC_SECRET body\n"
+  let plain = "---\nname: plain\n---\n\nPlain body\n"
+  try fixture.write(secret, file: fixture.snippets.appendingPathComponent("b.md"))
+  try fixture.write(plain, file: fixture.snippets.appendingPathComponent("c.md"))
+  let original = try String(
+    contentsOf: fixture.snippets.appendingPathComponent("strip.md"), encoding: .utf8)
+  var requests: [[String]] = []
+  let batch = try admittedBatch(fixture, inspect: { requests.append($0) })
+  let secretRequests = requests.filter { $0.contains(secret) }
+  #expect(secretRequests.count == 1)
+  #expect(secretRequests.first.map(Set.init) == [secret, plain, original])
+  let stripping = Dictionary(
+    uniqueKeysWithValues: try #require(batch.provenance?.stripping).map { ($0.name, $0) })
+  let redacted = secret.replacingOccurrences(of: "SYNTHETIC_SECRET", with: "[x]")
+  #expect(stripping["b.md"]?.bytes == Data(redacted.utf8))
+  #expect(stripping["b.md"]?.originalHash == SourceDigest(bytes: Data(secret.utf8)))
+  #expect(stripping["c.md"]?.bytes == Data(plain.utf8))
+  #expect(stripping["strip.md"]?.bytes == Data(original.utf8))
+}
+
 @Test func admittedViewLengthChangeKeepsOriginalCursorAndSeparateHashes() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

@@ -711,6 +711,28 @@ test("a failed queue read after an answer still drops the answered finding from 
 	} finally { await f.stop(); }
 });
 
+test("a failed queue read filters the reminder that survives a branch move, not one the move removed", async () => {
+	const answered = "a".repeat(64); const other = "b".repeat(64);
+	let isBusy = false; let rows = [pendingRow(answered, "Answered synthetic claim."), pendingRow(other, "Other synthetic claim.")];
+	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return rows; });
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		const first = await turn();
+		await f.call("memory_queue", { operation: "present", revision: answered });
+		await f.reply("leave that for later");
+		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
+		rows = [rows[1]!];
+		const second = await turn();
+		assert.doesNotMatch(second.reminder!, new RegExp(answered));
+		second.transcript.splice(-2);
+		isBusy = true;
+		const moved = await turn();
+		assert.equal(moved.reminder, first.reminder!.split("\n").filter((line) => !line.startsWith(`- ${answered}:`)).join("\n"));
+		assert.equal(reminders(moved.messages).length, 2);
+	} finally { await f.stop(); }
+});
+
 test("a failed queue read after the last listed finding is answered adds the nothing-to-ask note", async () => {
 	let isBusy = false;
 	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return [pendingRow("a".repeat(64), "Synthetic pending claim.")]; });

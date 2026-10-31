@@ -58,9 +58,30 @@ package final class MemoryQueue {
       repository: repository, stateRoot: reviewState, sources: sources, environment: environment)
     review.isCancelled = { [weak self] in self?.isCancelled() ?? true }
     configureReview(review)
+    _ = close(try directory.openLock().descriptor)
     try MemoryQueueAuthority.activate(
       git: review.store.reviewGit, review: review.binding, queue: queueRoot)
+    try settleUnappliedDecisions(review)
     return review
+  }
+
+  private func settleUnappliedDecisions(_ review: MemoryReviewController) throws {
+    guard try directory.isPresent("queue.json") else { return }
+    let state = try MemoryReviewEncoding.decode(
+      QueueLedger.self,
+      bytes: directory.read("queue.json", maximum: MemoryReviewEncoding.maximumFileBytes))
+    for intent in state.intents
+    where (intent.queuedClock != nil || intent.isImmediate == true)
+      && !state.receipts.contains(where: { $0.decisionID == intent.decisionID })
+    {
+      if intent.queuedClock == nil {
+        _ = try needsDecision(intent, review: review)
+      } else if try recover(decisionID: intent.decisionID, review: review).status
+        == "outcome-unresolved"
+      {
+        try applyJournaledDecision(intent, review: review)
+      }
+    }
   }
 
   func ledger<T>(
@@ -403,7 +424,7 @@ package final class MemoryQueue {
     }
     let intent = QueueDecisionIntent(
       decisionID: decisionID, display: display, action: action, responseReference: responseReference,
-      queuedClock: current.clockDate.timeIntervalSince1970)
+      isImmediate: true)
     try ledger(current.controller, isWaiting: true) { state in
       guard !state.intents.contains(where: { $0.decisionID == decisionID }) else {
         throw MemoryError("decision key already used; recover its receipt")
@@ -413,28 +434,30 @@ package final class MemoryQueue {
     defer { active = nil }
     do {
       try perform(
-        action, review: current.controller, preview: current.preview, checkout: current.checkout)
+        action, review: current.controller, preview: current.preview, checkout: current.checkout,
+        isWaitingForWriter: true)
     } catch DreamRunError.busy {
-      return receipt(intent, status: "queued")
+      throw DreamRunError.busy
     } catch {
       let recovered = try recover(
         decisionID: decisionID, review: current.controller, isWaiting: true)
-      guard recovered.status != "queued" else { throw error }
-      return recovered
+      guard recovered.status == "outcome-unresolved" else { return recovered }
+      return try needsDecision(intent, review: current.controller)
     }
     return try recover(decisionID: decisionID, review: current.controller, isWaiting: true)
   }
 
   private func perform(
     _ action: String, review: MemoryReviewController, preview: MemoryReviewPreview,
-    checkout: MemoryReviewCheckoutPreview
+    checkout: MemoryReviewCheckoutPreview, isWaitingForWriter: Bool
   ) throws {
     if action == "approve" {
-      _ = try review.apply(preview)
+      _ = try review.apply(preview, isWaitingForWriter: isWaitingForWriter)
     } else if action == "reject" {
-      try review.reject(candidateID: preview.change.id)
+      try review.reject(candidateID: preview.change.id, isWaitingForWriter: isWaitingForWriter)
     } else if action == "defer" {
-      try review.deferCandidate(candidateID: preview.change.id)
+      try review.deferCandidate(
+        candidateID: preview.change.id, isWaitingForWriter: isWaitingForWriter)
     } else {
       guard checkout.isDetachRequired else {
         throw MemoryError("checkout does not require preparation")
@@ -451,59 +474,31 @@ package final class MemoryQueue {
       commit: nil, auditRef: nil)
   }
 
-  package func drain(sessionID: String? = nil) throws -> (
-    queued: Int, review: Int, needsDecision: Int, notices: [MemoryQueueReceipt]
-  ) {
+  package func reviewCount() throws -> Int {
     guard active == nil else { throw DreamRunError.busy }
-    let review = try controller()
-    let unresolved = { (state: QueueLedger) in
-      state.intents.filter { intent in
-        intent.queuedClock != nil
-          && !state.receipts.contains(where: { $0.decisionID == intent.decisionID })
-      }
-    }
-    for intent in try ledger(review, { unresolved($0) }) {
-      guard try recover(decisionID: intent.decisionID, review: review).status == "queued" else {
-        continue
-      }
-      try applyQueued(intent, review: review)
-    }
-    let pending = try review.list().filter { $0.disposition == .pending && $0.limitation == nil }
-      .map(\.change.id.rawValue)
-    let (waiting, open) = try ledger(review) { state in
-      let open = state.receipts.compactMap { receipt -> (MemoryQueueReceipt, String)? in
-        guard receipt.status == "needs-decision", pending.contains(receipt.revision),
-          let index = state.intents.firstIndex(where: { $0.decisionID == receipt.decisionID }),
-          !state.intents[(index + 1)...].contains(where: {
-            $0.display.presentation.finding.revision == receipt.revision
-          })
-        else { return nil }
-        return (receipt, state.intents[index].display.presentation.request.sessionID)
-      }
-      return (unresolved(state), open)
-    }
-    let revisions = Set(waiting.map(\.display.presentation.finding.revision))
-    var notified: Set<String> = []
-    let notices = open.filter { $0.1 == sessionID && notified.insert($0.0.revision).inserted }
-      .map(\.0)
-    return (
-      waiting.count, pending.filter { !revisions.contains($0) }.count,
-      Set(open.map(\.0.revision)).count, notices
-    )
+    return try controller().list().filter { $0.disposition == .pending && $0.limitation == nil }
+      .count
   }
 
+  @discardableResult
   func needsDecision(_ intent: QueueDecisionIntent, review: MemoryReviewController)
-    throws
+    throws -> MemoryQueueReceipt
   {
     try ledger(review, isWaiting: true) { state in
-      guard !state.receipts.contains(where: { $0.decisionID == intent.decisionID }) else { return }
+      if let existing = state.receipts.first(where: { $0.decisionID == intent.decisionID }) {
+        return existing
+      }
       _ = try review.list()
-      state.receipts.append(
-        try published(intent, review: review) ?? receipt(intent, status: "needs-decision"))
+      let written =
+        try published(intent, review: review) ?? receipt(intent, status: "needs-decision")
+      state.receipts.append(written)
+      return written
     }
   }
 
-  private func applyQueued(_ intent: QueueDecisionIntent, review: MemoryReviewController) throws {
+  private func applyJournaledDecision(_ intent: QueueDecisionIntent, review: MemoryReviewController)
+    throws
+  {
     let presentation = intent.display.presentation
     var validated: (MemoryReviewPreview, MemoryReviewCheckoutPreview)?
     do {
@@ -539,14 +534,18 @@ package final class MemoryQueue {
       validated = nil
     }
     guard let (preview, checkout) = validated else {
-      return try needsDecision(intent, review: review)
+      try needsDecision(intent, review: review)
+      return
     }
     do {
-      try perform(intent.action, review: review, preview: preview, checkout: checkout)
+      try perform(
+        intent.action, review: review, preview: preview, checkout: checkout,
+        isWaitingForWriter: false)
     } catch DreamRunError.busy {
       throw DreamRunError.busy
     } catch {
-      if try recover(decisionID: intent.decisionID, review: review).status == "queued" {
+      if try recover(decisionID: intent.decisionID, review: review).status == "outcome-unresolved"
+      {
         try needsDecision(intent, review: review)
       }
       return
@@ -589,8 +588,7 @@ package final class MemoryQueue {
         state.receipts.append(receipt)
         return receipt
       }
-      return self.receipt(
-        intent, status: intent.queuedClock == nil ? "outcome-unresolved" : "queued")
+      return self.receipt(intent, status: "outcome-unresolved")
     }
   }
 

@@ -102,12 +102,15 @@ package struct MemoryConfiguration: Codable, Sendable {
     if deviceKey == nil { deviceKey = SourceDigest(bytes: Data(UUID().uuidString.utf8)).rawValue }
   }
 
-  package func reviewSources() throws -> DreamRunStore {
-    try reviewSources(stateRoot: stateURL, memoryRepository: memoryURL)
+  package func reviewSources(isCancelled: @escaping @Sendable () -> Bool = { false }) throws
+    -> DreamRunStore
+  {
+    try reviewSources(stateRoot: stateURL, memoryRepository: memoryURL, isCancelled: isCancelled)
   }
 
   package func reviewSources(
-    stateRoot: URL, memoryRepository: URL, isReadOnly: Bool = false
+    stateRoot: URL, memoryRepository: URL, isReadOnly: Bool = false,
+    isCancelled: @escaping @Sendable () -> Bool = { false }
   ) throws -> DreamRunStore {
     let root = try DreamStateDirectory.openRoot(stateRoot, isCreating: false)
     let bytes = try root.read("root.json", maximum: 1_048_576)
@@ -133,7 +136,7 @@ package struct MemoryConfiguration: Codable, Sendable {
           URL(fileURLWithPath: $0)
         },
         globalAgents: roots.globalAgents.map { URL(fileURLWithPath: $0) }, deviceKey: deviceKey,
-        projectBindings: projectBindings, isReadOnly: isReadOnly)
+        projectBindings: projectBindings, isCancelled: isCancelled, isReadOnly: isReadOnly)
     }
     let sessionRoot = URL(fileURLWithPath: original[0])
     let managedSnippets = sessionRoot.deletingLastPathComponent()
@@ -151,7 +154,8 @@ package struct MemoryConfiguration: Codable, Sendable {
       memoryRepository: URL(fileURLWithPath: original[1]),
       strippingRoots: strippingRoots,
       globalAgents: (saved["globalAgents"] as? String).map { URL(fileURLWithPath: $0) },
-      deviceKey: deviceKey, projectBindings: projectBindings, isReadOnly: isReadOnly)
+      deviceKey: deviceKey, projectBindings: projectBindings, isCancelled: isCancelled,
+      isReadOnly: isReadOnly)
   }
 
   package func validate() throws {

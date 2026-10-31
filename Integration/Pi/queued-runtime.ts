@@ -84,8 +84,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let isAlive = false;
 	let dreamStatus: string | undefined;
-	let footerCounts = { queued: 0, review: 0, needsDecision: 0 };
-	const noticed = new Set<string>();
+	let footerCounts = { review: 0 };
 	let timerDelay = 0;
 	let marking: Promise<void> | undefined;
 	const markerError = 'dreaming: error(code: liveSessionUnavailable, message: "Live session marker is unavailable")';
@@ -98,7 +97,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	const answeredRevisions = new Set<string>();
 	const pendingReminders: { anchor: number; message: Extract<AgentMessage, { role: "custom" }> }[] = [];
 	let unanchoredReminder: { text: string | undefined; isReadFailed?: boolean } | undefined;
-	for (const type of ["pi-core-memories:proposal", "pi-core-memories:needs-decision"]) pi.registerMessageRenderer(type, (message) => typeof message.content === "string" ? new Text(message.content, 0, 0) : undefined);
+	pi.registerMessageRenderer("pi-core-memories:proposal", (message) => typeof message.content === "string" ? new Text(message.content, 0, 0) : undefined);
 	function closeConversation(): Promise<void> {
 		const previous = conversation; conversation = undefined; observedReply = undefined;
 		if (previous) { previous.controller.abort(); conversationClose = previous.client.close(); }
@@ -107,21 +106,16 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	function reportDreamStatus(value: string | undefined): void {
 		if (value !== undefined && !isAlive) return;
 		dreamStatus = value;
-		const counts = [footerCounts.queued ? `${footerCounts.queued} queued` : "", footerCounts.review ? `${footerCounts.review} to review` : "", footerCounts.needsDecision ? `${footerCounts.needsDecision} need decision` : ""].filter(Boolean);
+		const counts = footerCounts.review ? [`${footerCounts.review} to review`] : [];
 		const text = value === undefined || value.startsWith("dreaming: error(") ? value : [value, ...counts].join(" · ");
 		try { if (context?.hasUI) context.ui.setStatus("pi-core-memories:dream", text); } catch {}
 	}
-	async function drainDecisions(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, signal: AbortSignal): Promise<void> {
+	async function refreshCounts(ctx: Pick<ExtensionContext, "cwd">, signal: AbortSignal): Promise<void> {
 		const client = await deps.open(ctx.cwd, signal);
 		try {
-			const result = await client.request("drain", { sessionID: hash(ctx.sessionManager.getSessionId()) });
-			if (result.type !== "drained" || typeof result.queued !== "number" || typeof result.review !== "number" || typeof result.needsDecision !== "number" || !Array.isArray(result.notices)) return;
-			const revisions = result.notices.map((value) => queueObject(value).revision).filter((value): value is string => typeof value === "string" && !noticed.has(value));
-			footerCounts = { queued: result.queued, review: result.review, needsDecision: result.needsDecision };
-			for (const revision of revisions) {
-				noticed.add(revision);
-				pi.sendMessage({ customType: "pi-core-memories:needs-decision", content: `Your earlier memory decision for revision ${revision} was not applied and does not count: the proposal, its evidence or the memory store changed first. Nothing was saved. The agent will present the current proposal for a new answer.`, display: true, details: { revision } }, { triggerTurn: false });
-			}
+			const result = await client.request("counts", {});
+			if (result.type !== "counts" || typeof result.review !== "number") return;
+			footerCounts = { review: result.review };
 		} finally { await client.close(); reportDreamStatus(dreamStatus); }
 	}
 	async function recordBlockedDream(invocationID: string, report: DreamReport): Promise<void> {
@@ -202,10 +196,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			try {
 				await conversationClose;
 				current.signal.throwIfAborted();
-				if (isCurrent()) reportDreamStatus("dreaming: applying");
-				await drainDecisions(ctx, current.signal).catch(() => {});
-				current.signal.throwIfAborted();
 				if (isCurrent()) reportDreamStatus("dreaming: active");
+				await refreshCounts(ctx, current.signal).catch(() => {});
+				current.signal.throwIfAborted();
 				const excludedSessionIDs = await liveSessions();
 				const roots = await deps.roots(getAgentDir(), ctx.cwd);
 				const scope = await deps.scope(current.signal);
@@ -226,12 +219,12 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					}
 				}, current.signal, () => {}, (value: unknown, signal: AbortSignal) => deps.protect(pi, invocationID, value, signal));
 				if (!isCurrent()) return;
-				await drainDecisions(ctx, current.signal).catch(() => {});
+				await refreshCounts(ctx, current.signal).catch(() => {});
 				if (!isCurrent()) return;
 				const recorded = report.callSelection;
 				const isRetrying = report.status === "pending" && report.reason === "interruptedCall" && (!recorded || isDeepStrictEqual(recorded, selection));
 				if (isRetrying) interruptedCallSelection = selection;
-				const isRescheduled = report.status !== "blocked" && (report.status !== "pending" || isRetrying || report.reason === "cancelled");
+				const isRescheduled = report.status !== "blocked" && (report.status !== "pending" || isRetrying || report.reason === "cancelled" || report.reason === "droppedBatch");
 				failures = isRescheduled ? 0 : 3;
 				const blockedReason = report.reason && /^[A-Za-z0-9:._-]{1,80}$/.test(report.reason) ? report.reason : "unknown";
 				reportDreamStatus(isRescheduled ? "dreaming: idle"
@@ -308,12 +301,12 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const abortConversation = () => activeConversation?.abort();
 		combined.addEventListener("abort", abortConversation, { once: true });
 		clearTimeout(timer); timer = undefined;
-		const refreshCounts = () => conversation || background ? Promise.resolve() : drainDecisions(ctx, combined).catch(() => {});
+		const refreshIdleCounts = () => conversation || background ? Promise.resolve() : refreshCounts(ctx, combined).catch(() => {});
 		foregroundCompletion = (async () => {
 			await conversationClose;
-			if (operation !== "reply") await refreshCounts();
+			if (operation !== "reply") await refreshIdleCounts();
 			const result = await run();
-			if (isCurrent()) await refreshCounts();
+			if (isCurrent()) await refreshIdleCounts();
 			return result;
 		})();
 		async function run(): Promise<unknown> {
@@ -378,13 +371,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 						await closeConversation();
 						return { status: "outcome-unresolved", decisionID, recovery };
 					}
-					if (state.startType === "claim" && receipt.status !== "detached") answeredRevisions.add(state.preview.tuple.revision);
-					if (receipt.status === "queued") {
-						await closeConversation();
-						footerCounts = { ...footerCounts, queued: footerCounts.queued + 1, review: Math.max(0, footerCounts.review - 1) };
-						reportDreamStatus(dreamStatus);
-						return { status: "decision-queued", decisionID, recovery, message: "Your decision was recorded. A dream run holds the memory lock, so the decision will be applied shortly, after the same native checks. Nothing is saved yet." };
-					}
+					if (state.startType === "claim" && receipt.status !== "detached" && receipt.status !== "needs-decision") answeredRevisions.add(state.preview.tuple.revision);
 					if (receipt && receipt.status === "detached") {
 						const next = await refreshConversation(state, identity.requestID);
 						if (next.status !== "proposal-queued") await closeConversation();

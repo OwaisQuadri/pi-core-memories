@@ -160,6 +160,7 @@ struct QueueDecisionIntent: Codable, Equatable {
   let action: String
   let responseReference: String
   var queuedClock: Double? = nil
+  var isImmediate: Bool? = nil
 }
 
 package struct MemoryQueueReceipt: Codable, Equatable {

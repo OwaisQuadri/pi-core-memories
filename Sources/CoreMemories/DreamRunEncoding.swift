@@ -689,6 +689,7 @@ extension DreamRunEncoding {
     let requestHash: String
     let selection: Selection
     let base: String
+    var rejectedVersion: String? = nil
   }
 
   struct State: Codable {

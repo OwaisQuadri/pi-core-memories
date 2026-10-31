@@ -278,6 +278,39 @@ func queueWorkerOnlyExactPrivateOriginalReplyReturnsReceipt(mode: String) throws
   worker.process.waitUntilExit()
 }
 
+@Test func queueWorkerCancelStopsAReplyWaitingForTheDreamWriterLock() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  do {
+    let controller = try MemoryReviewController(
+      repository: fixture.memory, stateRoot: fixture.root.appendingPathComponent("review"),
+      sources: sources, environment: [:])
+    try controller.confirmDetach(controller.checkoutPreview())
+  }
+  let worker = try QueueWorkerFixture(config: queueWorkerConfig(fixture))
+  let original = try fixture.main()
+  var tuple = try worker.tuple(worker.claim())
+  tuple["messageReference"] = "message"
+  try worker.send("presented", tuple, isControl: true)
+  #expect(try worker.frame()["type"] as? String == "presented")
+  tuple.removeValue(forKey: "messageReference")
+  tuple["originalText"] = "Save that memory"
+  tuple["submittedText"] = "Save that memory"
+  tuple["decisionID"] = "save-1"
+  tuple["responseReference"] = "human-response"
+  let writer = open(fixture.state.appendingPathComponent("writer.lock").path, O_RDONLY | O_CLOEXEC)
+  defer { close(writer) }
+  #expect(flock(writer, LOCK_EX | LOCK_NB) == 0)
+  try worker.send("reply", tuple, isControl: true)
+  usleep(500_000)
+  try worker.send("cancel")
+  let outcome = try worker.frame()
+  #expect(outcome["type"] as? String == "blocked")
+  #expect(outcome["code"] as? String == "outcome-unresolved")
+  #expect(try fixture.main() == original)
+}
+
 @Test func queueWorkerOriginalReplyRetainsTheExactClaimUntilAnExplicitDecision() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

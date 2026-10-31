@@ -117,7 +117,9 @@ package final class MemoryDraftStore {
 
   package func list(review: MemoryReviewController? = nil) throws -> [MemoryDraft] {
     if let review {
-      return try withBatchJournal(review) { _ in try drafts(review: review) }
+      return try withBatchJournal(review, isWaitingForWriter: false) { _ in
+        try drafts(review: review)
+      }
     }
     return try locked { try drafts() }
   }
@@ -137,7 +139,7 @@ package final class MemoryDraftStore {
         recoveryRequired: recoveryRequired.sorted { $0.created < $1.created })
     }
     if let review {
-      return try withBatchJournal(review) { _ in try inspect() }
+      return try withBatchJournal(review, isWaitingForWriter: false) { _ in try inspect() }
     }
     return try locked { try inspect() }
   }

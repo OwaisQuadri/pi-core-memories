@@ -47,6 +47,9 @@ package struct DreamInvocationStatus: Sendable {
     case "callbackFailure": meaning = "The model call failed before its reply was saved."
     case "invalidDecision":
       meaning = "The saved reply failed validation. Queue progress did not advance."
+    case "droppedBatch":
+      meaning =
+        "Approved memory or rejected findings changed before the batch was published, so it was dropped. Its evidence will be dreamt again."
     case "workerFailure": meaning = "The worker stopped before finishing."
     case "protocolFailure": meaning = "The worker and Pi disagreed on the protocol."
     default:

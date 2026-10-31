@@ -307,9 +307,11 @@ package final class MemoryReviewController {
     }
   }
 
-  package func apply(_ preview: MemoryReviewPreview) throws -> MemoryReviewApproval {
+  package func apply(_ preview: MemoryReviewPreview, isWaitingForWriter: Bool = true) throws
+    -> MemoryReviewApproval
+  {
     try locked {
-      try withBatchSources(state: checkoutState!) {
+      try withBatchSources(state: checkoutState!, isWaitingForWriter: isWaitingForWriter) {
         let payload = preview.payload
         guard previews.removeValue(forKey: payload.candidateID) == payload,
           try selection(payload.candidateID) == .pending
@@ -324,26 +326,29 @@ package final class MemoryReviewController {
     }
   }
 
-  package func reject(candidateID: SourceDigest) throws {
-    try choose(candidateID, disposition: .rejected)
+  package func reject(candidateID: SourceDigest, isWaitingForWriter: Bool = true) throws {
+    try choose(candidateID, disposition: .rejected, isWaitingForWriter: isWaitingForWriter)
   }
 
-  package func deferCandidate(candidateID: SourceDigest) throws {
-    try choose(candidateID, disposition: .deferred)
+  package func deferCandidate(candidateID: SourceDigest, isWaitingForWriter: Bool = true) throws {
+    try choose(candidateID, disposition: .deferred, isWaitingForWriter: isWaitingForWriter)
   }
 
-  private func choose(_ candidateID: SourceDigest, disposition: MemoryReviewDisposition) throws {
+  private func choose(
+    _ candidateID: SourceDigest, disposition: MemoryReviewDisposition, isWaitingForWriter: Bool
+  ) throws {
     try locked {
-      try refresh()
-      let id = candidateID.rawValue
-      guard candidates[id] != nil, try selection(id) != .approved,
-        try selection(id) != .rejected
-      else { throw MemoryError("candidate is not selectable") }
-      let selection = ReviewSelection(candidateID: id, disposition: disposition)
-      try root.installReviewFile(
-        MemoryReviewEncoding.encode(selection), name: "\(disposition.rawValue)-\(id).json",
-        fault: persistenceFault, io: fileIO)
-      previews.removeValue(forKey: id)
+      try withBatchSources(state: checkoutState!, isWaitingForWriter: isWaitingForWriter) {
+        let id = candidateID.rawValue
+        guard candidates[id] != nil, try selection(id) != .approved,
+          try selection(id) != .rejected
+        else { throw MemoryError("candidate is not selectable") }
+        let selection = ReviewSelection(candidateID: id, disposition: disposition)
+        try root.installReviewFile(
+          MemoryReviewEncoding.encode(selection), name: "\(disposition.rawValue)-\(id).json",
+          fault: persistenceFault, io: fileIO)
+        previews.removeValue(forKey: id)
+      }
     }
   }
 
@@ -777,8 +782,10 @@ package final class MemoryReviewController {
     return try operation()
   }
 
-  func withBatchSources<T>(state: DreamStateDirectory, _ operation: () throws -> T) throws -> T {
-    try sources.withVerifiedReviewCandidates { bundles in
+  func withBatchSources<T>(
+    state: DreamStateDirectory, isWaitingForWriter: Bool, _ operation: () throws -> T
+  ) throws -> T {
+    try sources.withVerifiedReviewCandidates(isWaitingForWriter: isWaitingForWriter) { bundles in
       checkoutState = state
       defer { checkoutState = nil }
       try refresh(bundles: bundles)

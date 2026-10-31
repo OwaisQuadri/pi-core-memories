@@ -170,7 +170,8 @@ public enum DreamTransactionResult: Sendable {
 }
 
 public enum DreamPendingReason: String, Sendable {
-  case interruptedCall, cancelled, callbackFailure, invalidDecision, staleUnpublishedPlans
+  case interruptedCall, cancelled, callbackFailure, invalidDecision, staleUnpublishedPlans,
+    droppedBatch
 }
 
 public enum DreamResumeAction: Sendable {
@@ -232,6 +233,7 @@ public final class DreamRunStore {
   var persistenceFault: ((DreamPersistenceEvent) throws -> Void)?
   var clock: () -> Date = { Date() }
   var isCancelled: () -> Bool = { false }
+  var writerLockWaitLimit: Duration = .seconds(300)
   var beforePublication: ((String) throws -> Void)?
   var recoveryCount = 0
   var beforeFinalReport: (() throws -> Void)?
@@ -430,11 +432,11 @@ public final class DreamRunStore {
   }
 
   package func verifiedCompletedReviewCandidates() throws -> [VerifiedDreamReviewCandidates] {
-    try withVerifiedReviewCandidates { $0 }
+    try withVerifiedReviewCandidates(isWaitingForWriter: false) { $0 }
   }
 
   func withVerifiedReviewCandidates<T>(
-    _ operation: ([VerifiedDreamReviewCandidates]) throws -> T
+    isWaitingForWriter: Bool, _ operation: ([VerifiedDreamReviewCandidates]) throws -> T
   ) throws -> T {
     guard operationLock.try() else { throw DreamRunError.busy }
     defer { operationLock.unlock() }
@@ -443,7 +445,13 @@ public final class DreamRunStore {
       _ = flock(lock, LOCK_UN)
       _ = close(lock)
     }
-    guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
+    let deadline = ContinuousClock.now + (isWaitingForWriter ? writerLockWaitLimit : .zero)
+    while flock(lock, LOCK_EX | LOCK_NB) != 0 {
+      guard errno == EWOULDBLOCK, !isCancelled(), ContinuousClock.now < deadline else {
+        throw DreamRunError.busy
+      }
+      usleep(10_000)
+    }
     var bundles: [VerifiedDreamReviewCandidates] = []
     do {
       try root.verifyLock(lock)
@@ -1063,6 +1071,18 @@ public final class DreamRunStore {
   ) throws -> DreamTransactionResult {
     guard operationLock.try() else { throw DreamRunError.busy }
     defer { operationLock.unlock() }
+    let runRoot = try DreamStateDirectory.openRoot(
+      URL(fileURLWithPath: reviewStateURL.path + ".run"))
+    let runLock = try runRoot.openLock().descriptor
+    defer {
+      _ = flock(runLock, LOCK_UN)
+      _ = close(runLock)
+    }
+    guard flock(runLock, LOCK_EX | LOCK_NB) == 0 else {
+      if errno == EWOULDBLOCK { throw DreamRunError.busy }
+      throw DreamRunError.persistenceFailure
+    }
+    try runRoot.verifyLock(runLock)
     let ownership = try root.openLock()
     let lock = ownership.descriptor
     guard flock(lock, LOCK_EX | LOCK_NB) == 0 else {
@@ -1082,15 +1102,32 @@ public final class DreamRunStore {
     var measuredSeconds: Double?
     var observedRecordCount = 0
     var observedInputBytes = 0
+    var lockFailure: (any Error)?
     let result = try runLocked(
       selection: selection, resume: resume, isLockCreated: ownership.isCreated,
       sourceRoles: sourceRoles, excludedSessionIDs: excludedSessionIDs,
       prepare: prepare, protect: protect, remainingProtections: remainingProtections,
       call: { request in
+        guard flock(lock, LOCK_UN) == 0 else {
+          lockFailure = DreamRunError.persistenceFailure
+          throw DreamRunError.persistenceFailure
+        }
         let started = ContinuousClock.now
         let response = try call(request)
         let elapsed = started.duration(to: .now).components
         measuredSeconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+        while flock(lock, LOCK_EX | LOCK_NB) != 0 {
+          guard errno == EWOULDBLOCK else {
+            lockFailure = DreamRunError.persistenceFailure
+            throw DreamRunError.persistenceFailure
+          }
+          if self.isCancelled() { throw CancellationError() }
+          usleep(10_000)
+        }
+        do { try self.root.verifyLock(lock) } catch {
+          lockFailure = error
+          throw error
+        }
         return response
       },
       observe: { progress, batch, isRepeated in
@@ -1112,6 +1149,7 @@ public final class DreamRunStore {
         }
         try observe(progress, batch, isRepeated, estimate)
       })
+    if let lockFailure { throw lockFailure }
     if case .completed = result, let measuredSeconds, measuredSeconds > 0 {
       try? persist(
         bounded(
@@ -1270,6 +1308,7 @@ public final class DreamRunStore {
         messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)),
         renderingVersion: DreamRequestRendering.connectedV3.rawValue)
       let requestBytes = try bounded(request)
+      let rejected = try rejectedVersion()
       let directory = try runs.child(runID, isCreating: true)
       try synchronize(runs, name: "runDirectory")
       _ = try directory.child("receipts", isCreating: true)
@@ -1283,7 +1322,7 @@ public final class DreamRunStore {
         predecessorHash: chain.hash.rawValue, runID: runID, inputHash: run.inputHash.rawValue,
         contextHash: context.contextHash.rawValue,
         requestHash: SourceDigest(bytes: requestBytes).rawValue,
-        selection: DreamRunEncoding.Selection(selection), base: base)
+        selection: DreamRunEncoding.Selection(selection), base: base, rejectedVersion: rejected)
       let admissionBytes = try bounded(admission)
       try persist(
         admissionBytes, name: "\(progress.generation).json", directory: admissions,
@@ -1393,7 +1432,33 @@ public final class DreamRunStore {
         selection: DreamRunEncoding.Selection(selection), text: response.text)
       try install(envelope, name: attempt.responseName, directory: sealed.directory)
     }
+    if try isMemoryChanged(sealed) { return try dropBatch(sealed, chain: chain) }
     return try finish(sealed, chain: chain, isRecovered: isRecovered, isCommitted: false)
+  }
+
+  private func isMemoryChanged(_ sealed: SealedRun) throws -> Bool {
+    guard !(try sealed.directory.isPresent("decisions.json")) else { return false }
+    return try MemoryStore(repo: memoryRepository).approvedCommit() != sealed.run.approvedBase
+  }
+
+  private func isRejectionChanged(_ sealed: SealedRun) throws -> Bool {
+    guard let sealedVersion = sealed.admission.rejectedVersion else { return false }
+    return try rejectedVersion() != sealedVersion
+  }
+
+  private func dropBatch(_ sealed: SealedRun, chain: SuccessfulChain) throws
+    -> DreamTransactionResult
+  {
+    try save(generation: sealed.run.progress.generation, hash: chain.hash)
+    try root.child("admissions").remove("\(sealed.run.progress.generation).json")
+    return pending(sealed, reason: .droppedBatch)
+  }
+
+  private func rejectedVersion() throws -> String {
+    let names = try MemoryQueueAuthority.rejectedNames(
+      git: Git(repo: memoryRepository, environment: ProcessInfo.processInfo.environment),
+      repository: memoryRepository, sourceBinding: reviewSourceBinding().rawValue)
+    return SourceDigest(bytes: try DreamRunEncoding.encode(names)).rawValue
   }
 
   private func checkProtection(
@@ -2224,13 +2289,16 @@ public final class DreamRunStore {
       if isCommitted { throw DreamRunError.corruption }
       return try pending(sealed, reason: .staleUnpublishedPlans, proposals: reports())
     }
+    if !isCommitted, receipts.count != outcome.plans.count, try isRejectionChanged(sealed) {
+      return try dropBatch(sealed, chain: chain)
+    }
     for plan in outcome.plans where receipts[plan.path] == nil {
       if isCommitted { throw DreamRunError.corruption }
       if isCancelled() { return try pending(sealed, reason: .cancelled, proposals: reports()) }
       guard try memory.approvedCommit() == sealed.run.approvedBase else {
         try recoverAll()
         if receipts.count == outcome.plans.count { break }
-        return try pending(sealed, reason: .staleUnpublishedPlans, proposals: reports())
+        return try dropBatch(sealed, chain: chain)
       }
       try beforePublication?(plan.path)
       do {
@@ -2242,7 +2310,7 @@ public final class DreamRunStore {
         if receipts.count != outcome.plans.count,
           try memory.approvedCommit() != sealed.run.approvedBase
         {
-          return try pending(sealed, reason: .staleUnpublishedPlans, proposals: reports())
+          return try dropBatch(sealed, chain: chain)
         }
         if receipts[plan.path] == nil { throw error }
       }
@@ -2604,6 +2672,12 @@ final class DreamStateDirectory {
     defer { if !isClosed { _ = close(file) } }
     guard fsync(file) == 0, close(file) == 0 else { throw DreamRunError.persistenceFailure }
     isClosed = true
+  }
+
+  func remove(_ name: String) throws {
+    guard unlinkat(descriptor, name, 0) == 0 || errno == ENOENT, fsync(descriptor) == 0 else {
+      throw DreamRunError.persistenceFailure
+    }
   }
 
   func openReadLock() throws -> Int32 { try openFile("writer.lock") }

@@ -121,12 +121,9 @@ func queueFixture(_ fixture: TransactionFixture, sources: DreamRunStore) throws 
     ["commit-tree", "\(base)^{tree}", "-p", base, "-m", "Synthetic intervening change"],
     additions: Git.proposalIdentity)
   _ = try git.data(["update-ref", "refs/heads/main", changed, base])
-  #expect(throws: (any Error).self) {
-    try queue.decide(
-      display, action: "approve", decisionID: "stale-save", responseReference: "answer")
-  }
-  #expect(try queue.recover(decisionID: "stale-save").status == "queued")
-  _ = try queue.drain()
+  let receipt = try queue.decide(
+    display, action: "approve", decisionID: "stale-save", responseReference: "answer")
+  #expect(receipt.status == "needs-decision")
   #expect(try queue.recover(decisionID: "stale-save").status == "needs-decision")
   #expect(try fixture.main() == changed)
 }

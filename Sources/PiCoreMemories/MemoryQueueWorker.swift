@@ -460,7 +460,12 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try WorkerJSON.fields(object, header)
             guard display == nil, managementDisplay == nil else { throw WorkerError.protocolFailure }
             let counts = try queue.drain()
-            try emit("drained", ["queued": counts.queued, "review": counts.review])
+            try emit(
+              "drained",
+              [
+                "queued": counts.queued, "review": counts.review,
+                "needsDecision": encoded(counts.needsDecision),
+              ])
           case "inventory":
             try WorkerJSON.fields(object, header)
             let inventory = try queue.inventory(configuration: configuration)

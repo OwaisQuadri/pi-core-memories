@@ -295,6 +295,12 @@ private final class WorkerInput: @unchecked Sendable {
     return try DreamCompletedResponse(text: reply)
   }
 
+  var remainingProtectionRequests: Int {
+    condition.lock()
+    defer { condition.unlock() }
+    return Self.maximumProtectionRequests - protectionCount
+  }
+
   func protect(_ pieces: [String], invocationID: String) throws {
     try DreamSourceProtection.requireUnchanged(pieces, check(pieces, invocationID: invocationID))
   }
@@ -305,11 +311,13 @@ private final class WorkerInput: @unchecked Sendable {
     let id = UUID().uuidString.lowercased()
     let digest = DreamSourceProtection.digest(pieces).rawValue
     condition.lock()
-    guard protectionRequest == nil, request == nil, failure == nil, !isCancelledFlag,
-      protectionCount < Self.maximumProtectionRequests
-    else {
+    guard protectionRequest == nil, request == nil, failure == nil, !isCancelledFlag else {
       condition.unlock()
       throw DreamSourceProtectionError.unavailable
+    }
+    guard protectionCount < Self.maximumProtectionRequests else {
+      condition.unlock()
+      throw DreamSourceProtectionError.requestLimit
     }
     protectionCount += 1
     protectionRequest = (id, digest, pieces)
@@ -618,6 +626,7 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
         isSnippetsPresent: start.snippets != nil, isPromptsPresent: start.prompts != nil),
       excludedSessionIDs: start.excludedSessionIDs,
       protect: { try input.protect($0, invocationID: start.invocationID) },
+      remainingProtections: { input.remainingProtectionRequests },
       prepare: { progress, sources in
         guard !input.isCancelled else { throw WorkerError.cancelled }
         return try SessionReader(

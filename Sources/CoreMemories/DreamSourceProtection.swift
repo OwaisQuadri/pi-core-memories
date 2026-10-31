@@ -1,7 +1,7 @@
 import Foundation
 
 package enum DreamSourceProtectionError: Error, Equatable, Sendable {
-  case unavailable, blocked, changed, limitExceeded, timeout, cancelled, invalidReply
+  case unavailable, blocked, changed, limitExceeded, requestLimit, timeout, cancelled, invalidReply
 }
 
 package enum DreamSourceProtection {

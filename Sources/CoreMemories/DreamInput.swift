@@ -574,16 +574,28 @@ extension SessionReader {
       binding.append(0)
       guard let folder else { return [] }
       let directory = try PreparationDirectory(url: folder)
-      var bodies: [String] = []
-      for name in try directory.names() where name.lowercased().hasSuffix(".md") {
+      let names = try directory.names().filter { $0.lowercased().hasSuffix(".md") }
+      var originals: [Data] = []
+      for name in names {
         try beforeRead(folder.appendingPathComponent(name))
         guard !DreamSourceProtection.isProtectedPath(folder.appendingPathComponent(name).path)
         else {
           throw DreamSourceProtectionError.blocked
         }
-        var bytes = try directory.capture(name, isFollowingLinks: true)
-        let originalHash = admit == nil ? nil : SourceDigest(bytes: bytes)
-        if let admit { bytes = Data(try admit([DreamSourceProtection.text(bytes)])[0].utf8) }
+        originals.append(try directory.capture(name, isFollowingLinks: true))
+      }
+      var admitted = originals
+      if let admit, !originals.isEmpty {
+        let checked = try admit(try originals.map(DreamSourceProtection.text))
+        guard checked.count == originals.count else {
+          throw DreamSourceProtectionError.invalidReply
+        }
+        admitted = checked.map { Data($0.utf8) }
+      }
+      var bodies: [String] = []
+      for (index, name) in names.enumerated() {
+        let bytes = admitted[index]
+        let originalHash = admit == nil ? nil : SourceDigest(bytes: originals[index])
         guard let raw = String(data: bytes, encoding: .utf8) else {
           throw MemoryError("invalid stripping input UTF-8")
         }

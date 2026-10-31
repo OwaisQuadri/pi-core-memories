@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { liveSessionIDs, markLiveSession } from "./live-sessions.ts";
@@ -22,6 +22,20 @@ await markLiveSession(process.argv[1], "two"); process.send("ready"); setInterva
 		await local.close();
 		assert.deepEqual(await liveSessionIDs(directory), []);
 	} finally { child.kill("SIGKILL"); await local.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("an invalid marker is skipped and a dead process's orphan staging file is removed", async () => {
+	const root = await mkdtemp("/private/tmp/pi-live-bad-");
+	const directory = join(root, "hosts");
+	const local = await markLiveSession(directory, "one");
+	try {
+		const uuid = "00000000-0000-4000-8000-000000000000";
+		await writeFile(join(directory, `${process.pid}-${uuid}.live`), "bad session id with spaces", { mode: 0o600 });
+		await writeFile(join(directory, `${process.pid}-${uuid.replace(/0$/, "1")}.live`), "loose", { mode: 0o644 });
+		await writeFile(join(directory, `999999999-${uuid}.live.tmp`), "", { mode: 0o600 });
+		assert.deepEqual(await liveSessionIDs(directory), ["one"]);
+		assert.equal((await readdir(directory)).some((name) => name.endsWith(".tmp")), false);
+	} finally { await local.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test("unsafe shared directory permissions fail closed without changing them", async () => {

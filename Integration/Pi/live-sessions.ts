@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 
 export type LiveSessionMarker = { close(): Promise<void> };
 const sessionPattern = /^[A-Za-z0-9._:-]{1,256}$/;
-const markerPattern = /^([1-9][0-9]{0,9})-[a-f0-9-]{36}\.live$/;
+const markerPattern = /^([1-9][0-9]{0,9})-[a-f0-9-]{36}\.live(\.tmp)?$/;
 function blocked(): never { throw new Error("Live session markers are unavailable or unsafe."); }
 
 async function checkedDirectory(directory: string): Promise<number> {
@@ -51,15 +51,14 @@ export async function liveSessionIDs(directory: string): Promise<string[]> {
 	for await (const entry of await opendir(directory)) {
 		const identity = markerPattern.exec(entry.name);
 		if (!identity) continue;
-		if (++count > 256) return blocked();
 		const location = join(directory, entry.name);
 		const metadata = await lstat(location).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
-		if (!metadata) continue;
-		if (!metadata.isFile() || metadata.uid !== uid || metadata.nlink !== 1 || (metadata.mode & 0o777) !== 0o600 || metadata.size > 256) return blocked();
+		if (!metadata || !metadata.isFile() || metadata.uid !== uid) continue;
 		if (!isProcessAlive(Number(identity[1]))) { await unlink(location).catch(() => {}); continue; }
+		if (identity[2] || metadata.nlink !== 1 || (metadata.mode & 0o777) !== 0o600 || metadata.size > 256) continue;
 		const sessionID = await readFile(location, "utf8").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
-		if (sessionID === undefined) continue;
-		if (!sessionPattern.test(sessionID)) return blocked();
+		if (sessionID === undefined || !sessionPattern.test(sessionID)) continue;
+		if (++count > 256) return blocked();
 		sessions.add(sessionID);
 	}
 	return [...sessions].sort();

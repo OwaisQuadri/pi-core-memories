@@ -52,7 +52,7 @@ private final class QueueInput: @unchecked Sendable {
               [
                 "list", "claim", "amend", "release", "recover", "inventory", "finish", "cancel",
                 "approved-list", "approved-get", "manage-preview", "manage-recover",
-                "relocation-preview", "relocation-recover",
+                "relocation-preview", "relocation-recover", "drain",
               ].contains(
                 type)
             else { throw WorkerError.protocolFailure }
@@ -456,6 +456,11 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try WorkerJSON.fields(object, header.union(["decisionID"]))
             let receipt = try queue.recover(decisionID: WorkerJSON.identifier(object, "decisionID"))
             try emit("decision", ["receipt": encoded(receipt)])
+          case "drain":
+            try WorkerJSON.fields(object, header)
+            guard display == nil, managementDisplay == nil else { throw WorkerError.protocolFailure }
+            let counts = try queue.drain()
+            try emit("drained", ["queued": counts.queued, "review": counts.review])
           case "inventory":
             try WorkerJSON.fields(object, header)
             let inventory = try queue.inventory(configuration: configuration)

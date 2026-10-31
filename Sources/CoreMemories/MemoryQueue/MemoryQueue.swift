@@ -397,8 +397,8 @@ package final class MemoryQueue {
         "checkout preparation requires a separate explicit choice and fresh preview")
     }
     let intent = QueueDecisionIntent(
-      decisionID: decisionID, display: display, action: action, responseReference: responseReference
-    )
+      decisionID: decisionID, display: display, action: action, responseReference: responseReference,
+      queuedClock: current.clockDate.timeIntervalSince1970)
     try ledger(current.controller, isWaiting: true) { state in
       guard !state.intents.contains(where: { $0.decisionID == decisionID }) else {
         throw MemoryError("decision key already used; recover its receipt")
@@ -410,14 +410,11 @@ package final class MemoryQueue {
       try perform(
         action, review: current.controller, preview: current.preview, checkout: current.checkout)
     } catch DreamRunError.busy {
-      let queued = intent.with(queuedClock: current.clockDate.timeIntervalSince1970)
-      try ledger(current.controller, isWaiting: true) { state in
-        guard let index = state.intents.firstIndex(where: { $0 == intent }) else {
-          throw MemoryError("decision journal changed")
-        }
-        state.intents[index] = queued
-      }
-      return receipt(queued, status: "queued")
+      return receipt(intent, status: "queued")
+    } catch {
+      let recovered = try recover(decisionID: decisionID, review: current.controller)
+      guard recovered.status != "queued" else { throw error }
+      return recovered
     }
     return try recover(decisionID: decisionID, review: current.controller)
   }

@@ -126,6 +126,75 @@ private func journaledApproval(_ fixture: TransactionFixture) throws -> MemoryQu
   #expect(try queue.recover(decisionID: "journaled").status == "approved")
 }
 
+private func presentedApproval(
+  _ fixture: TransactionFixture, fault: @escaping () throws -> Void
+) throws -> (MemoryQueue, MemoryQueueDisplay) {
+  let sources = try reviewCompletedSiblings(fixture)
+  do {
+    let review = try MemoryReviewController(
+      repository: fixture.memory, stateRoot: fixture.root.appendingPathComponent("review"),
+      sources: sources, environment: [:])
+    try review.confirmDetach(review.checkoutPreview())
+  }
+  let queue = try queueFixture(fixture, sources: sources)
+  var isArmed = false
+  queue.configureReview = { review in
+    review.persistenceFault = { event in
+      if isArmed, case .beforeWrite = event {
+        isArmed = false
+        try fault()
+      }
+    }
+  }
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let row = try #require(queue.list(request: request).first)
+  let display = try queue.claim(revision: row.finding.revision, request: request)
+  try queue.presented(display, messageReference: "message")
+  isArmed = true
+  return (queue, display)
+}
+
+@Test func replyInterruptedAfterItsJournalWriteIsDrainedNotStranded() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let (queue, display) = try presentedApproval(fixture) {
+    throw MemoryError("synthetic worker death after journal write")
+  }
+  #expect(throws: (any Error).self) {
+    try queue.decide(
+      display, action: "approve", decisionID: "interrupted", responseReference: "answer")
+  }
+  let reopened = try queueFixture(fixture, sources: fixture.store())
+  #expect(try reopened.recover(decisionID: "interrupted").status == "queued")
+  #expect(try reopened.drain().queued == 0)
+  let receipt = try reopened.recover(decisionID: "interrupted")
+  #expect(receipt.status == "approved")
+  #expect(receipt.commit == (try fixture.main()))
+}
+
+@Test func drainDuringLiveReplyCannotApplyItTwice() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  var racing: MemoryQueue?
+  var isDrainBusy = false
+  let (queue, display) = try presentedApproval(fixture) {
+    do { _ = try racing?.drain() } catch DreamRunError.busy { isDrainBusy = true }
+  }
+  let original = try fixture.main()
+  racing = try queueFixture(fixture, sources: fixture.store())
+  let receipt = try queue.decide(
+    display, action: "approve", decisionID: "live", responseReference: "answer")
+  #expect(isDrainBusy)
+  #expect(receipt.status == "approved")
+  let drained = try #require(racing)
+  #expect(try drained.drain().queued == 0)
+  #expect(try drained.recover(decisionID: "live") == receipt)
+  #expect(
+    try Git(repo: fixture.memory, environment: [:]).text([
+      "rev-list", "--count", "\(original)..\(receipt.commit!)",
+    ]) == "1")
+}
+
 @Test func busyLedgerDuringDecisionStillJournalsTheReply() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

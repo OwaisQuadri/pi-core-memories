@@ -125,7 +125,9 @@ func queueFixture(_ fixture: TransactionFixture, sources: DreamRunStore) throws 
     try queue.decide(
       display, action: "approve", decisionID: "stale-save", responseReference: "answer")
   }
-  #expect(try queue.recover(decisionID: "stale-save").status == "outcome-unresolved")
+  #expect(try queue.recover(decisionID: "stale-save").status == "queued")
+  _ = try queue.drain()
+  #expect(try queue.recover(decisionID: "stale-save").status == "needs-decision")
   #expect(try fixture.main() == changed)
 }
 

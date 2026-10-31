@@ -383,6 +383,18 @@ private func journaledRejectAndDefer(_ fixture: TransactionFixture) throws {
   #expect(drained.queued == 0)
   #expect(drained.needsDecision == 1)
   #expect(try failing.drain(sessionID: "session-reject").notices.map(\.decisionID) == ["reject"])
-  #expect(try failing.recover(decisionID: "reject").status == "needs-decision")
+  let unapplied = try failing.recover(decisionID: "reject")
+  #expect(unapplied.status == "needs-decision")
   #expect(try failing.recover(decisionID: "defer").status == "deferred")
+  let queue = try queueFixture(fixture, sources: fixture.store())
+  let request = try MemoryQueueRequest(sessionID: "session-reject", requestID: "again")
+  let row = try #require(
+    try queue.list(request: request).first { $0.finding.revision == unapplied.revision })
+  #expect(row.blockReason == nil)
+  let display = try queue.claim(revision: row.finding.revision, request: request)
+  try queue.presented(display, messageReference: "message-again")
+  let receipt = try queue.decide(
+    display, action: "reject", decisionID: "again", responseReference: "answer-again")
+  #expect(receipt.status == "rejected")
+  #expect(try queue.drain().needsDecision == 0)
 }

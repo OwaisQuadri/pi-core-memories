@@ -150,6 +150,19 @@ package final class MemoryQueue {
     return revisions
   }
 
+  private static func rejectedRevisions(rows: [MemoryReviewCandidate], state: QueueLedger)
+    -> Set<String>
+  {
+    Set(rows.filter { $0.disposition == .rejected }.map { $0.change.id.rawValue })
+      .union(
+        state.intents.filter { intent in
+          intent.action == "reject"
+            && !state.receipts.contains(where: {
+              $0.decisionID == intent.decisionID && $0.status != "rejected"
+            })
+        }.map { $0.display.presentation.finding.revision })
+  }
+
   private func admit(_ rows: [MemoryReviewCandidate], state: inout QueueLedger) throws {
     for row in rows
     where !state.findings.contains(where: { $0.revision == row.change.id.rawValue }) {
@@ -185,11 +198,7 @@ package final class MemoryQueue {
           else { return nil }
           return origin.revision
         }.first
-      let rejected = Set(rows.filter { $0.disposition == .rejected }.map { $0.change.id.rawValue })
-        .union(
-          state.intents.filter { $0.action == "reject" }.map {
-            $0.display.presentation.finding.revision
-          })
+      let rejected = Self.rejectedRevisions(rows: rows, state: state)
       var proposed = state
       proposed.findings.append(finding)
       let relatedRejected = Self.relatedRevisions(finding, state: proposed, isAcrossEpochs: true)
@@ -223,11 +232,7 @@ package final class MemoryQueue {
     }
     let revisions = Self.relatedRevisions(finding, state: state)
     let connected = Self.relatedRevisions(finding, state: state, isAcrossEpochs: true)
-    let rejected = Set(rows.filter { $0.disposition == .rejected }.map { $0.change.id.rawValue })
-      .union(
-        state.intents.filter { $0.action == "reject" }.map {
-          $0.display.presentation.finding.revision
-        })
+    let rejected = Self.rejectedRevisions(rows: rows, state: state)
     let excluded = Set(
       state.findings.first(where: { $0.revision == finding.suppressionEpoch })?.successorRejections
         ?? [])

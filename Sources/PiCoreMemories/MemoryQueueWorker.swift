@@ -457,14 +457,14 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             let receipt = try queue.recover(decisionID: WorkerJSON.identifier(object, "decisionID"))
             try emit("decision", ["receipt": encoded(receipt)])
           case "drain":
-            try WorkerJSON.fields(object, header)
+            try WorkerJSON.fields(object, header.union(["sessionID"]))
             guard display == nil, managementDisplay == nil else { throw WorkerError.protocolFailure }
-            let counts = try queue.drain()
+            let counts = try queue.drain(sessionID: WorkerJSON.identifier(object, "sessionID"))
             try emit(
               "drained",
               [
                 "queued": counts.queued, "review": counts.review,
-                "needsDecision": encoded(counts.needsDecision),
+                "needsDecision": counts.needsDecision, "notices": encoded(counts.notices),
               ])
           case "inventory":
             try WorkerJSON.fields(object, header)

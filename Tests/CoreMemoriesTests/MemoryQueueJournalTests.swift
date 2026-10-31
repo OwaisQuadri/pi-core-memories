@@ -79,9 +79,90 @@ private func journaledApproval(_ fixture: TransactionFixture) throws -> MemoryQu
   try fixture.advance()
   let changed = try fixture.main()
   let reopened = try queueFixture(fixture, sources: fixture.store())
-  #expect(try reopened.drain().needsDecision.map(\.decisionID) == ["journaled"])
+  let drained = try reopened.drain(sessionID: "session")
+  #expect(drained.notices.map(\.decisionID) == ["journaled"])
+  #expect(drained.needsDecision == 1)
+  #expect(try reopened.drain(sessionID: "other").notices.isEmpty)
   #expect(try reopened.recover(decisionID: "journaled").status == "needs-decision")
   #expect(try fixture.main() == changed)
+}
+
+@Test func concurrentDrainCannotMislabelAnAppliedDecision() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  _ = try journaledApproval(fixture)
+  let stale = try queueFixture(fixture, sources: fixture.store())
+  let intent = try stale.ledger(stale.controller()) { $0.intents.first! }
+  let crashing = try queueFixture(fixture, sources: fixture.store())
+  crashing.configureReview = { review in
+    review.persistenceFault = { event in
+      if case .beforeWrite(let name) = event, name.hasPrefix("outcome-") {
+        throw MemoryError("synthetic stop after publication")
+      }
+    }
+  }
+  #expect(throws: (any Error).self) { try crashing.drain() }
+  try stale.needsDecision(intent, review: stale.controller())
+  let receipt = try stale.recover(decisionID: "journaled")
+  #expect(receipt.status == "approved")
+  #expect(receipt.commit == (try fixture.main()))
+  #expect(try stale.drain(sessionID: "session").notices.isEmpty)
+}
+
+@Test func needsDecisionReceiptDoesNotHideAPublishedDecision() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  _ = try journaledApproval(fixture)
+  let queue = try queueFixture(fixture, sources: fixture.store())
+  _ = try queue.drain()
+  try queue.ledger(queue.controller()) { state in
+    let index = state.receipts.firstIndex { $0.decisionID == "journaled" }!
+    let old = state.receipts[index]
+    state.receipts[index] = MemoryQueueReceipt(
+      decisionID: old.decisionID, findingID: old.findingID, revision: old.revision,
+      displayDigest: old.displayDigest, action: old.action, status: "needs-decision",
+      commit: nil, auditRef: nil)
+  }
+  #expect(try queue.recover(decisionID: "journaled").status == "approved")
+}
+
+@Test func busyLedgerDuringDecisionStillJournalsTheReply() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  do {
+    let review = try MemoryReviewController(
+      repository: fixture.memory, stateRoot: fixture.root.appendingPathComponent("review"),
+      sources: sources, environment: [:])
+    try review.confirmDetach(review.checkoutPreview())
+  }
+  let queue = try queueFixture(fixture, sources: sources)
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let row = try #require(queue.list(request: request).first)
+  let display = try queue.claim(revision: row.finding.revision, request: request)
+  try queue.presented(display, messageReference: "message")
+  let ledgerLock = try queue.directory.openLock().descriptor
+  defer { close(ledgerLock) }
+  let done = DispatchSemaphore(value: 0)
+  Thread.detachNewThread {
+    for _ in 0..<20 {
+      flock(ledgerLock, LOCK_EX)
+      usleep(30_000)
+      flock(ledgerLock, LOCK_UN)
+      usleep(1_000)
+    }
+    done.signal()
+  }
+  usleep(5_000)
+  let lock = try holdDreamLock(fixture)
+  let receipt = try queue.decide(
+    display, action: "approve", decisionID: "journaled", responseReference: "answer")
+  close(lock)
+  done.wait()
+  #expect(receipt.status == "queued")
+  let reopened = try queueFixture(fixture, sources: fixture.store())
+  #expect(try reopened.drain().queued == 0)
+  #expect(try reopened.recover(decisionID: "journaled").status == "approved")
 }
 
 private func independentAdds(_ fixture: TransactionFixture) throws -> DreamRunStore {
@@ -138,7 +219,7 @@ private func journaledRejectAndDefer(_ fixture: TransactionFixture) throws {
   let reopened = try queueFixture(fixture, sources: fixture.store())
   let drained = try reopened.drain()
   #expect(drained.queued == 0)
-  #expect(drained.needsDecision.isEmpty)
+  #expect(drained.needsDecision == 0)
   #expect(try reopened.recover(decisionID: "reject").status == "rejected")
   #expect(try reopened.recover(decisionID: "defer").status == "deferred")
 }
@@ -157,7 +238,8 @@ private func journaledRejectAndDefer(_ fixture: TransactionFixture) throws {
   }
   let drained = try failing.drain()
   #expect(drained.queued == 0)
-  #expect(drained.needsDecision.map(\.decisionID) == ["reject"])
+  #expect(drained.needsDecision == 1)
+  #expect(try failing.drain(sessionID: "session-reject").notices.map(\.decisionID) == ["reject"])
   #expect(try failing.recover(decisionID: "reject").status == "needs-decision")
   #expect(try failing.recover(decisionID: "defer").status == "deferred")
 }

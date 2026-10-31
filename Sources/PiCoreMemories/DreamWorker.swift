@@ -592,6 +592,9 @@ private enum WorkerOutput {
         if !isProtocolFailure, let error = report.validationError {
           object["detail"] = String(describing: error)
         }
+        if !isProtocolFailure, let callSelection = report.callSelection {
+          object["callSelection"] = selection(callSelection)
+        }
       case .noNewRecords(let generation, let tails):
         object["status"] = "noNewRecords"
         object["generation"] = String(generation)

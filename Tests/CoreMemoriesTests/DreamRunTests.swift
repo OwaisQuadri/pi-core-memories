@@ -43,7 +43,7 @@ private func transactionMutate(_ file: URL, _ change: (inout [String: Any]) -> V
   ).write(to: file)
 }
 
-@Test func dreamRunRetryUsesCurrentSelectionWithoutChangingFrozenPayloads() throws {
+@Test func dreamRunRetryRefusesAnotherSelectionAndRetriesTheRecordedOneWithFrozenPayloads() throws {
   for selection in [
     try DreamSelectedCall(provider: "other", modelID: "fixture", thinkingLevel: "off"),
     try DreamSelectedCall(provider: "synthetic", modelID: "other", thinkingLevel: "off"),
@@ -60,16 +60,19 @@ private func transactionMutate(_ file: URL, _ change: (inout [String: Any]) -> V
     try transactionMutate(fixture.payload("call-started.json")) { $0.removeValue(forKey: "selection") }
     let before = try fixture.snapshot(fixture.state)
     let protected = try fixture.protectedState()
-    _ = try transactionPending(
+    let refused = try transactionPending(
       fixture.store().run(
-        selection: selection, prepare: transactionUncalledPrepare, call: transactionUncalled),
+        selection: selection, resume: .retryInterruptedCall, prepare: transactionUncalledPrepare,
+        call: transactionUncalled),
       reason: .interruptedCall)
+    #expect(refused.callSelection == fixture.selection)
     #expect(try fixture.snapshot(fixture.state) == before)
     let report = try transactionCompleted(
       fixture.store().run(
-        selection: selection, resume: .retryInterruptedCall, prepare: transactionUncalledPrepare,
+        selection: fixture.selection, resume: .retryInterruptedCall,
+        prepare: transactionUncalledPrepare,
         call: { request in
-          #expect(request.selection == selection)
+          #expect(request.selection == fixture.selection)
           #expect(request.inputHash == saved.inputHash && request.contextHash == saved.contextHash)
           #expect(request.requestHash == saved.requestHash && request.runID == saved.runID)
           #expect(request.systemPrompt == saved.systemPrompt && request.messages == saved.messages)
@@ -86,9 +89,9 @@ private func transactionMutate(_ file: URL, _ change: (inout [String: Any]) -> V
     #expect(try fixture.protectedState() == protected)
     let response = try DreamRunEncoding.decode(
       DreamRunEncoding.BoundResponse.self, bytes: Data(contentsOf: fixture.payload("response.json")))
-    #expect(try response.selection.domain() == selection)
+    #expect(try response.selection.domain() == fixture.selection)
     #expect(try transactionCompleted(fixture.store().run(
-      selection: fixture.selection, resume: .retryInterruptedCall,
+      selection: selection, resume: .retryInterruptedCall,
       prepare: transactionUncalledPrepare, call: transactionUncalled)).runID == report.runID)
   }
 }
@@ -349,7 +352,7 @@ private func transactionBoundaries(_ name: String) -> [DreamPersistenceEvent] {
     try fixture.populate()
     _ = try fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) },
       call: { _ in throw CancellationError() })
-    let selection = try DreamSelectedCall(provider: "other", modelID: "other", thinkingLevel: "high")
+    let selection = fixture.selection
     let store = try fixture.store()
     store.persistenceFault = { if $0 == target { throw POSIXError(.EIO) } }
     #expect(throws: DreamRunError.persistenceFailure) {

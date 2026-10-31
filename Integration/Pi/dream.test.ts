@@ -41,6 +41,14 @@ test("invalid saved decision explains retained recovery in conversation without 
 	assert.ok(dream.dreamReviewText({ ...report, reason: "interruptedCall" }).includes("Discuss recovery in conversation"));
 });
 
+test("a recorded call selection is accepted only in its exact shape on a pending interrupted call", () => {
+	const pending = { ...final, status: "pending", runID: "run", base: "b".repeat(40), reason: "interruptedCall", callSelection: selection };
+	assert.deepEqual(dream.dreamReport(pending, start).callSelection, selection);
+	assert.throws(() => dream.dreamReport({ ...pending, reason: "callbackFailure" }, start));
+	assert.throws(() => dream.dreamReport({ ...pending, callSelection: { ...selection, extra: "x" } }, start));
+	assert.throws(() => dream.dreamReport({ ...pending, callSelection: null }, start));
+});
+
 test("subscription registry receives only pinned bytes and timestamps, captured model, and transport-only off mapping", async () => {
 	for (const level of ["off", "medium"]) {
 		const captured = { ...selection, thinkingLevel: level };

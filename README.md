@@ -156,6 +156,33 @@ A relevant pending finding belongs in the ongoing conversation, including
 during a task. Listing or claiming the finding is internal work. It must not
 turn the user into an operator of the queue.
 
+Before each prompt in an interactive window, the extension reads the pending
+queue and gives the model a short reminder: one line per pending finding, with
+its revision and the first line of its proposed entry (up to 120 characters).
+When a finding could be relevant to the current request, the model presents
+that exact proposal. The reminder is never approval, carries no proposal
+control material, and is not saved in the session. It is left out when nothing
+is pending, while a proposal awaits a reply, or when the queue cannot be read
+in time. The read is abandoned after two seconds and stopping the native worker
+can take about one more second, so a prompt waits about three seconds at most.
+
+After the user answers a proposal (approve, reject, defer, or amend), that
+finding leaves the reminder for the rest of the session. A new session lists
+deferred findings again. Resuming a session starts a new runtime, so deferred
+findings are listed again after a resume too. An unanswered finding stays
+listed, so it can be asked about again. The reminder shows the original
+proposed wording; presenting an amended finding shows its amended draft.
+
+Each reminder stays in place right after the prompt it was made for, with the
+same bytes on every later request, so the conversation prefix stays cached. A
+new reminder is added only when the listed findings change, and it states that
+only the latest reminder is current; when nothing is left pending, a short
+reminder says so. Reminders cost tokens that accumulate only when the list
+changes, and a reminder is dropped once its prompt is compacted away. Reminders
+live in memory for the current runtime only. Each one is capped at 16 KB (about
+85 findings), keeping findings in the queue's stable order and stating how many
+were left out.
+
 Before a change, show the exact proposal, its reason, and its evidence. The user
 can discuss it, request a revision, reject it, defer it, or approve the exact
 displayed change.

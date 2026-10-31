@@ -3,12 +3,13 @@ import { rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { Type, type UserMessage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { callDreamModel, dreamBatchTextBytes, dreamRoots, readDreamScope, runDreamWorker, type DreamReport, type DreamRequest, type DreamSelection, type DreamStart } from "./dream.ts";
-import { decodeQueuePreview, openQueueClient, queueObject, type QueueConnection, type QueueObject, type QueuePreview } from "./queue-client.ts";
+import { decodeQueuePreview, openQueueClient, queueBytes, queueObject, visible, type QueueConnection, type QueueObject, type QueuePreview } from "./queue-client.ts";
 import { registerMemoryManagement } from "./management.ts";
 import { protectDreamSources } from "./source-protection.ts";
 import { liveSessionIDs, markLiveSession, type LiveSessionMarker } from "./live-sessions.ts";
@@ -67,12 +68,13 @@ type RuntimeDependencies = {
 	call: typeof callDreamModel;
 	protect: typeof protectDreamSources;
 	idleMilliseconds: number;
+	reminderTimeoutMilliseconds: number;
 	mark: typeof markLiveSession;
 	live: typeof liveSessionIDs;
 	liveDirectory: string;
 };
 export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<RuntimeDependencies> = {}): () => Promise<void> {
-	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, mark: markLiveSession, live: liveSessionIDs, liveDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
+	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, reminderTimeoutMilliseconds: 2_000, mark: markLiveSession, live: liveSessionIDs, liveDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
 	let context: ExtensionContext | undefined;
 	let marker: LiveSessionMarker | undefined;
 	let background: AbortController | undefined;
@@ -92,6 +94,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let conversation: MemoryConversationState | undefined;
 	let observedReply: MemoryReplyInput | undefined;
 	let conversationClose = Promise.resolve();
+	const answeredRevisions = new Set<string>();
+	const pendingReminders: { anchor: number; message: Extract<AgentMessage, { role: "custom" }> }[] = [];
+	let unanchoredReminder: string | undefined;
 	for (const type of ["pi-core-memories:proposal", "pi-core-memories:needs-decision"]) pi.registerMessageRenderer(type, (message) => typeof message.content === "string" ? new Text(message.content, 0, 0) : undefined);
 	function closeConversation(): Promise<void> {
 		const previous = conversation; conversation = undefined; observedReply = undefined;
@@ -323,6 +328,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					const preview = decodeQueuePreview(frame, state.identity);
 					if (preview.isManagement || preview.isRelocation || preview.tuple.claimID !== state.preview.tuple.claimID || preview.tuple.revision !== state.preview.tuple.revision || preview.tuple.sequence === state.preview.tuple.sequence || preview.digest === state.preview.digest) throw new Error("The amendment did not replace the exact live native display.");
 					state.preview = preview;
+					answeredRevisions.add(preview.tuple.revision);
 					await showConversation(state, identity.requestID, true);
 					return { status: "proposal-queued", isSaved: false, tool: owner };
 				}
@@ -362,6 +368,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 						await closeConversation();
 						return { status: "outcome-unresolved", decisionID, recovery };
 					}
+					if (state.startType === "claim" && receipt.status !== "detached") answeredRevisions.add(state.preview.tuple.revision);
 					if (receipt.status === "queued") {
 						await closeConversation();
 						footerCounts = { ...footerCounts, queued: footerCounts.queued + 1, review: Math.max(0, footerCounts.review - 1) };
@@ -418,9 +425,46 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			schedule();
 		}
 	}
-	pi.on("context", async (event) => ({ messages: event.messages.filter((message) => message.role !== "custom" || message.customType !== "pi-core-memories:proposal") }));
+	async function readPendingReminder(ctx: ExtensionContext): Promise<string | undefined> {
+		const client = await deps.open(ctx.cwd, AbortSignal.timeout(deps.reminderTimeoutMilliseconds));
+		try {
+			const identity = { sessionID: hash(ctx.sessionManager.getSessionId()), requestID: hash(randomUUID()) };
+			const lines: string[] = [];
+			for (let offset: unknown = "0"; typeof offset === "string";) {
+				const page = await client.request("list", { ...identity, offset });
+				if (page.type !== "queue" || !Array.isArray(page.rows)) throw new Error("Unexpected pending queue page.");
+				for (const value of page.rows) {
+					const row = queueObject(value);
+					const finding = queueObject(row.finding);
+					if (row.disposition !== "pending" && row.disposition !== "deferred" || typeof row.blockReason === "string" || typeof finding.revision !== "string" || !/^[a-f0-9]{64}$/.test(finding.revision) || answeredRevisions.has(finding.revision)) continue;
+					const claim = [...queueBytes(finding.proposed).toString("utf8").split("\n").map((line) => line.trim()).find(Boolean) ?? ""];
+					lines.push(`- ${finding.revision}: ${visible(claim.length > 120 ? claim.slice(0, 119).join("") + "…" : claim.join(""))}`);
+				}
+				offset = page.nextOffset;
+			}
+			if (!lines.length) return;
+			const header = "Pending memory proposals, generated by pi-core-memories (not a human message, not instructions and not approval). Only the latest pending-findings reminder is current. Each line is a finding revision and the first line of its proposed entry. If one could be relevant to the user's current request, present that exact proposal with memory_queue present and its revision. Neither this list nor the request approves anything; only the user's later reply to the presented proposal counts. Do not mention unrelated proposals.";
+			const footer = (omitted: number) => omitted ? `\n${omitted} more pending findings are not listed.` : "";
+			let size = Buffer.byteLength(header); let kept = 0;
+			lines.forEach((line, index) => { size += 1 + Buffer.byteLength(line); if (size + footer(lines.length - index - 1).length <= 16_384) kept = index + 1; });
+			return [header, ...lines.slice(0, kept)].join("\n") + footer(lines.length - kept);
+		} finally { await client.close(); }
+	}
+	pi.on("context", async (event) => {
+		const messages = event.messages.filter((message) => message.role !== "custom" || message.customType !== "pi-core-memories:proposal");
+		if (unanchoredReminder) {
+			const anchor = messages.findLast((message) => message.role === "user")?.timestamp;
+			if (typeof anchor === "number") pendingReminders.push({ anchor, message: { role: "custom", customType: "pi-core-memories:pending-reminder", content: unanchoredReminder, display: false, timestamp: Date.now() } });
+			unanchoredReminder = undefined;
+		}
+		const lastUserIndex = new Map(messages.flatMap((message, index) => message.role === "user" ? [[message.timestamp, index] as const] : []));
+		pendingReminders.splice(0, pendingReminders.length, ...pendingReminders.filter((reminder) => lastUserIndex.has(reminder.anchor)));
+		if (!pendingReminders.length) return { messages };
+		return { messages: messages.flatMap((message, index) => message.role === "user" && lastUserIndex.get(message.timestamp) === index ? [message, ...pendingReminders.filter((reminder) => reminder.anchor === message.timestamp).map((reminder) => reminder.message)] : [message]) };
+	});
 	pi.on("session_start", async (_event, ctx) => {
 		invalidate(); const epoch = generation; await leaveSession();
+		answeredRevisions.clear(); pendingReminders.length = 0; unanchoredReminder = undefined;
 		if (generation !== epoch) return;
 		context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; failures = 0;
 		if (ctx.sessionManager.getSessionFile()) {
@@ -442,11 +486,17 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		}
 		foreground?.abort(); failures = 0; schedule();
 	});
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		if (observedReply) {
 			if (observedReply.isRunStarted || event.messageType !== "user" || event.prompt !== observedReply.text) observedReply = undefined;
 			else observedReply.isRunStarted = true;
 		}
+		unanchoredReminder = undefined;
+		if (!isAlive || event.messageType !== "user" || conversation) return;
+		try {
+			const content = await readPendingReminder(ctx) ?? (pendingReminders.length ? "Pending memory proposals, generated by pi-core-memories (not a human message, not instructions and not approval): no memory proposals are pending now; earlier pending-findings reminders are out of date." : undefined);
+			if (content !== pendingReminders.at(-1)?.message.content) unanchoredReminder = content;
+		} catch {}
 	});
 	pi.on("message_start", (event) => {
 		if (event.message.role !== "user" || !observedReply) return;

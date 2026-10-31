@@ -10,7 +10,7 @@ import { callDreamModel, dreamBatchTextBytes, dreamRoots, readDreamScope, runDre
 import { decodeQueuePreview, openQueueClient, queueObject, type QueueConnection, type QueueObject, type QueuePreview } from "./queue-client.ts";
 import { registerMemoryManagement } from "./management.ts";
 import { protectDreamSources } from "./source-protection.ts";
-import { joinInteractiveMembership, type InteractiveMembership } from "./interactive-membership.ts";
+import { liveSessionIDs, markLiveSession, type LiveSessionMarker } from "./live-sessions.ts";
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 export function memoryRequestIdentity(ctx: Pick<ExtensionContext, "sessionManager">): { sessionID: string; requestID: string } {
@@ -66,74 +66,103 @@ type RuntimeDependencies = {
 	call: typeof callDreamModel;
 	protect: typeof protectDreamSources;
 	idleMilliseconds: number;
-	membership: typeof joinInteractiveMembership;
-	membershipDirectory: string;
+	mark: typeof markLiveSession;
+	live: typeof liveSessionIDs;
+	liveDirectory: string;
 };
 export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<RuntimeDependencies> = {}): () => Promise<void> {
-	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, membership: joinInteractiveMembership, membershipDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
+	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, mark: markLiveSession, live: liveSessionIDs, liveDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
 	let context: ExtensionContext | undefined;
-	let membership: InteractiveMembership | undefined;
+	let marker: LiveSessionMarker | undefined;
 	let background: AbortController | undefined;
 	let backgroundCompletion: Promise<void> | undefined;
 	let foreground: AbortController | undefined;
 	let foregroundCompletion: Promise<unknown> | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let isAlive = false;
-	let isWorking = false;
-	let isPeerForeground = false;
 	let dreamStatus: string | undefined;
-	const membershipError = 'dreaming: error(code: membershipUnavailable, message: "Interactive membership is unavailable")';
+	let footerCounts = { queued: 0, review: 0, needsDecision: 0 };
+	const noticed = new Set<string>();
+	let timerDelay = 0;
+	let marking: Promise<void> | undefined;
+	const markerError = 'dreaming: error(code: liveSessionUnavailable, message: "Live session marker is unavailable")';
 	let failures = 0;
 	let generation = 0;
 	let conversation: MemoryConversationState | undefined;
 	let observedReply: MemoryReplyInput | undefined;
 	let conversationClose = Promise.resolve();
-	pi.registerMessageRenderer("pi-core-memories:proposal", (message) => typeof message.content === "string" ? new Text(message.content, 0, 0) : undefined);
+	for (const type of ["pi-core-memories:proposal", "pi-core-memories:needs-decision"]) pi.registerMessageRenderer(type, (message) => typeof message.content === "string" ? new Text(message.content, 0, 0) : undefined);
 	function closeConversation(): Promise<void> {
 		const previous = conversation; conversation = undefined; observedReply = undefined;
 		if (previous) { previous.controller.abort(); conversationClose = previous.client.close(); }
 		return conversationClose;
 	}
 	function reportDreamStatus(value: string | undefined): void {
-		if (dreamStatus === value || value !== undefined && !isAlive) return;
+		if (value !== undefined && !isAlive) return;
 		dreamStatus = value;
-		try { if (context?.hasUI) context.ui.setStatus("pi-core-memories:dream", value); } catch {}
+		const counts = [footerCounts.queued ? `${footerCounts.queued} queued` : "", footerCounts.review ? `${footerCounts.review} to review` : "", footerCounts.needsDecision ? `${footerCounts.needsDecision} need decision` : ""].filter(Boolean);
+		const text = value === undefined || value.startsWith("dreaming: error(") ? value : [value, ...counts].join(" · ");
+		try { if (context?.hasUI) context.ui.setStatus("pi-core-memories:dream", text); } catch {}
+	}
+	async function drainDecisions(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, signal: AbortSignal): Promise<void> {
+		const client = await deps.open(ctx.cwd, signal);
+		try {
+			const result = await client.request("drain", { sessionID: hash(ctx.sessionManager.getSessionId()) });
+			if (result.type !== "drained" || typeof result.queued !== "number" || typeof result.review !== "number" || typeof result.needsDecision !== "number" || !Array.isArray(result.notices)) return;
+			const revisions = result.notices.map((value) => queueObject(value).revision).filter((value): value is string => typeof value === "string" && !noticed.has(value));
+			footerCounts = { queued: result.queued, review: result.review, needsDecision: result.needsDecision };
+			for (const revision of revisions) {
+				noticed.add(revision);
+				pi.sendMessage({ customType: "pi-core-memories:needs-decision", content: `Your earlier memory decision for revision ${revision} was not applied and does not count: the proposal, its evidence or the memory store changed first. Nothing was saved. The agent will present the current proposal for a new answer.`, display: true, details: { revision } }, { triggerTurn: false });
+			}
+		} finally { await client.close(); reportDreamStatus(dreamStatus); }
 	}
 	function stopBackground(): void {
 		clearTimeout(timer); timer = undefined; background?.abort();
 		if (dreamStatus === "dreaming: active") reportDreamStatus("dreaming: paused");
 	}
-	function invalidate(isConversationInvalidated = true): void {
-		foreground?.abort(); stopBackground();
-		if (isConversationInvalidated) { generation++; void closeConversation(); }
+	function retryMark(): void {
+		const ctx = context;
+		if (marking || marker || !ctx || !ctx.sessionManager.getSessionFile()) return;
+		const epoch = generation;
+		marking = (async () => {
+			await new Promise((resolve) => { const wait = setTimeout(resolve, deps.idleMilliseconds); wait.unref?.(); });
+			if (generation !== epoch || marker || context !== ctx) return;
+			try {
+				const created = await deps.mark(deps.liveDirectory, ctx.sessionManager.getSessionId());
+				if (generation !== epoch || marker) { await created.close(); return; }
+				marker = created;
+			} catch {}
+		})().finally(() => { marking = undefined; if (generation === epoch) schedule(); });
 	}
-	function updateMembership(): void {
-		if (!context) return;
-		const isForeground = isWorking || !!foreground || !!conversation || context.hasPendingMessages();
-		membership?.set({ sessionID: context.sessionManager.getSessionId(), isForeground });
-		if (isForeground && !dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: paused");
-	}
-	async function leaveMembership(): Promise<void> {
-		const previous = membership; membership = undefined; isPeerForeground = false;
+	function invalidateConversation(): void { foreground?.abort(); generation++; void closeConversation(); }
+	function invalidate(): void { invalidateConversation(); stopBackground(); }
+	async function leaveSession(): Promise<void> {
+		const previous = marker; marker = undefined;
 		reportDreamStatus(undefined);
 		await previous?.close();
 	}
 	function schedule(): void {
-		clearTimeout(timer);
+		const isMarkerMissing = !marker && !!context?.sessionManager.getSessionFile();
+		const isBlocked = !isAlive || !context || isMarkerMissing || !!foreground || !!conversation || failures >= 3;
+		if (isBlocked) { clearTimeout(timer); timer = undefined; }
 		if (!isAlive || !context) return;
-		if (!membership) { reportDreamStatus(membershipError); return; }
-		if (isWorking || foreground || conversation || isPeerForeground || failures >= 3) {
+		if (isMarkerMissing) { reportDreamStatus(markerError); retryMark(); return; }
+		if (isBlocked) {
 			if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: paused");
 			return;
 		}
 		if (background) return;
-		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus(failures || context.hasPendingMessages() ? "dreaming: paused" : "dreaming: idle");
-		timer = setTimeout(() => { timer = undefined; void startBackground(); }, deps.idleMilliseconds * 2 ** failures);
+		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus(failures ? "dreaming: paused" : "dreaming: idle");
+		const delay = deps.idleMilliseconds * 2 ** failures;
+		if (timer && timerDelay <= delay) return;
+		clearTimeout(timer); timerDelay = delay;
+		timer = setTimeout(() => { timer = undefined; void startBackground(); }, delay);
 		timer.unref?.();
 	}
 	async function startBackground(): Promise<void> {
 		const ctx = context;
-		if (!ctx || !isAlive || isWorking || foreground || conversation || background || !ctx.isIdle() || ctx.hasPendingMessages()) { schedule(); return; }
+		if (!ctx || !isAlive || foreground || conversation || background) { schedule(); return; }
 		const model = ctx.model;
 		if (!model || !["openai", "openai-codex", "anthropic"].includes(model.provider)) {
 			reportDreamStatus('dreaming: error(code: unsupportedProvider, message: "Selected provider cannot run dreaming")'); return;
@@ -144,30 +173,31 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		}
 		const selection: DreamSelection = { provider: model.provider, modelID: model.id, thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel() };
 		const current = new AbortController(); background = current;
-		const epoch = generation;
-		const isCurrent = () => isAlive && !current.signal.aborted && background === current && generation === epoch;
-		reportDreamStatus("dreaming: paused");
+		const isCurrent = () => isAlive && !current.signal.aborted && background === current;
 		const sessionID = ctx.sessionManager.getSessionId();
+		let isLiveUnavailable = false;
+		const liveSessions = async () => {
+			try { return [...new Set([sessionID, ...await deps.live(deps.liveDirectory)])].sort(); }
+			catch (error) { isLiveUnavailable = true; throw error; }
+		};
 		backgroundCompletion = (async () => {
 			try {
 				await conversationClose;
 				current.signal.throwIfAborted();
-				const live = membership;
-				if (!live) return;
-				updateMembership();
-				const admitted = await live.snapshot().catch((error) => { if (isCurrent()) reportDreamStatus(membershipError); throw error; });
-				isPeerForeground = admitted.isForeground;
-				if (admitted.isForeground || !admitted.sessionIDs.length || admitted.sessionIDs.length > 64) return;
+				if (isCurrent()) reportDreamStatus("dreaming: applying");
+				await drainDecisions(ctx, current.signal).catch(() => {});
+				current.signal.throwIfAborted();
+				if (isCurrent()) reportDreamStatus("dreaming: active");
+				const excludedSessionIDs = await liveSessions();
 				const roots = await deps.roots(getAgentDir(), ctx.cwd);
 				const scope = await deps.scope(current.signal);
 				current.signal.throwIfAborted();
 				const invocationID = randomUUID();
-				const start: DreamStart & { excludedSessionIDs: string[] } = { version: 1, type: "start", invocationID, roots, selection, resume: "inspectOrContinue", batchTextBytes, ...scope, excludedSessionIDs: admitted.sessionIDs };
+				const start: DreamStart & { excludedSessionIDs: string[] } = { version: 1, type: "start", invocationID, roots, selection, resume: "inspectOrContinue", batchTextBytes, ...scope, excludedSessionIDs };
 				const report = await deps.run(start, async (request, signal) => {
-					if (!isAlive || isWorking || current.signal.aborted || ctx.sessionManager.getSessionId() !== sessionID || ctx.model?.id !== model.id || ctx.model?.provider !== model.provider || (ctx.thinkingLevel ?? pi.getThinkingLevel()) !== selection.thinkingLevel) throw new Error("Memory worker selection or lifecycle changed.");
-					const currentMembers = await live.snapshot();
-					if (currentMembers.isForeground || membership !== live || JSON.stringify(currentMembers.sessionIDs) !== JSON.stringify(admitted.sessionIDs) || signal.aborted || current.signal.aborted) throw new Error("Interactive memory membership changed.");
-					assertArchivedRequest(request, currentMembers.sessionIDs);
+					if (!isAlive || current.signal.aborted || ctx.sessionManager.getSessionId() !== sessionID || ctx.model?.id !== model.id || ctx.model?.provider !== model.provider || (ctx.thinkingLevel ?? pi.getThinkingLevel()) !== selection.thinkingLevel) throw new Error("Memory worker selection or lifecycle changed.");
+					assertArchivedRequest(request, await liveSessions());
+					if (signal.aborted || current.signal.aborted) throw new Error("Memory worker was cancelled.");
 					if (isCurrent()) reportDreamStatus("dreaming: active");
 					try { return await deps.call(request, ctx, model, selection, signal); }
 					catch (error) {
@@ -176,14 +206,16 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 					}
 				}, current.signal, () => {}, (value: unknown, signal: AbortSignal) => deps.protect(pi, invocationID, value, signal));
 				if (!isCurrent()) return;
+				await drainDecisions(ctx, current.signal).catch(() => {});
+				if (!isCurrent()) return;
 				if (["blocked", "pending"].includes(report.status)) failures = 3;
-				else if (report.status === "busy") failures++;
 				else failures = 0;
 				reportDreamStatus(report.status === "blocked"
 					? 'dreaming: error(code: blocked, message: "Native dream worker blocked the run")'
-					: report.status === "pending" || report.status === "busy" ? "dreaming: paused" : "dreaming: idle");
+					: report.status === "pending" ? "dreaming: paused" : "dreaming: idle");
 			} catch {
-				if (isCurrent()) {
+				if (isCurrent() && isLiveUnavailable) reportDreamStatus(markerError);
+				else if (isCurrent()) {
 					failures++;
 					if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus('dreaming: error(code: workerFailure, message: "Background dream run failed")');
 				}
@@ -239,7 +271,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	async function perform(owner: string, operation: string, params: QueueObject, signal: AbortSignal | undefined, ctx: ExtensionToolContext): Promise<unknown> {
 		if (ctx.mode !== "tui" || !ctx.hasUI || !isAlive || foreground) throw new Error("Memory queue needs one live interactive session.");
 		const identity = memoryRequestIdentity(ctx);
-		const current = new AbortController(); foreground = current; updateMembership();
+		const current = new AbortController(); foreground = current;
 		const combined = AbortSignal.any(signal ? [signal, current.signal] : [current.signal]);
 		const epoch = generation;
 		const isCurrent = () => {
@@ -249,9 +281,16 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		let activeConversation: AbortController | undefined;
 		const abortConversation = () => activeConversation?.abort();
 		combined.addEventListener("abort", abortConversation, { once: true });
-		stopBackground();
+		clearTimeout(timer); timer = undefined;
+		const refreshCounts = () => conversation || background ? Promise.resolve() : drainDecisions(ctx, combined).catch(() => {});
 		foregroundCompletion = (async () => {
-			await backgroundCompletion; await conversationClose;
+			await conversationClose;
+			if (operation !== "reply") await refreshCounts();
+			const result = await run();
+			if (isCurrent()) await refreshCounts();
+			return result;
+		})();
+		async function run(): Promise<unknown> {
 			combined.throwIfAborted();
 			if (!isCurrent()) throw new Error("Memory request changed before ownership was acquired.");
 			if (conversation?.client.signal?.aborted || conversation && conversation.identity.sessionID !== identity.sessionID) await closeConversation();
@@ -312,6 +351,12 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 						await closeConversation();
 						return { status: "outcome-unresolved", decisionID, recovery };
 					}
+					if (receipt.status === "queued") {
+						await closeConversation();
+						footerCounts = { ...footerCounts, queued: footerCounts.queued + 1, review: Math.max(0, footerCounts.review - 1) };
+						reportDreamStatus(dreamStatus);
+						return { status: "decision-queued", decisionID, recovery, message: "Your decision was recorded. A dream run holds the memory lock, so the decision will be applied shortly, after the same native checks. Nothing is saved yet." };
+					}
 					if (receipt && receipt.status === "detached") {
 						const next = await refreshConversation(state, identity.requestID);
 						if (next.status !== "proposal-queued") await closeConversation();
@@ -352,36 +397,29 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				const { invocationID: _invocation, version: _version, ...publicResult } = result;
 				return publicResult;
 			} finally { await client.close(); }
-		})();
+		}
 		try { return await foregroundCompletion; }
 		catch (cause) { if (activeConversation) await closeConversation(); throw cause; }
 		finally {
 			combined.removeEventListener("abort", abortConversation);
 			if (conversation?.controller.signal.aborted) await closeConversation();
 			if (foreground === current) foreground = undefined;
-			updateMembership(); schedule();
+			schedule();
 		}
 	}
 	pi.on("context", async (event) => ({ messages: event.messages.filter((message) => message.role !== "custom" || message.customType !== "pi-core-memories:proposal") }));
 	pi.on("session_start", async (_event, ctx) => {
-		invalidate(); const epoch = generation; await leaveMembership();
+		invalidate(); const epoch = generation; await leaveSession();
 		if (generation !== epoch) return;
-		context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; isWorking = !ctx.isIdle(); failures = 0;
-		if (!isAlive) return;
-		let joined: InteractiveMembership | undefined;
-		try {
-			joined = await deps.membership(deps.membershipDirectory, { sessionID: ctx.sessionManager.getSessionId(), isForeground: isWorking }, (snapshot) => {
-				if (!joined || membership !== joined || !isAlive) return;
-				isPeerForeground = snapshot?.isForeground ?? true;
-				stopBackground();
-				if (!snapshot) reportDreamStatus(membershipError);
-				else if (dreamStatus === membershipError) reportDreamStatus("dreaming: paused");
-				schedule();
-			});
-			if (generation !== epoch || !isAlive) { await joined.close(); return; }
-			membership = joined;
-		} catch { if (generation === epoch && isAlive) reportDreamStatus(membershipError); return; }
-		updateMembership(); schedule();
+		context = ctx; isAlive = ctx.mode === "tui" && ctx.hasUI; failures = 0;
+		if (ctx.sessionManager.getSessionFile()) {
+			try {
+				const created = await deps.mark(deps.liveDirectory, ctx.sessionManager.getSessionId());
+				if (generation !== epoch) { await created.close(); return; }
+				marker = created;
+			} catch { if (generation === epoch && isAlive) reportDreamStatus(markerError); }
+		}
+		schedule();
 	});
 	pi.on("input", (event, ctx) => {
 		const previous = observedReply; observedReply = undefined;
@@ -391,14 +429,13 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			const leaf = ctx.sessionManager.getBranch().at(-1);
 			if (entry && leaf) observedReply = { proposalId: state.proposalId, proposalEntryId: entry.id, previousLeafId: leaf.id, text: event.text, isRunStarted: false };
 		}
-		invalidate(false); failures = 0; isWorking = true; reportDreamStatus("dreaming: paused"); updateMembership();
+		foreground?.abort(); failures = 0; schedule();
 	});
 	pi.on("before_agent_start", (event) => {
 		if (observedReply) {
 			if (observedReply.isRunStarted || event.messageType !== "user" || event.prompt !== observedReply.text) observedReply = undefined;
 			else observedReply.isRunStarted = true;
 		}
-		stopBackground(); isWorking = true; updateMembership();
 	});
 	pi.on("message_start", (event) => {
 		if (event.message.role !== "user" || !observedReply) return;
@@ -412,26 +449,25 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			try { requestID = memoryRequestIdentity(ctx).requestID; } catch {}
 			if (requestID !== conversation.presentedForRequest) await closeConversation();
 		}
-		isWorking = false; updateMembership(); schedule();
+		schedule();
 	});
 	pi.on("tool_call", async (event, ctx) => {
 		if (!conversation || event.toolName === conversation.owner) return;
 		let requestID: string | undefined;
 		try { requestID = memoryRequestIdentity(ctx).requestID; } catch {}
 		if (requestID !== conversation.presentedForRequest) await closeConversation();
-		updateMembership();
+		schedule();
 	});
-	pi.on("tool_execution_start", () => { stopBackground(); updateMembership(); });
 	pi.on("model_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: paused"); schedule(); });
 	pi.on("thinking_level_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: paused"); schedule(); });
-	pi.on("session_before_switch", async () => { isAlive = false; invalidate(); await leaveMembership(); });
-	pi.on("session_before_fork", async () => { isAlive = false; invalidate(); await leaveMembership(); });
-	pi.on("session_before_tree", () => { invalidate(); isWorking = true; updateMembership(); });
-	pi.on("session_before_compact", () => { invalidate(); isWorking = true; updateMembership(); });
-	pi.on("session_tree", (_event, ctx) => { context = ctx; isWorking = !ctx.isIdle(); updateMembership(); schedule(); });
-	pi.on("session_compact", (_event, ctx) => { context = ctx; isWorking = !ctx.isIdle(); updateMembership(); schedule(); });
-	pi.on("session_compact_failed", (_event, ctx) => { context = ctx; isWorking = !ctx.isIdle(); updateMembership(); schedule(); });
-	const stop = async () => { isAlive = false; invalidate(); await leaveMembership(); await Promise.allSettled([backgroundCompletion, foregroundCompletion, conversationClose]); };
+	pi.on("session_before_switch", async () => { isAlive = false; invalidate(); await leaveSession(); });
+	pi.on("session_before_fork", async () => { isAlive = false; invalidate(); await leaveSession(); });
+	pi.on("session_before_tree", invalidateConversation);
+	pi.on("session_before_compact", invalidateConversation);
+	pi.on("session_tree", (_event, ctx) => { context = ctx; schedule(); });
+	pi.on("session_compact", (_event, ctx) => { context = ctx; schedule(); });
+	pi.on("session_compact_failed", (_event, ctx) => { context = ctx; schedule(); });
+	const stop = async () => { isAlive = false; invalidate(); await leaveSession(); await Promise.allSettled([backgroundCompletion, foregroundCompletion, conversationClose]); };
 	pi.on("session_shutdown", stop);
 	registerMemoryManagement(pi, (owner, request, signal, ctx) => perform(owner, "manage", { request }, signal, ctx));
 	pi.registerTool({

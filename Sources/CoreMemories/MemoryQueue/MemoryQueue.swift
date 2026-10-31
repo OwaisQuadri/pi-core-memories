@@ -18,6 +18,7 @@ package final class MemoryQueue {
     let preview: MemoryReviewPreview
     let checkout: MemoryReviewCheckoutPreview
     let display: MemoryQueueDisplay
+    let clockDate: Date
     var messageReference: String?
   }
 
@@ -63,7 +64,8 @@ package final class MemoryQueue {
   }
 
   func ledger<T>(
-    _ review: MemoryReviewController, _ operation: (inout QueueLedger) throws -> T
+    _ review: MemoryReviewController, isWaiting: Bool = false,
+    _ operation: (inout QueueLedger) throws -> T
   ) throws -> T {
     var held = stat()
     var named = stat()
@@ -75,7 +77,12 @@ package final class MemoryQueue {
       _ = flock(lock, LOCK_UN)
       _ = close(lock)
     }
-    guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
+    var attempts = isWaiting ? 500 : 1
+    while flock(lock, LOCK_EX | LOCK_NB) != 0 {
+      attempts -= 1
+      guard attempts > 0 else { throw DreamRunError.busy }
+      usleep(10_000)
+    }
     try directory.verifyLock(lock)
     let binding = SourceDigest(bytes: try MemoryReviewEncoding.encode(review.binding)).rawValue
     var state =
@@ -143,6 +150,19 @@ package final class MemoryQueue {
     return revisions
   }
 
+  private static func rejectedRevisions(rows: [MemoryReviewCandidate], state: QueueLedger)
+    -> Set<String>
+  {
+    Set(rows.filter { $0.disposition == .rejected }.map { $0.change.id.rawValue })
+      .union(
+        state.intents.filter { intent in
+          intent.action == "reject"
+            && !state.receipts.contains(where: {
+              $0.decisionID == intent.decisionID && $0.status != "rejected"
+            })
+        }.map { $0.display.presentation.finding.revision })
+  }
+
   private func admit(_ rows: [MemoryReviewCandidate], state: inout QueueLedger) throws {
     for row in rows
     where !state.findings.contains(where: { $0.revision == row.change.id.rawValue }) {
@@ -178,11 +198,7 @@ package final class MemoryQueue {
           else { return nil }
           return origin.revision
         }.first
-      let rejected = Set(rows.filter { $0.disposition == .rejected }.map { $0.change.id.rawValue })
-        .union(
-          state.intents.filter { $0.action == "reject" }.map {
-            $0.display.presentation.finding.revision
-          })
+      let rejected = Self.rejectedRevisions(rows: rows, state: state)
       var proposed = state
       proposed.findings.append(finding)
       let relatedRejected = Self.relatedRevisions(finding, state: proposed, isAcrossEpochs: true)
@@ -216,11 +232,7 @@ package final class MemoryQueue {
     }
     let revisions = Self.relatedRevisions(finding, state: state)
     let connected = Self.relatedRevisions(finding, state: state, isAcrossEpochs: true)
-    let rejected = Set(rows.filter { $0.disposition == .rejected }.map { $0.change.id.rawValue })
-      .union(
-        state.intents.filter { $0.action == "reject" }.map {
-          $0.display.presentation.finding.revision
-        })
+    let rejected = Self.rejectedRevisions(rows: rows, state: state)
     let excluded = Set(
       state.findings.first(where: { $0.revision == finding.suppressionEpoch })?.successorRejections
         ?? [])
@@ -306,7 +318,8 @@ package final class MemoryQueue {
           displayDigest: display.displayDigest, messageReference: nil))
     }
     active = ActiveReview(
-      controller: review, preview: preview, checkout: checkout, display: display)
+      controller: review, preview: preview, checkout: checkout, display: display,
+      clockDate: clockDate)
     return display
   }
 
@@ -351,7 +364,8 @@ package final class MemoryQueue {
         request: presentation.request, displayDigest: amended.displayDigest, messageReference: nil)
     }
     active = ActiveReview(
-      controller: current.controller, preview: preview, checkout: checkout, display: amended)
+      controller: current.controller, preview: preview, checkout: checkout, display: amended,
+      clockDate: clockDate)
     return amended
   }
 
@@ -388,28 +402,156 @@ package final class MemoryQueue {
         "checkout preparation requires a separate explicit choice and fresh preview")
     }
     let intent = QueueDecisionIntent(
-      decisionID: decisionID, display: display, action: action, responseReference: responseReference
-    )
-    try ledger(current.controller) { state in
+      decisionID: decisionID, display: display, action: action, responseReference: responseReference,
+      queuedClock: current.clockDate.timeIntervalSince1970)
+    try ledger(current.controller, isWaiting: true) { state in
       guard !state.intents.contains(where: { $0.decisionID == decisionID }) else {
         throw MemoryError("decision key already used; recover its receipt")
       }
       state.intents.append(intent)
     }
     defer { active = nil }
+    do {
+      try perform(
+        action, review: current.controller, preview: current.preview, checkout: current.checkout)
+    } catch DreamRunError.busy {
+      return receipt(intent, status: "queued")
+    } catch {
+      let recovered = try recover(
+        decisionID: decisionID, review: current.controller, isWaiting: true)
+      guard recovered.status != "queued" else { throw error }
+      return recovered
+    }
+    return try recover(decisionID: decisionID, review: current.controller, isWaiting: true)
+  }
+
+  private func perform(
+    _ action: String, review: MemoryReviewController, preview: MemoryReviewPreview,
+    checkout: MemoryReviewCheckoutPreview
+  ) throws {
     if action == "approve" {
-      _ = try current.controller.apply(current.preview)
+      _ = try review.apply(preview)
     } else if action == "reject" {
-      try current.controller.reject(candidateID: current.preview.change.id)
+      try review.reject(candidateID: preview.change.id)
     } else if action == "defer" {
-      try current.controller.deferCandidate(candidateID: current.preview.change.id)
+      try review.deferCandidate(candidateID: preview.change.id)
     } else {
-      guard current.checkout.isDetachRequired else {
+      guard checkout.isDetachRequired else {
         throw MemoryError("checkout does not require preparation")
       }
-      try current.controller.confirmDetach(current.checkout)
+      try review.confirmDetach(checkout)
     }
-    return try recover(decisionID: decisionID, review: current.controller)
+  }
+
+  private func receipt(_ intent: QueueDecisionIntent, status: String) -> MemoryQueueReceipt {
+    let finding = intent.display.presentation.finding
+    return MemoryQueueReceipt(
+      decisionID: intent.decisionID, findingID: finding.findingID, revision: finding.revision,
+      displayDigest: intent.display.displayDigest, action: intent.action, status: status,
+      commit: nil, auditRef: nil)
+  }
+
+  package func drain(sessionID: String? = nil) throws -> (
+    queued: Int, review: Int, needsDecision: Int, notices: [MemoryQueueReceipt]
+  ) {
+    guard active == nil else { throw DreamRunError.busy }
+    let review = try controller()
+    let unresolved = { (state: QueueLedger) in
+      state.intents.filter { intent in
+        intent.queuedClock != nil
+          && !state.receipts.contains(where: { $0.decisionID == intent.decisionID })
+      }
+    }
+    for intent in try ledger(review, { unresolved($0) }) {
+      guard try recover(decisionID: intent.decisionID, review: review).status == "queued" else {
+        continue
+      }
+      try applyQueued(intent, review: review)
+    }
+    let pending = try review.list().filter { $0.disposition == .pending && $0.limitation == nil }
+      .map(\.change.id.rawValue)
+    let (waiting, open) = try ledger(review) { state in
+      let open = state.receipts.compactMap { receipt -> (MemoryQueueReceipt, String)? in
+        guard receipt.status == "needs-decision", pending.contains(receipt.revision),
+          let index = state.intents.firstIndex(where: { $0.decisionID == receipt.decisionID }),
+          !state.intents[(index + 1)...].contains(where: {
+            $0.display.presentation.finding.revision == receipt.revision
+          })
+        else { return nil }
+        return (receipt, state.intents[index].display.presentation.request.sessionID)
+      }
+      return (unresolved(state), open)
+    }
+    let revisions = Set(waiting.map(\.display.presentation.finding.revision))
+    var notified: Set<String> = []
+    let notices = open.filter { $0.1 == sessionID && notified.insert($0.0.revision).inserted }
+      .map(\.0)
+    return (
+      waiting.count, pending.filter { !revisions.contains($0) }.count,
+      Set(open.map(\.0.revision)).count, notices
+    )
+  }
+
+  func needsDecision(_ intent: QueueDecisionIntent, review: MemoryReviewController)
+    throws
+  {
+    try ledger(review, isWaiting: true) { state in
+      guard !state.receipts.contains(where: { $0.decisionID == intent.decisionID }) else { return }
+      _ = try review.list()
+      state.receipts.append(
+        try published(intent, review: review) ?? receipt(intent, status: "needs-decision"))
+    }
+  }
+
+  private func applyQueued(_ intent: QueueDecisionIntent, review: MemoryReviewController) throws {
+    let presentation = intent.display.presentation
+    var validated: (MemoryReviewPreview, MemoryReviewCheckoutPreview)?
+    do {
+      let shown = try ledger(review) { state in
+        (
+          state.shown.first(where: { $0.displayDigest == intent.display.displayDigest }),
+          state.amendments?.last(where: { $0.revision == presentation.finding.revision })?
+            .amendment
+        )
+      }
+      let candidate = try review.list().first {
+        $0.change.id.rawValue == presentation.finding.revision
+      }
+      if let row = candidate, let reference = shown.0?.messageReference,
+        reference != intent.responseReference, shown.1?.reason == presentation.amendmentReason,
+        let clock = intent.queuedClock
+      {
+        let preview = try review.preview(
+          candidateID: row.change.id, clockDate: Date(timeIntervalSince1970: clock),
+          amendment: shown.1)
+        let checkout = try review.checkoutPreview()
+        let isExact =
+          preview.digest.rawValue == presentation.previewDigest
+          && preview.before == presentation.before && preview.after == presentation.after
+          && preview.replacement == presentation.replacement
+          && checkout.digest.rawValue == presentation.checkoutDigest
+          && !(intent.action == "approve" && checkout.isDetachRequired)
+        if isExact { validated = (preview, checkout) }
+      }
+    } catch DreamRunError.busy {
+      throw DreamRunError.busy
+    } catch {
+      validated = nil
+    }
+    guard let (preview, checkout) = validated else {
+      return try needsDecision(intent, review: review)
+    }
+    do {
+      try perform(intent.action, review: review, preview: preview, checkout: checkout)
+    } catch DreamRunError.busy {
+      throw DreamRunError.busy
+    } catch {
+      if try recover(decisionID: intent.decisionID, review: review).status == "queued" {
+        try needsDecision(intent, review: review)
+      }
+      return
+    }
+    _ = try recover(decisionID: intent.decisionID, review: review)
   }
 
   package func recover(decisionID: String) throws -> MemoryQueueReceipt {
@@ -419,64 +561,86 @@ package final class MemoryQueue {
     return try recover(decisionID: decisionID, review: controller())
   }
 
-  private func recover(decisionID: String, review: MemoryReviewController) throws
-    -> MemoryQueueReceipt
-  {
+  private func recover(
+    decisionID: String, review: MemoryReviewController, isWaiting: Bool = false
+  ) throws -> MemoryQueueReceipt {
     _ = try review.list()
-    return try ledger(review) { state in
+    return try ledger(review, isWaiting: isWaiting) { state in
       guard let intent = state.intents.first(where: { $0.decisionID == decisionID }) else {
         throw MemoryError("unknown decision key")
       }
-      let presentation = intent.display.presentation
-      let finding = presentation.finding
-      var commit: String?
-      var auditRef: String?
-      var status = "outcome-unresolved"
-      if intent.action == "approve", let attempt = review.approvals[finding.revision],
-        attempt.previewHash == presentation.previewDigest,
-        attempt.preview.before == presentation.before, attempt.preview.after == presentation.after,
-        attempt.preview.replacement == presentation.replacement
-      {
-        commit = attempt.resultCommit
-        auditRef = attempt.auditRef
-        status = "approved"
-      } else if intent.action == "reject" || intent.action == "defer" {
-        let disposition: MemoryReviewDisposition = intent.action == "reject" ? .rejected : .deferred
-        let name = "\(disposition.rawValue)-\(finding.revision).json"
-        if try review.root.isPresent(name) {
-          let selection = try MemoryReviewEncoding.decode(
-            ReviewSelection.self,
-            bytes: review.root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
-          guard
-            selection == ReviewSelection(candidateID: finding.revision, disposition: disposition)
-          else { throw DreamRunError.corruption }
-          status = disposition.rawValue
+      let receipt = try published(intent, review: review)
+      if let index = state.receipts.firstIndex(where: { $0.decisionID == decisionID }) {
+        let previous = state.receipts[index]
+        guard previous.status == "needs-decision" else {
+          guard previous == receipt else { throw MemoryError("native receipt no longer verifies") }
+          return previous
         }
-      } else if intent.action == "detach" {
-        let name = "detach-outcome-\(presentation.checkoutDigest).json"
-        if try review.root.isPresent(name) {
-          let attempt = try MemoryReviewEncoding.decode(
-            ReviewDetachAttempt.self,
-            bytes: review.root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
-          guard attempt.digest == presentation.checkoutDigest,
-            attempt.witness.commit == presentation.checkoutCommit
-          else { throw DreamRunError.corruption }
-          commit = attempt.witness.commit
-          auditRef = attempt.auditRef
-          status = "detached"
-        }
+        let position = state.intents.firstIndex(where: { $0.decisionID == decisionID })!
+        guard let receipt,
+          !state.intents[(position + 1)...].contains(where: {
+            $0.display.presentation.finding.revision == intent.display.presentation.finding.revision
+          })
+        else { return previous }
+        state.receipts[index] = receipt
+        return receipt
       }
-      let receipt = MemoryQueueReceipt(
-        decisionID: decisionID, findingID: finding.findingID, revision: finding.revision,
-        displayDigest: intent.display.displayDigest, action: intent.action, status: status,
-        commit: commit, auditRef: auditRef)
-      if let previous = state.receipts.first(where: { $0.decisionID == decisionID }) {
-        guard previous == receipt else { throw MemoryError("native receipt no longer verifies") }
-        return previous
+      if let receipt {
+        state.receipts.append(receipt)
+        return receipt
       }
-      if status != "outcome-unresolved" { state.receipts.append(receipt) }
-      return receipt
+      return self.receipt(
+        intent, status: intent.queuedClock == nil ? "outcome-unresolved" : "queued")
     }
+  }
+
+  private func published(_ intent: QueueDecisionIntent, review: MemoryReviewController) throws
+    -> MemoryQueueReceipt?
+  {
+    let presentation = intent.display.presentation
+    let finding = presentation.finding
+    var commit: String?
+    var auditRef: String?
+    var status = "outcome-unresolved"
+    if intent.action == "approve", let attempt = review.approvals[finding.revision],
+      attempt.previewHash == presentation.previewDigest,
+      attempt.preview.before == presentation.before, attempt.preview.after == presentation.after,
+      attempt.preview.replacement == presentation.replacement
+    {
+      commit = attempt.resultCommit
+      auditRef = attempt.auditRef
+      status = "approved"
+    } else if intent.action == "reject" || intent.action == "defer" {
+      let disposition: MemoryReviewDisposition = intent.action == "reject" ? .rejected : .deferred
+      let name = "\(disposition.rawValue)-\(finding.revision).json"
+      if try review.root.isPresent(name) {
+        let selection = try MemoryReviewEncoding.decode(
+          ReviewSelection.self,
+          bytes: review.root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
+        guard
+          selection == ReviewSelection(candidateID: finding.revision, disposition: disposition)
+        else { throw DreamRunError.corruption }
+        status = disposition.rawValue
+      }
+    } else if intent.action == "detach" {
+      let name = "detach-outcome-\(presentation.checkoutDigest).json"
+      if try review.root.isPresent(name) {
+        let attempt = try MemoryReviewEncoding.decode(
+          ReviewDetachAttempt.self,
+          bytes: review.root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
+        guard attempt.digest == presentation.checkoutDigest,
+          attempt.witness.commit == presentation.checkoutCommit
+        else { throw DreamRunError.corruption }
+        commit = attempt.witness.commit
+        auditRef = attempt.auditRef
+        status = "detached"
+      }
+    }
+    guard status != "outcome-unresolved" else { return nil }
+    return MemoryQueueReceipt(
+      decisionID: intent.decisionID, findingID: finding.findingID, revision: finding.revision,
+      displayDigest: intent.display.displayDigest, action: intent.action, status: status,
+      commit: commit, auditRef: auditRef)
   }
 
   package func release() { active = nil }

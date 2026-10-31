@@ -51,10 +51,51 @@ blocks the write. A separate review dialog is not an alternate completion path.
 
 Dreaming is background work. It does not approve or write memories.
 
-- One temporary worker serves the local interactive Pi sessions.
+- One window at a time dreams. The native worker holds an exclusive,
+  non-blocking `flock` on its dream state; other windows stay `dreaming: idle`
+  and retry later. The operating system releases the lock when the process exits.
 - Intake includes existing sessions and new completed work.
-- Foreground work has priority over intake and model calls.
-- Live sessions are excluded from the background evidence batch.
+- Dreaming continues while you use this or another Pi window.
+- Memory tool calls in a window do not stop that window's dream run.
+- Live sessions are excluded from the background evidence batch. Every Pi
+  process with a session file (interactive, print, or RPC) writes a marker for
+  its session in `~/.pi/memory-host` (directory mode 0700, owner checked). Only
+  interactive windows dream. The marker name holds the process ID; the dreamer
+  skips sessions whose process is alive and deletes any regular file you own
+  with a marker or orphan `.live.tmp` name whose process is dead, before
+  checking its mode or content. A file that is not a regular file you own is
+  skipped and not deleted. A live process's marker that fails the mode 0600,
+  link, size or session ID check is skipped, not trusted and not deleted. If the
+  operating system reuses a dead window's process ID, its stale marker keeps
+  that session excluded until the new process exits. This fails safe: it can
+  delay intake of a finished session, but never admits a live one. If a window
+  cannot write its marker, it shows `liveSessionUnavailable` and retries on
+  later schedules; this does not count as a worker failure. A window with no
+  session file has no session to exclude; it writes no marker and still dreams.
+- Findings stay pending until you approve the exact proposal in conversation.
+- Decision journal: a dream run holds the memory lock for its whole run. If you
+  answer a proposal while another window dreams, the window records your exact
+  decision (proposal revision, display digest, the durable reply reference, and
+  the action) in the queue ledger and tells you it will apply shortly. Each
+  dream run applies journaled decisions before and after its run, and every
+  window applies them before and after each memory tool operation when no
+  proposal is open, whatever that window queued itself. Each apply repeats
+  the same native checks as an immediate reply. If the proposal or its
+  evidence changed, or the apply fails before it publishes, nothing is applied
+  and the decision gets a `needs-decision` receipt; later journaled decisions
+  still apply. A `needs-decision` receipt is written only after a fresh check
+  shows that nothing was published, and a later published result replaces it.
+  Only the window whose session gave the answer posts a visible message, once
+  per revision: the earlier answer was not applied and does not count, nothing
+  was saved, and the agent will present the current proposal. The message never
+  counts as an answer; a new answer binds to the new proposal. If that session
+  is gone, no window posts a message, and the revision shows under
+  `N to review`. Every window's footer shows `N need decision` from the
+  journal until the revision gets a new decision. A decision is applied at most
+  once; a crash between publication and receipt recovers the published result.
+- Footer counts come from the native journal: `N queued` counts journaled
+  decisions not yet applied, and `N to review` counts pending findings without
+  one. They refresh after each journal apply.
 - With no interactive Pi session open, no worker should continue.
 - There is no permanent service or cross-device queue.
 - The selected provider, model, and thinking level stay unchanged.
@@ -69,11 +110,17 @@ The runtime publishes this session's dreaming state through Pi's public
 extension-status key `pi-core-memories:dream`. A footer can display it without
 another command, review mode, or host change.
 
+- `dreaming: applying` means the run is applying journaled decisions.
 - `dreaming: active` means a validated archived-model request is in progress.
 - `dreaming: idle` means the scheduler waits or finds no new records. It does
   not prove a successful model call.
-- `dreaming: paused` means foreground work, pending review, or worker contention
-  prevents this session from dispatching.
+- `dreaming: paused` means pending review, a model change, or repeated failures
+  delay this session's next dispatch.
+- Nonzero counts follow the state, for example
+  `dreaming: active · 1 queued · 1 to review · 1 need decision`. `queued`
+  counts recorded decisions that wait for the lock; `to review` counts pending
+  proposals; `need decision` counts revisions whose recorded answer was not
+  applied and needs a new decision.
 - `dreaming: error(code: X, message: "...")` reports a blocked or failed attempt.
   The code and message use fixed safe text, not raw exceptions or source data.
 
@@ -184,7 +231,7 @@ review must run against the current source state. A native protocol pass, a
 source-only inspection, or a video of a removed menu does not establish the
 installed conversational flow.
 
-Acceptance includes background intake, foreground priority, normal chat
+Acceptance includes background intake while windows are in use, normal chat
 handoff, exact displayed approval, conversational changes, rejection, deferral,
 ownership recovery, last-session shutdown, preserved data, and migration.
 Installation follows checked user-merged revisions. Application retirement

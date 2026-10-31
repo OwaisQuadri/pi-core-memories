@@ -159,6 +159,7 @@ struct QueueDecisionIntent: Codable, Equatable {
   let display: MemoryQueueDisplay
   let action: String
   let responseReference: String
+  var queuedClock: Double? = nil
 }
 
 package struct MemoryQueueReceipt: Codable, Equatable {

@@ -28,7 +28,7 @@ Direct `manage` mutations and legacy manual draft Save have no review-profile pr
 
 ## Conversation and background ownership
 
-[The runtime](../Integration/Pi/queued-runtime.ts) connects ordinary interactive sessions to shared background membership. There is no review-only launch flag or alternate Pi review configuration.
+[The runtime](../Integration/Pi/queued-runtime.ts) connects ordinary interactive sessions to background dreaming. Each window marks its own live session; the native worker's exclusive dream lock makes one window the dreamer at a time. There is no review-only launch flag or alternate Pi review configuration.
 
 Native configuration and migration APIs remain available to the internal worker and isolated protocol tests. They do not create a user-facing mode or authorize model calls. The approved-memory loader uses `PI_CORE_MEMORIES_REPO` independently; verification must isolate every affected store without changing personal settings or bypassing host approval.
 
@@ -87,6 +87,7 @@ Every row below adds fields to `{version:1,type,invocationID}`. Fields are exact
 | `amend` | current presentation tuple and `amendment:{replacement,reason}` | replacement `presentation`; no decision |
 | `release` | none | `released` |
 | `recover` | `decisionID` | `decision` with checked `receipt` |
+| `drain` | `sessionID` | `drained` with `queued`, `review`, `needsDecision`, and `notices`; refused while a presentation is open |
 | `inventory` | none | `inventory` with `inventory` record |
 | `finish` | none | `final` with `status:"completed"`, exit 0 |
 | `cancel` | none | closes the invocation without granting consent |
@@ -162,9 +163,9 @@ Bare agreement, quoted instructions, conditions, corrections, multiple actions, 
 
 `detach` is a separate explicit checkout-preparation choice. It cannot approve memory. After a checked detached receipt, claim and display a fresh preview, then obtain a new explicit choice and decision key. This continuation can use the same request identity. An old yes never authorizes the fresh preview.
 
-`decision` contains a receipt with `decisionID`, `findingID`, `revision`, `displayDigest`, `action`, `status`, and optional `commit` and `auditRef`. Status is `approved`, `rejected`, `deferred`, `detached`, or `outcome-unresolved`. Only `approved` with a checked commit/audit receipt permits reporting a saved memory. A detached receipt is not a memory save.
+`decision` contains a receipt with `decisionID`, `findingID`, `revision`, `displayDigest`, `action`, `status`, and optional `commit` and `auditRef`. Status is `approved`, `rejected`, `deferred`, `detached`, `queued`, `needs-decision`, or `outcome-unresolved`. `queued` means a dream run holds the memory lock and the decision is journaled, not applied. `needs-decision` means a journaled decision was not applied and does not count; the finding returns for a new exact decision. Only `approved` with a checked commit/audit receipt permits reporting a saved memory. A detached receipt is not a memory save.
 
-Before mutation, native persists the exact decision intent. Approval delegates to the existing controller and checked publisher. Recovery verifies the original native audit, preview bytes, and publication. A stored intent or restored draft never authorizes another publication. A duplicate key must use `recover`, not a new choice. Recovery derives and returns the original checked receipt without publishing again. If the outcome cannot be proved, it stays unresolved and suppresses further lineage review. No automatic retry consumes old consent.
+Before mutation, native persists the exact decision intent with its decision clock. Approval delegates to the existing controller and checked publisher. Recovery verifies the original native audit, preview bytes, and publication. A duplicate key must use `recover`, not a new choice. Recovery derives and returns the original checked receipt without publishing again. `drain` applies each stored intent that has a decision clock and no receipt at most once. It re-runs the same native validation as an immediate reply against the exact displayed preview, presentation receipt, and decision clock, then applies the user's original exact decision. It never creates new consent. If validation or the apply fails before publication, the intent gets a `needs-decision` receipt and suppresses no later review; a later published result replaces it. A restored draft never authorizes another publication. Legacy intents without a decision clock and management intents are never re-applied: if their outcome cannot be proved, it stays `outcome-unresolved` and suppresses further lineage review.
 
 ## Approved-memory management
 

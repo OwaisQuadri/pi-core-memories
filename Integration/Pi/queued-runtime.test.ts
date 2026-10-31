@@ -271,6 +271,93 @@ test("model selection changes cancel a running worker and shutdown stops resched
 	await f.stop(); const after = runs; await sleep(20); assert.equal(runs, after);
 });
 
+function footerHistory(ctx: ExtensionContext): (string | undefined)[] {
+	const history: (string | undefined)[] = []; const setStatus = ctx.ui.setStatus.bind(ctx.ui);
+	Object.assign(ctx.ui, { setStatus: (key: string, value: string | undefined) => { history.push(value); setStatus(key, value); } });
+	return history;
+}
+
+test("an interrupted call after a restart is retried under its recorded selection instead of pausing dreaming forever", async () => {
+	const starts: DreamStart[] = []; let calls = 0;
+	const f = runtime(async (start, call, signal) => {
+		starts.push(start);
+		if (starts.length === 1) return { status: "pending", reason: "interruptedCall", callSelection: start.selection } as DreamReport;
+		if (start.resume === "retryInterruptedCall") await call(archivedRequest(start), signal);
+		return { status: start.resume === "retryInterruptedCall" ? "completed" : "noNewRecords" } as DreamReport;
+	}, "tui", undefined, { call: async () => { calls++; return "{}"; } });
+	const footer = footerHistory(f.ctx);
+	try {
+		await f.emit("session_start"); await sleep(60);
+		assert.deepEqual(starts.slice(0, 2).map((start) => start.resume), ["inspectOrContinue", "retryInterruptedCall"]);
+		assert.deepEqual(starts[1]!.selection, starts[0]!.selection);
+		assert.equal(calls, 1);
+		assert.ok(!footer.includes("dreaming: paused"));
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
+	} finally { await f.stop(); }
+});
+
+test("an interrupted call is never retried under another selection and shows its recorded model until the window switches back", async () => {
+	const recorded = { provider: "anthropic", modelID: "recorded", thinkingLevel: "low" };
+	const starts: DreamStart[] = [];
+	const f = runtime(async (start) => {
+		starts.push(start);
+		return (start.resume === "retryInterruptedCall" ? { status: "completed" } : { status: "pending", reason: "interruptedCall", callSelection: recorded }) as DreamReport;
+	});
+	const footer = footerHistory(f.ctx);
+	try {
+		await f.emit("session_start"); await sleep(40);
+		assert.deepEqual(starts.map((start) => start.resume), ["inspectOrContinue"]);
+		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: interruptedCall, message: "Interrupted dream needs the model it started with: anthropic/recorded, thinking low")');
+		Object.assign(f.ctx, { model: { provider: "anthropic", id: "recorded", contextWindow: 262_144 }, thinkingLevel: "low" });
+		await f.emit("model_select"); await sleep(40);
+		assert.deepEqual(starts.slice(0, 3).map((start) => start.resume), ["inspectOrContinue", "inspectOrContinue", "retryInterruptedCall"]);
+		assert.deepEqual(starts[2]!.selection, recorded);
+		assert.ok(!footer.includes("dreaming: paused"));
+	} finally { await f.stop(); }
+});
+
+test("a pending run shows its reason as an error instead of paused, and a cancelled run is rescheduled", async () => {
+	for (const reason of ["callbackFailure", "invalidDecision", "staleUnpublishedPlans", "cancelled"]) {
+		let runs = 0;
+		const f = runtime(async () => { runs++; return { status: "pending", reason } as DreamReport; });
+		const footer = footerHistory(f.ctx);
+		try {
+			await f.emit("session_start"); await sleep(40);
+			assert.ok(!footer.includes("dreaming: paused"));
+			if (reason === "cancelled") { assert.ok(runs > 1); continue; }
+			assert.equal(runs, 1);
+			assert.equal(f.statuses.get("pi-core-memories:dream"), `dreaming: error(code: pending, reason: ${reason}, message: "Native dream worker kept the run pending")`);
+		} finally { await f.stop(); }
+	}
+});
+
+test("the footer shows paused only while a foreground memory write holds the queue", async () => {
+	const f = conversationalRuntime();
+	const footer = footerHistory(f.ctx);
+	try {
+		await f.emit("session_start"); await f.emit("model_select"); await f.emit("thinking_level_select");
+		assert.ok(!footer.includes("dreaming: paused"));
+		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
+		await f.call("memory_queue", { operation: "cancel" });
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
+	} finally { await f.stop(); }
+});
+
+test("closing a proposal during a background run returns the footer from paused to active", async () => {
+	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
+	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
+	const f = conversationalRuntime([], [], { idleMilliseconds: 5, run: async () => { enter(); await released; return { status: "noNewRecords" } as DreamReport; } });
+	try {
+		await f.emit("session_start");
+		await Promise.race([entered, sleep(1000).then(() => assert.fail("No background run"))]);
+		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
+		await f.call("memory_queue", { operation: "cancel" });
+		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active");
+	} finally { release(); await f.stop(); }
+});
+
 
 test("a native queue refusal never retries another context", async () => {
 	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", new Error("Native queue unavailable."));
@@ -294,7 +381,7 @@ test("ordinary conversation keeps the shared queue and the live session marker",
 	} finally { await f.stop(); }
 });
 
-function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued" | "deferred" | "rejected")[] = [], rows: unknown[] | (() => unknown[]) = []) {
+function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "queued" | "deferred" | "rejected")[] = [], rows: unknown[] | (() => unknown[]) = [], overrides: NonNullable<Parameters<typeof registerQueuedRuntime>[1]> = {}) {
 	let f: ReturnType<typeof runtime>;
 	const journal = { queued: 0, review: 0, needsDecision: 0, notices: [] as Record<string, unknown>[] };
 	const frames: { type: string; fields: Record<string, unknown>; isPrivate?: boolean }[] = [];
@@ -342,6 +429,7 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 				close: async () => { if (clientIndex && !closes.includes(clientIndex)) closes.push(clientIndex); },
 			};
 		},
+		...overrides,
 	});
 	return {
 		...f, frames, signals, closes, journal,

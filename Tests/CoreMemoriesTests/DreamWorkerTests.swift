@@ -358,6 +358,8 @@ func dreamWorkerCancellationNeverAdvancesGeneration(phase: String) throws {
   let interrupted = try pending.frame()
   #expect(interrupted["status"] as? String == "pending")
   #expect(interrupted["reason"] as? String == "interruptedCall")
+  let callSelection = try #require(interrupted["callSelection"] as? [String: Any])
+  #expect(NSDictionary(dictionary: callSelection).isEqual(to: request["selection"] as? [String: Any] ?? [:]))
   try pending.finish()
   try FileManager.default.removeItem(at: fixture.sessions)
   try FileManager.default.removeItem(at: fixture.snippets)

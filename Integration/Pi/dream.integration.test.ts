@@ -196,7 +196,7 @@ test("explicit worker replacement alone dispatches current selection and archive
 	assert.equal((await launch(currentStart)).status, "blocked"); assert.equal(calls.length, 2);
 });
 
-test("interrupted replacement needs explicit retry, retains original, and uses current selection", async (t) => {
+test("interrupted replacement needs explicit retry, retains original, and retries only under its recorded selection", async (t) => {
 	const f = await fixture(t); let saved: DreamRequest | undefined;
 	const first = await dream.runDreamWorker(f.start, async (request) => { saved = request; return "Invalid café 🌱"; }, new AbortController().signal);
 	assert.equal(first.reason, "invalidDecision");
@@ -215,9 +215,12 @@ test("interrupted replacement needs explicit retry, retains original, and uses c
 		assert.equal(inspect.reason, "interruptedCall"); assert.equal(inspect.generation, "0");
 	}
 	await rm(f.roots.sessions, { recursive: true });
-	const retry: DreamStart = { ...replacing, resume: "retryInterruptedCall", selection: { provider: "third", modelID: "latest", thinkingLevel: "medium" } };
+	const other: DreamStart = { ...replacing, resume: "retryInterruptedCall", selection: { provider: "third", modelID: "latest", thinkingLevel: "medium" } };
+	const refused = await dream.runDreamWorker(other, forbidden, new AbortController().signal);
+	assert.equal(refused.status, "pending"); assert.equal(refused.reason, "interruptedCall"); assert.deepEqual(refused.callSelection, replacing.selection);
+	const retry: DreamStart = { ...replacing, resume: "retryInterruptedCall" };
 	const completed = await dream.runDreamWorker(retry, async (request) => {
-		assert.deepEqual(request, { ...saved, selection: retry.selection }); return decision(request);
+		assert.deepEqual(request, { ...saved, selection: replacing.selection }); return decision(request);
 	}, new AbortController().signal);
 	assert.equal(completed.status, "completed"); assert.equal(completed.generation, "1"); assert.equal(completed.runID, saved!.runID);
 	assert.deepEqual(await readFile(join(directory, "response.json")), original);
@@ -226,14 +229,14 @@ test("interrupted replacement needs explicit retry, retains original, and uses c
 	assert.equal(replay.status, "completed"); assert.equal(replay.runID, saved!.runID);
 });
 
-test("resumed worker dispatches current provider, model and thinking with exact frozen context", async (t) => {
+test("resumed worker dispatches its recorded provider, model and thinking with exact frozen context", async (t) => {
 	for (const selection of [
 		{ provider: "anthropic", modelID: "selected", thinkingLevel: "off" },
 		{ provider: "openai", modelID: "other", thinkingLevel: "off" },
 		{ provider: "openai", modelID: "selected", thinkingLevel: "high" },
 	]) {
 		const f = await fixture(t); let saved: DreamRequest | undefined;
-		const first = await dream.runDreamWorker(f.start, async (request) => { saved = request; throw new Error("interrupted"); }, new AbortController().signal);
+		const first = await dream.runDreamWorker({ ...f.start, selection }, async (request) => { saved = request; throw new Error("interrupted"); }, new AbortController().signal);
 		assert.equal(first.status, "pending"); assert.ok(saved);
 		const directory = join(f.roots.state, "runs", saved.runID);
 		const names = ["input.json", "context.json", "request.json"];

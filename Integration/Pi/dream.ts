@@ -24,7 +24,7 @@ export type DreamRequest = { version: 1; type: "modelRequest"; invocationID: str
 type DreamSource = { sessionID: string; entryID: string; partIndex: number };
 type DreamProposal = { ref: string; commit: string; base: string; path: string; sources: DreamSource[]; contradictions: string };
 type DreamNote = { kind: string; sources: DreamSource[]; explanation: string; reasonCode: string | null; ownerReference: string | null; contradictions: string };
-export type DreamReport = { version: 1; type: "final"; invocationID: string; status: "completed" | "pending" | "noNewRecords" | "busy" | "blocked"; generation: string; runID: string | null; base: string | null; proposals: DreamProposal[]; notes: DreamNote[]; isBacklog: boolean; isRecovered: boolean; reason: string | null; detail: string | null; unfinishedTails: number };
+export type DreamReport = { version: 1; type: "final"; invocationID: string; status: "completed" | "pending" | "noNewRecords" | "busy" | "blocked"; generation: string; runID: string | null; base: string | null; proposals: DreamProposal[]; notes: DreamNote[]; isBacklog: boolean; isRecovered: boolean; reason: string | null; detail: string | null; unfinishedTails: number; callSelection?: DreamSelection };
 export type DreamCoverage = { backlogBytes: number | null; backlogLimitBytes: number | null; undreamtBytes: number | null; nextBytes: number | null; plannedBytes: number; completedBytes: number; repeatedRecords: number; estimateSeconds: number | null };
 function coverageFields(result: ObjectValue): DreamCoverage {
 	const nullable = (value: unknown) => value === null ? null : integer(value);
@@ -260,7 +260,10 @@ function sources(value: unknown): void {
 }
 export function dreamReport(value: unknown, start: DreamStart): DreamReport {
 	const result = header(value, start);
-	fields(result, ["version", "type", "invocationID", "status", "generation", "runID", "base", "proposals", "notes", "isBacklog", "isRecovered", "reason", "detail", "unfinishedTails"]);
+	const isCallSelected = "callSelection" in result;
+	fields(result, ["version", "type", "invocationID", "status", "generation", "runID", "base", "proposals", "notes", "isBacklog", "isRecovered", "reason", "detail", "unfinishedTails", ...isCallSelected ? ["callSelection"] : []]);
+	if (isCallSelected && (result.status !== "pending" || result.reason !== "interruptedCall")) failure();
+	if (isCallSelected) selected(result.callSelection);
 	if (result.type !== "final" || !["completed", "pending", "noNewRecords", "busy", "blocked"].includes(String(result.status))) failure();
 	generation(result.generation);
 	if (result.runID !== null) identifier(result.runID);

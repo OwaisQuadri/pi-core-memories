@@ -458,8 +458,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	});
 	pi.on("model_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: paused"); schedule(); });
 	pi.on("thinking_level_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: paused"); schedule(); });
-	pi.on("session_before_switch", async () => { isAlive = false; invalidate(); generation++; await leaveSession(); });
-	pi.on("session_before_fork", async () => { isAlive = false; invalidate(); generation++; await leaveSession(); });
+	pi.on("session_before_switch", async () => { isAlive = false; invalidate(); await leaveSession(); });
+	pi.on("session_before_fork", async () => { isAlive = false; invalidate(); await leaveSession(); });
 	pi.on("session_before_tree", invalidateConversation);
 	pi.on("session_before_compact", invalidateConversation);
 	pi.on("session_tree", (_event, ctx) => { context = ctx; schedule(); });

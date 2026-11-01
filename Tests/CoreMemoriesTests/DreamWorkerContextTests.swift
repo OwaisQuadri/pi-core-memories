@@ -138,3 +138,120 @@ func dreamWorkerRejectedCatalogueRegisteredSecretBlocksFreshAndReplay(isReplay: 
     !FileManager.default.fileExists(
       atPath: fixture.state.appendingPathComponent("generations/2.json").path))
 }
+
+@Test func dreamWorkerUnverifiedOldSourceIsNotReintroducedByHistoryOrCatalogue() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: ["OLD_SOURCE_SENTINEL"])
+  let finding = try workerContextReject(fixture, claim: "OLD_CLAIM_SENTINEL")
+  try fixture.populate(texts: ["Rewritten source with the old timestamp."])
+  try FileManager.default.setAttributes(
+    [.modificationDate: Date().addingTimeInterval(-8 * 86_400)], ofItemAtPath: fixture.source.path)
+  try workerContextSession(fixture, text: "A current preference.")
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  try worker.send(workerStart(fixture))
+  let request = try worker.frame()
+  let context = try workerContext(request)
+  #expect((context["primaryEvidence"] as? [[String: Any]])?.count == 1)
+  #expect(context["rejectedPredecessorsNotPrimaryEvidence"] == nil)
+  #expect(!String(describing: request).contains("OLD_SOURCE_SENTINEL"))
+  #expect(!String(describing: request).contains("OLD_CLAIM_SENTINEL"))
+  let prior = try #require(context["priorFindingsNotPrimaryEvidence"] as? [String: Any])
+  #expect((prior["findings"] as? [[String: Any]])?.isEmpty == true)
+  #expect((prior["omitted"] as? [String: Any])?["unverifiedSource"] as? Int == 1)
+  #expect(
+    (context["limitations"] as? [String])?.contains {
+      $0.contains("currently verified admitted source view")
+    } == true)
+  try worker.send(workerReply(request, text: workerDecision(request)))
+  #expect(try worker.frame()["status"] as? String == "completed")
+  try worker.finish()
+  let queue = try queueFixture(fixture, sources: fixture.store())
+  let rows = try queue.list(request: MemoryQueueRequest(sessionID: "reviewer", requestID: "later"))
+  #expect(rows.first { $0.finding.revision == finding.revision }?.finding == finding)
+}
+
+@Test func dreamWorkerPriorContextSuppliesOtherSessionNotesAndFindingsAndReplaysFrozen() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: ["Prefer green buttons."])
+  let rejected = try workerContextReject(fixture)
+  try workerContextSession(fixture, text: "Later preference.")
+  let second = try DreamWorkerProcess()
+  defer { second.clean() }
+  try second.send(workerStart(fixture))
+  let noted = try second.frame()
+  try second.send(workerReply(noted, text: workerDecision(noted)))
+  #expect(try second.frame()["status"] as? String == "completed")
+  try second.finish()
+  let elsewhere = fixture.root.appendingPathComponent("elsewhere")
+  try FileManager.default.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+  try fixture.write(
+    dreamHeader("three", cwd: elsewhere.path, name: nil) + "\n"
+      + dreamUser("third", nil, dreamOld, "An unrelated preference.") + "\n",
+    file: fixture.sessions.appendingPathComponent("--fixture--/three.jsonl"))
+  let third = try DreamWorkerProcess()
+  defer { third.clean() }
+  try third.send(workerStart(fixture))
+  let request = try third.frame()
+  let context = try workerContext(request)
+  let primary = try #require(context["primaryEvidence"] as? [[String: Any]])
+  #expect(primary.allSatisfy { ($0["source"] as? [String: Any])?["session"] as? String == "three" })
+  let notes = try #require(context["priorDreamNotesNotPrimaryEvidence"] as? [String: Any])
+  let noteItems = try #require(notes["notes"] as? [[String: Any]])
+  #expect(!noteItems.isEmpty)
+  #expect(noteItems.allSatisfy { $0["explanation"] as? String == "Synthetic Unicode café 🌱 note." })
+  #expect(noteItems.allSatisfy { $0["generation"] as? Int == 1 })
+  let findings = try #require(context["priorFindingsNotPrimaryEvidence"] as? [String: Any])
+  let findingItems = try #require(findings["findings"] as? [[String: Any]])
+  #expect(findingItems.count == 1)
+  #expect(findingItems.first?["revision"] as? String == rejected.revision)
+  #expect(findingItems.first?["status"] as? String == "rejected")
+  #expect(findingItems.first?["sessions"] as? [String] == ["one"])
+  #expect((findings["omitted"] as? [String: Any])?["unverifiedSource"] as? Int == 0)
+  #expect((request["systemPrompt"] as? String)?.contains("priorFindingsNotPrimaryEvidence") == true)
+  try third.send(workerReply(request, category: "failed"))
+  #expect(try third.frame()["status"] as? String == "pending")
+  try third.finish()
+  try FileManager.default.removeItem(at: fixture.source)
+  let retry = try DreamWorkerProcess()
+  defer { retry.clean() }
+  try retry.send(workerStart(fixture, resume: "retryInterruptedCall"))
+  let replay = try retry.frame()
+  #expect(NSDictionary(dictionary: replay).isEqual(to: request))
+  try retry.send(workerReply(replay, text: workerDecision(replay)))
+  #expect(try retry.frame()["status"] as? String == "completed")
+  try retry.finish()
+}
+
+@Test func dreamPriorContextKeepsNewestWithinCapsAndCountsOmissions() throws {
+  let notes = (0..<50).map { index in
+    DreamPriorCandidate(
+      item: DreamPriorNote(
+        generation: UInt64(index), kind: "noChange", reasonCode: "notDurable",
+        explanation: "Note \(index).", sessions: ["s\(index)"]),
+      sessions: ["s\(index)"], sourcePaths: ["--fixture--/s\(index).jsonl"])
+  }
+  let findings = (0..<30).map { index in
+    DreamPriorCandidate(
+      item: DreamOpenFinding(
+        revision: String(repeating: String(index % 10), count: 64), status: "pending",
+        path: "global.md", claim: String(repeating: "x", count: 5_000), reason: "Reason.",
+        sessions: ["f\(index)"]),
+      sessions: ["f\(index)"], sourcePaths: index == 1 ? ["--fixture--/changed.jsonl"] : ["--fixture--/f.jsonl"])
+  }
+  let context = try #require(
+    try DreamPriorContext(
+      newestNotes: notes, olderNoteCount: 7, newestFindings: findings,
+      excludedSessionIDs: ["s0"], isVerified: { !$0.contains("--fixture--/changed.jsonl") }))
+  #expect(context.notes.map(\.explanation) == (1...40).map { "Note \($0)." })
+  #expect(context.omittedNotes == DreamPriorOmissions(overBudget: 16, liveSession: 1))
+  #expect(context.findings.allSatisfy { $0.claim.utf8.count == DreamPriorContext.maximumTextBytes })
+  #expect(try DreamRunEncoding.encode(context.findings).count <= DreamPriorContext.maximumFindingBytes)
+  #expect(context.findings.first?.sessions == ["f0"])
+  #expect(!context.findings.contains { $0.sessions == ["f1"] })
+  #expect(context.omittedFindings.unverifiedSource == 1)
+  #expect(context.findings.count + context.omittedFindings.overBudget + 1 == 30)
+  #expect(context.isWithinBudget)
+}

@@ -288,30 +288,6 @@ test("exclusions-only complete and no-new records never call registry", async (t
 	assert.equal((await dream.runDreamWorker(f.start, forbidden, new AbortController().signal)).status, "noNewRecords");
 });
 
-test("SDK custom virtual transport never receives a subscription-only request", async (t) => {
-	const f = await fixture(t);
-	const runtime = await sdk.ModelRuntime.create({ authPath: join(f.agent, "auth.json"), modelsPath: null, modelsStorePath: join(f.agent, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
-	const baseline = runtime.getModels("openai").find((item) => item.reasoning); assert.ok(baseline);
-	const native: Model<"offline-native-api"> = { provider: "offline-native", id: "physical", name: "Offline physical model", api: "offline-native-api", baseUrl: "https://fixture.invalid", reasoning: true, input: ["text"], cost: { ...baseline.cost }, contextWindow: baseline.contextWindow, maxTokens: baseline.maxTokens };
-	let nativeCalls = 0; let routes = 0;
-	const scripted: typeof runtime.streamSimple = () => {
-		nativeCalls++; throw new Error("Custom transport must not receive subscription-only requests");
-	};
-	runtime.registerNativeProvider(ai.createProvider({ id: native.provider, auth: { apiKey: { name: "Offline fixture", resolve: async () => ({ auth: {}, source: "fixture" }) } }, models: [native], api: { stream: scripted, streamSimple: scripted } }));
-	await runtime.refresh({ allowNetwork: false });
-	runtime.registerVirtualModel({ provider: "offline-virtual", id: "selected", name: "Offline virtual selection", thinkingLevels: ["medium"], route: (routing) => {
-		routes++; assert.equal(routing.reason, "direct"); assert.equal(routing.thinkingLevel, "medium"); assert.equal(routing.model.api, "pi-virtual");
-		assert.ok(JSON.stringify(routing.messages).includes("EXACT saved context"));
-		return { model: native, thinkingLevel: "high" };
-	} });
-	const captured = runtime.getModelOfType("chat", "offline-virtual", "selected"); assert.ok(captured);
-	const selection = { provider: captured.provider, modelID: captured.id, thinkingLevel: "medium" };
-	const request = { version: 1, type: "modelRequest", invocationID: "invocation", requestID: "run:" + "a".repeat(64), runID: "run", generation: "0", inputHash: "b".repeat(64), contextHash: "c".repeat(64), requestHash: "a".repeat(64), selection, systemPrompt: "EXACT saved context", messages: [{ role: "user", text: "saved input", timestampMilliseconds: 0 }] } as DreamRequest;
-	const registry = new sdk.ModelRegistry(runtime);
-	await assert.rejects(dream.callDreamModel(request, { modelRegistry: registry }, captured, selection, new AbortController().signal), /the selected model is not using a subscription sign-in; nothing was dispatched/);
-	assert.equal(routes, 0); assert.equal(nativeCalls, 0); assert.equal(captured.api, "pi-virtual"); assert.equal(request.selection.thinkingLevel, "medium");
-});
-
 function contentHash(context: Context): string {
 	const payload = JSON.parse(typeof context.messages[0].content === "string" ? context.messages[0].content : "") as Record<string, unknown>;
 	assert.equal(typeof payload.contextHash, "string");

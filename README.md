@@ -150,7 +150,7 @@ Dreaming uses the selected provider, model, and thinking level. It must not fall
 back to a paid application programming interface (API) key or switch selections.
 The selected model must be signed in through OAuth (Open Authorization) to a
 subscription provider; virtual models are refused. The call then goes through
-Pi's model registry, the same request path as a normal session, which resolves
+Pi's model registry, the same authentication path as a normal session, which resolves
 authentication, headers, and endpoint for the selected model.
 
 ## Review in conversation

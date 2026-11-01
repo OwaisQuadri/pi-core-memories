@@ -91,9 +91,6 @@ function failure(): never {
 	const frames = (new Error().stack ?? "").split("\n").slice(2, 4).map((frame) => frame.trim().replace(/\(.*\//, "("));
 	throw new Error(`Dream check failed ${frames.join(" ") || "at unknown location"}`);
 }
-function message(error: unknown): string {
-	return Buffer.from(error instanceof Error ? error.message : String(error)).subarray(0, 1000).toString();
-}
 function object(value: unknown): ObjectValue {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return failure();
 	return value as ObjectValue;

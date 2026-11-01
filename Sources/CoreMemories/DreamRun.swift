@@ -175,7 +175,7 @@ public enum DreamPendingReason: String, Sendable {
 }
 
 public enum DreamResumeAction: Sendable {
-  case inspectOrContinue, retryInterruptedCall, replaceInvalidResponse
+  case inspectOrContinue, retryInterruptedCall, replaceInvalidResponse, discardInvalidResponse
 }
 
 public struct DreamRecoveryTarget: Sendable {
@@ -228,6 +228,8 @@ enum DreamPersistenceEvent: Equatable {
 }
 
 public final class DreamRunStore {
+  private static let discardTemporaryPrefix = ".pending-discard-"
+  private static let stateTemporaryPrefix = ".pending-state-"
   private let root: DreamStateDirectory
   private let reviewStateURL: URL
   private let configuredRoots: [URL]
@@ -1209,6 +1211,7 @@ public final class DreamRunStore {
       _ = try DreamRunEncoding.decode(RootBinding.self, bytes: bytes)
       guard bytes == bindingBytes else { throw DreamRunError.unsafeState }
     }
+    try finishInterruptedDiscard()
     var admittedViews: [String: DreamAdmittedView] = [:]
     var retainedBatches: [PreparedSessionBatch] = []
     var priorDreams = PriorDreams()
@@ -1271,7 +1274,8 @@ public final class DreamRunStore {
         name == "\(generation).json", generation <= progress.generation
       else { throw DreamRunError.corruption }
     }
-    if (resume == .replaceInvalidResponse || recoveryTarget != nil),
+    if (resume == .replaceInvalidResponse || resume == .discardInvalidResponse
+      || recoveryTarget != nil),
       !(try admissions.isPresent("\(progress.generation).json"))
     {
       throw DreamRunError.replacementUnavailable
@@ -1377,11 +1381,51 @@ public final class DreamRunStore {
       try save(generation: progress.generation, hash: chain.hash, sealed: sealed)
     }
     if let recoveryTarget {
-      guard resume == .replaceInvalidResponse,
+      guard (resume == .replaceInvalidResponse || resume == .discardInvalidResponse),
         sealed.run.runID == recoveryTarget.runID,
         sealed.request.requestHash == recoveryTarget.requestHash,
         try loadCallSelection(sealed, attempt: ResponseAttempt(number: 0)) == selection
       else { throw DreamRunError.replacementUnavailable }
+    }
+    if resume == .discardInvalidResponse {
+      guard recoveryTarget != nil, sealed.rendering == .priorContextV5,
+        !(try sealed.directory.isPresent("decisions.json")),
+        !(try sealed.directory.isPresent("completion.json")),
+        try sealed.directory.child("receipts").names().isEmpty,
+        try sealed.directory.names().allSatisfy({ DiscardMarker.allowedFiles.contains($0) })
+      else { throw DreamRunError.replacementUnavailable }
+      let attempt = try attemptReader(sealed).verify()
+      guard attempt.attempt.number == 0, let response = attempt.response,
+        case .failure = DreamDecision.assess(
+          response: response, context: sealed.context, rendering: attempt.rendering)
+      else { throw DreamRunError.replacementUnavailable }
+      let marker = DiscardMarker(
+        schemaVersion: 2, runID: sealed.run.runID, generation: progress.generation,
+        requestHash: sealed.request.requestHash.rawValue,
+        admissionHash: sealed.admissionHash.rawValue, chainHash: chain.hash.rawValue)
+      let markerBytes = try bounded(marker)
+      for name in try root.names(isDreamAuthority: true) where name.hasPrefix(Self.discardTemporaryPrefix) {
+        let identifier = String(name.dropFirst(Self.discardTemporaryPrefix.count))
+        guard UUID(uuidString: identifier)?.uuidString.lowercased() == identifier,
+          markerBytes.starts(with: try root.read(name, maximum: markerBytes.count))
+        else { throw DreamRunError.unsafeState }
+        try root.removeVerifiedFile(name)
+      }
+      let clearedState = try bounded(DreamRunEncoding.State(
+        schemaVersion: 2, generation: progress.generation,
+        generationHash: chain.hash.rawValue, admissionHash: nil, runID: nil))
+      let retained = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
+      let available = limits.maximumStateBytes - retained
+      guard markerBytes.count <= available,
+        clearedState.count <= available - markerBytes.count
+      else { throw DreamRunError.limitExceeded }
+      try persist(markerBytes, name: DiscardMarker.name, directory: root, isReplacing: false)
+      try finishInterruptedDiscard()
+      return try runLocked(
+        selection: selection, resume: .inspectOrContinue, recoveryTarget: nil,
+        isLockCreated: false, sourceRoles: sourceRoles,
+        excludedSessionIDs: excludedSessionIDs, prepare: prepare, protect: protect,
+        remainingProtections: remainingProtections, call: call, observe: observe)
     }
     guard sealed.rendering != .scopeV2 else { throw DreamRunError.unsupportedSchema }
     if isRecovered {
@@ -1529,6 +1573,80 @@ public final class DreamRunStore {
     try save(generation: sealed.run.progress.generation, hash: chain.hash)
     try root.child("admissions").remove("\(sealed.run.progress.generation).json")
     return pending(sealed, reason: .droppedBatch)
+  }
+
+  private struct DiscardMarker: Codable {
+    static let name = "discard-invalid.json"
+    static let allowedFiles: Set<String> = [
+      "input.json", "context.json", "request.json", "call-started.json", "response.json",
+      "receipts",
+    ]
+    let schemaVersion: Int
+    let runID: String
+    let generation: UInt64
+    let requestHash: String
+    let admissionHash: String
+    let chainHash: String
+  }
+
+  private func finishInterruptedDiscard() throws {
+    guard try root.isPresent(DiscardMarker.name) else { return }
+    let marker = try DreamRunEncoding.decode(
+      DiscardMarker.self,
+      bytes: root.read(DiscardMarker.name, maximum: DreamRunEncoding.maximumMetadataBytes))
+    guard DreamRunEncoding.isRunID(marker.runID) else { throw DreamRunError.corruption }
+    let chain = try loadChain()
+    guard chain.record.progress.generation == marker.generation,
+      chain.hash.rawValue == marker.chainHash
+    else { throw DreamRunError.corruption }
+    let admissions = try root.child("admissions")
+    let admissionName = "\(marker.generation).json"
+    if try admissions.isPresent(admissionName) {
+      let sealed = try loadAdmission(generation: marker.generation, chain: chain)
+      guard sealed.run.runID == marker.runID,
+        sealed.request.requestHash.rawValue == marker.requestHash,
+        sealed.admissionHash.rawValue == marker.admissionHash,
+        !(try sealed.directory.isPresent("decisions.json")),
+        !(try sealed.directory.isPresent("completion.json")),
+        try sealed.directory.child("receipts").names().isEmpty
+      else { throw DreamRunError.corruption }
+    }
+    let state = try DreamRunEncoding.decode(
+      DreamRunEncoding.State.self,
+      bytes: root.read("state.json", maximum: DreamRunEncoding.maximumMetadataBytes))
+    guard state.generation == marker.generation, state.generationHash == marker.chainHash,
+      (state.runID == marker.runID && state.admissionHash == marker.admissionHash)
+        || (state.runID == nil && state.admissionHash == nil)
+    else { throw DreamRunError.corruption }
+    let runs = try root.child("runs")
+    if try runs.isPresent(marker.runID) {
+      guard try runs.child(marker.runID).names().allSatisfy({
+        DiscardMarker.allowedFiles.contains($0)
+      }) else { throw DreamRunError.corruption }
+    }
+    let clearedState = try bounded(DreamRunEncoding.State(
+      schemaVersion: 2, generation: marker.generation,
+      generationHash: chain.hash.rawValue, admissionHash: nil, runID: nil))
+    for name in try root.names(isDreamAuthority: true) where name.hasPrefix(Self.stateTemporaryPrefix) {
+      let identifier = String(name.dropFirst(Self.stateTemporaryPrefix.count))
+      guard UUID(uuidString: identifier)?.uuidString.lowercased() == identifier,
+        clearedState.starts(with: try root.read(name, maximum: clearedState.count))
+      else { throw DreamRunError.unsafeState }
+      try root.removeVerifiedFile(name)
+    }
+    if state.runID != nil { try save(generation: marker.generation, hash: chain.hash) }
+    try admissions.remove(admissionName)
+    if try runs.isPresent(marker.runID) {
+      let directory = try runs.child(marker.runID)
+      let names = try directory.names()
+      guard names.allSatisfy({ DiscardMarker.allowedFiles.contains($0) }) else {
+        throw DreamRunError.corruption
+      }
+      if names.contains("receipts") { try directory.removeEmptyChild("receipts") }
+      for name in names where name != "receipts" { try directory.removeVerifiedFile(name) }
+      try runs.removeEmptyChild(marker.runID)
+    }
+    try root.remove(DiscardMarker.name)
   }
 
   private func rejectedVersion() throws -> String {
@@ -2515,7 +2633,15 @@ public final class DreamRunStore {
       !isPromptRelocation
         || (directory === root && DreamRelocationRole.allCases.contains(where: { $0.recordName == name }) && !isReplacing)
     else { throw DreamRunError.limitExceeded }
-    let temporary = ".pending-" + UUID().uuidString.lowercased()
+    let prefix: String
+    if directory === root && name == "state.json" {
+      prefix = Self.stateTemporaryPrefix
+    } else if directory === root && name == DiscardMarker.name {
+      prefix = Self.discardTemporaryPrefix
+    } else {
+      prefix = ".pending-"
+    }
+    let temporary = prefix + UUID().uuidString.lowercased()
     let file = openat(
       directory.descriptor, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard file >= 0 else { throw DreamRunError.persistenceFailure }
@@ -2803,6 +2929,33 @@ final class DreamStateDirectory {
     guard unlinkat(descriptor, name, 0) == 0 || errno == ENOENT, fsync(descriptor) == 0 else {
       throw DreamRunError.persistenceFailure
     }
+  }
+
+  func removeVerifiedFile(_ name: String) throws {
+    guard try isPresent(name) else { return }
+    let file = try openFile(name)
+    defer { _ = close(file) }
+    var opened = stat()
+    var named = stat()
+    guard fstat(file, &opened) == 0,
+      fstatat(descriptor, name, &named, AT_SYMLINK_NOFOLLOW) == 0,
+      opened.st_dev == named.st_dev, opened.st_ino == named.st_ino
+    else { throw DreamRunError.unsafeState }
+    try remove(name)
+  }
+
+  func removeEmptyChild(_ name: String) throws {
+    guard try isPresent(name) else { return }
+    let directory = try child(name)
+    guard try directory.names().isEmpty else { throw DreamRunError.unsafeState }
+    var opened = stat()
+    var named = stat()
+    guard fstat(directory.descriptor, &opened) == 0,
+      fstatat(descriptor, name, &named, AT_SYMLINK_NOFOLLOW) == 0,
+      opened.st_dev == named.st_dev, opened.st_ino == named.st_ino,
+      unlinkat(descriptor, name, AT_REMOVEDIR) == 0,
+      fsync(descriptor) == 0
+    else { throw DreamRunError.persistenceFailure }
   }
 
   func openReadLock() throws -> Int32 { try openFile("writer.lock") }

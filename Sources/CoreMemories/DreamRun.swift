@@ -170,8 +170,8 @@ public enum DreamTransactionResult: Sendable {
 }
 
 public enum DreamPendingReason: String, Sendable {
-  case interruptedCall, cancelled, callbackFailure, invalidDecision, staleUnpublishedPlans,
-    droppedBatch
+  case interruptedCall, recoveryApprovalRequired, cancelled, callbackFailure, invalidDecision,
+    staleUnpublishedPlans, droppedBatch
 }
 
 public enum DreamResumeAction: Sendable {
@@ -1379,7 +1379,8 @@ public final class DreamRunStore {
     if let recoveryTarget {
       guard resume == .replaceInvalidResponse,
         sealed.run.runID == recoveryTarget.runID,
-        sealed.request.requestHash == recoveryTarget.requestHash
+        sealed.request.requestHash == recoveryTarget.requestHash,
+        try loadCallSelection(sealed, attempt: ResponseAttempt(number: 0)) == selection
       else { throw DreamRunError.replacementUnavailable }
     }
     guard sealed.rendering != .scopeV2 else { throw DreamRunError.unsupportedSchema }
@@ -1457,9 +1458,14 @@ public final class DreamRunStore {
         !(try sealed.directory.isPresent("completion.json"))
       else { throw DreamRunError.missingPayload }
       if isCancelled() { return pending(sealed, reason: .cancelled) }
+      let prepared = try verifiedAttempt(sealed, attempt: attempt)
       if try sealed.directory.isPresent(attempt.callName) {
         let callSelection = try loadCallSelection(sealed, attempt: attempt)
-        if resume == .retryInterruptedCall ? callSelection != selection : !isReplacementStarted {
+        if prepared.replacement?.schemaVersion == 4 {
+          if resume != .replaceInvalidResponse || callSelection != selection {
+            return pending(sealed, reason: .recoveryApprovalRequired, callSelection: callSelection)
+          }
+        } else if resume == .retryInterruptedCall ? callSelection != selection : !isReplacementStarted {
           return pending(sealed, reason: .interruptedCall, callSelection: callSelection)
         }
       } else if attempt.number > 0, !isReplacementStarted, resume != .retryInterruptedCall {
@@ -1471,7 +1477,6 @@ public final class DreamRunStore {
           try persist(bytes, name: name, directory: sealed.directory, isReplacing: false)
         }
       }
-      let prepared = try verifiedAttempt(sealed, attempt: attempt)
       let request = try attemptReader(sealed).request(
         attempt: attempt, replacement: prepared.replacement,
         replacementHash: prepared.replacementHash, selection: selection)

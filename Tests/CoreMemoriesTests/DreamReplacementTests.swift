@@ -130,6 +130,17 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
       prepare: transactionUncalledPrepare, call: transactionUncalled)
   }
   #expect(try fixture.snapshot(fixture.state) == unchanged)
+  let differentModel = try DreamSelectedCall(
+    provider: fixture.selection.provider, modelID: "another-model",
+    thinkingLevel: fixture.selection.thinkingLevel)
+  #expect(throws: DreamRunError.replacementUnavailable) {
+    try fixture.store().run(
+      selection: differentModel, resume: .replaceInvalidResponse,
+      recoveryTarget: DreamRecoveryTarget(
+        runID: rejected.runID, requestHash: SourceDigest(bytes: originalRequest).rawValue),
+      prepare: transactionUncalledPrepare, call: transactionUncalled)
+  }
+  #expect(try fixture.snapshot(fixture.state) == unchanged)
   var successor: DreamModelRequest?
   let interrupted = try transactionPending(
     fixture.store().run(
@@ -165,9 +176,21 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
       prepare: transactionUncalledPrepare, call: transactionUncalled)
   }
   try originalIntent.write(to: intentURL)
+  let interruptedState = try fixture.snapshot(fixture.state)
+  for action in [DreamResumeAction.inspectOrContinue, .retryInterruptedCall] {
+    let approval = try transactionPending(
+      fixture.store().run(
+        selection: fixture.selection, resume: action,
+        prepare: transactionUncalledPrepare, call: transactionUncalled),
+      reason: .recoveryApprovalRequired)
+    #expect(approval.runID == rejected.runID)
+    #expect(try fixture.snapshot(fixture.state) == interruptedState)
+  }
   let completed = try transactionCompleted(
     fixture.store().run(
-      selection: fixture.selection, resume: .retryInterruptedCall,
+      selection: fixture.selection, resume: .replaceInvalidResponse,
+      recoveryTarget: DreamRecoveryTarget(
+        runID: rejected.runID, requestHash: SourceDigest(bytes: originalRequest).rawValue),
       prepare: transactionUncalledPrepare,
       call: { repeated in
         #expect(repeated.requestHash == request.requestHash)

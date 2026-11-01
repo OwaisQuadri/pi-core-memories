@@ -851,7 +851,7 @@ test("an unreadable or hanging queue skips the pending reminder without failing 
 	}
 });
 
-test("a slow pending reminder keeps its own worker alive past the turn's wait and reaches the next turn", async () => {
+test("a slow pending reminder keeps its own worker alive past the turn's wait and through user input, and reaches the next turn", async () => {
 	const signals: AbortSignal[] = [];
 	let lists = 0;
 	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
@@ -872,6 +872,9 @@ test("a slow pending reminder keeps its own worker alive past the turn's wait an
 		const turn = reminderTurns(f);
 		assert.equal((await turn()).reminder, undefined);
 		await sleep(30);
+		await f.emit("input", { text: "Next request.", source: "interactive" });
+		await sleep(0);
+		assert.equal(lists, 1);
 		assert.equal(signals.length, 1); assert.equal(signals[0]!.aborted, false);
 		release();
 		await sleep(0);
@@ -908,17 +911,6 @@ test("a memory tool call stops a hanging pending reminder read instead of waitin
 		assert.equal((await reminderTurns(f)()).reminder, undefined);
 		assert.equal(reminder.signal?.aborted, false);
 		await promptly(f.tool.execute("during-reminder", { operation: "pending" }, undefined, undefined, f.ctx));
-		assert.equal(reminder.signal?.aborted, true); assert.equal(reminder.isClosed, true);
-	} finally { await f.stop(); }
-});
-
-test("user input stops a hanging pending reminder read and its worker", async () => {
-	const { f, reminder } = hangingReminderRuntime();
-	try {
-		await f.emit("session_start");
-		await reminderTurns(f)();
-		await f.emit("input", { text: "Next request.", source: "interactive" });
-		await sleep(0);
 		assert.equal(reminder.signal?.aborted, true); assert.equal(reminder.isClosed, true);
 	} finally { await f.stop(); }
 });

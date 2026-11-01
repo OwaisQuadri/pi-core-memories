@@ -510,7 +510,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			const leaf = ctx.sessionManager.getBranch().at(-1);
 			if (entry && leaf) observedReply = { proposalId: state.proposalId, proposalEntryId: entry.id, previousLeafId: leaf.id, text: event.text, isRunStarted: false };
 		}
-		foreground?.abort(); abortReminderRead(); failures = 0; schedule();
+		foreground?.abort(); failures = 0; schedule();
 	});
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (observedReply) {

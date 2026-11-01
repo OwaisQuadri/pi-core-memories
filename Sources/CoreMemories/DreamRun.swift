@@ -228,6 +228,7 @@ enum DreamPersistenceEvent: Equatable {
 }
 
 public final class DreamRunStore {
+  private static let discardTemporaryPrefix = ".pending-discard-"
   private static let stateTemporaryPrefix = ".pending-state-"
   private let root: DreamStateDirectory
   private let reviewStateURL: URL
@@ -1403,6 +1404,13 @@ public final class DreamRunStore {
         requestHash: sealed.request.requestHash.rawValue,
         admissionHash: sealed.admissionHash.rawValue, chainHash: chain.hash.rawValue)
       let markerBytes = try bounded(marker)
+      for name in try root.names(isDreamAuthority: true) where name.hasPrefix(Self.discardTemporaryPrefix) {
+        let identifier = String(name.dropFirst(Self.discardTemporaryPrefix.count))
+        guard UUID(uuidString: identifier)?.uuidString.lowercased() == identifier,
+          markerBytes.starts(with: try root.read(name, maximum: markerBytes.count))
+        else { throw DreamRunError.unsafeState }
+        try root.removeVerifiedFile(name)
+      }
       let clearedState = try bounded(DreamRunEncoding.State(
         schemaVersion: 2, generation: progress.generation,
         generationHash: chain.hash.rawValue, admissionHash: nil, runID: nil))
@@ -2625,8 +2633,14 @@ public final class DreamRunStore {
       !isPromptRelocation
         || (directory === root && DreamRelocationRole.allCases.contains(where: { $0.recordName == name }) && !isReplacing)
     else { throw DreamRunError.limitExceeded }
-    let prefix = directory === root && name == "state.json"
-      ? Self.stateTemporaryPrefix : ".pending-"
+    let prefix: String
+    if directory === root && name == "state.json" {
+      prefix = Self.stateTemporaryPrefix
+    } else if directory === root && name == DiscardMarker.name {
+      prefix = Self.discardTemporaryPrefix
+    } else {
+      prefix = ".pending-"
+    }
     let temporary = prefix + UUID().uuidString.lowercased()
     let file = openat(
       directory.descriptor, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)

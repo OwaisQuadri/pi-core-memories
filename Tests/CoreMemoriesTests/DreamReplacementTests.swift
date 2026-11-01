@@ -334,6 +334,79 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
     atPath: fixture.state.appendingPathComponent("discard-invalid.json").path))
 }
 
+@Test func interruptedMarkerWriteAtCapacityNeedsApprovedRetry() throws {
+  struct Marker: Encodable {
+    let schemaVersion: Int
+    let runID: String
+    let generation: UInt64
+    let requestHash: String
+    let admissionHash: String
+    let chainHash: String
+  }
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let pending = try transactionPending(
+    fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) }) {
+      request in
+      let source = (try transactionObject(request)["primaryEvidence"] as! [[String: Any]])[0]["source"]!
+      return try transactionResponse(request, decisions: [[
+        "kind": "noChange", "sources": [source], "reasonCode": "unresolvedScope",
+        "explanation": "Synthetic invalid scope decision.",
+      ]])
+    }, reason: .invalidDecision)
+  try freezeV5Request(fixture)
+  let requestHash = SourceDigest(bytes: try Data(contentsOf: fixture.payload("request.json"))).rawValue
+  let admissionHash = SourceDigest(bytes: try Data(contentsOf:
+    fixture.state.appendingPathComponent("admissions/0.json"))).rawValue
+  let chainHash = SourceDigest(bytes: try Data(contentsOf:
+    fixture.state.appendingPathComponent("generations/0.json"))).rawValue
+  let markerSize = try DreamRunEncoding.encode(Marker(
+    schemaVersion: 2, runID: pending.runID, generation: 0,
+    requestHash: requestHash, admissionHash: admissionHash, chainHash: chainHash)).count
+  let clearedSize = try DreamRunEncoding.encode(DreamRunEncoding.State(
+    schemaVersion: 2, generation: 0, generationHash: chainHash,
+    admissionHash: nil, runID: nil)).count
+  let retained = try fixture.snapshot(fixture.state).values.reduce(0) { $0 + $1.bytes.count }
+  let limits = try DreamRunLimits(maximumStateBytes: retained + markerSize + clearedSize)
+  let target = try DreamRecoveryTarget(runID: pending.runID, requestHash: requestHash)
+  let store = try fixture.store(limits: limits)
+  store.persistenceFault = {
+    if $0 == .beforeInstall("discard-invalid.json") { throw POSIXError(.EIO) }
+  }
+  #expect(throws: DreamRunError.persistenceFailure) {
+    try store.run(
+      selection: fixture.selection, resume: .discardInvalidResponse,
+      recoveryTarget: target, prepare: transactionUncalledPrepare, call: transactionUncalled)
+  }
+  #expect(!FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("discard-invalid.json").path))
+  #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.state.path)
+    .filter { $0.hasPrefix(".pending-discard-") }.count == 1)
+  let inspection = try fixture.store(limits: limits).run(
+    selection: fixture.selection, prepare: transactionUncalledPrepare,
+    call: transactionUncalled)
+  guard case .pending(let preserved) = inspection else {
+    Issue.record("An unapproved inspection must leave the pending run intact")
+    return
+  }
+  #expect(preserved.runID == pending.runID)
+  #expect(FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("runs/\(pending.runID)").path))
+  #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.state.path)
+    .filter { $0.hasPrefix(".pending-discard-") }.count == 1)
+  #expect(throws: CancellationError.self) {
+    try fixture.store(limits: limits).run(
+      selection: fixture.selection, resume: .discardInvalidResponse,
+      recoveryTarget: target, prepare: { _ in throw CancellationError() },
+      call: transactionUncalled)
+  }
+  #expect(!FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("runs/\(pending.runID)").path))
+  #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.state.path)
+    .filter { $0.hasPrefix(".pending-discard-") }.isEmpty)
+}
+
 @Test func interruptedStateWriteAtCapacityCanFinishDiscard() throws {
   struct Marker: Encodable {
     let schemaVersion: Int

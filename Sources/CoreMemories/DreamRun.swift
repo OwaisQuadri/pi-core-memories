@@ -1401,7 +1401,16 @@ public final class DreamRunStore {
         schemaVersion: 2, runID: sealed.run.runID, generation: progress.generation,
         requestHash: sealed.request.requestHash.rawValue,
         admissionHash: sealed.admissionHash.rawValue, chainHash: chain.hash.rawValue)
-      try install(marker, name: DiscardMarker.name, directory: root)
+      let markerBytes = try bounded(marker)
+      let clearedState = try bounded(DreamRunEncoding.State(
+        schemaVersion: 2, generation: progress.generation,
+        generationHash: chain.hash.rawValue, admissionHash: nil, runID: nil))
+      let retained = try root.retainedBytes(maximum: limits.maximumStateBytes, isDreamAuthority: true)
+      let available = limits.maximumStateBytes - retained
+      guard markerBytes.count <= available,
+        clearedState.count <= available - markerBytes.count
+      else { throw DreamRunError.limitExceeded }
+      try persist(markerBytes, name: DiscardMarker.name, directory: root, isReplacing: false)
       try finishInterruptedDiscard()
       return try runLocked(
         selection: selection, resume: .inspectOrContinue, recoveryTarget: nil,

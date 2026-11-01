@@ -11,32 +11,75 @@ package enum DreamSourceProtection {
   package static let maximumOutputBytes = 8_388_608
   static let maximumSplitRecordBytes = 2 * maximumPieceBytes
   static let maximumContextBytes = maximumPieceBytes
+  static let splitBoundaryBytes = 4_096
 
-  static func parts(_ text: String) -> [String] {
-    let bytes = Array(text.utf8)
-    guard bytes.count > maximumPieceBytes else { return [text] }
-    let count = (bytes.count + maximumPieceBytes - 5) / (maximumPieceBytes - 4)
-    var cuts = [0]
-    for part in 1..<count {
-      var cut = bytes.count * part / count
-      while cut < bytes.count, bytes[cut] & 0xC0 == 0x80 { cut += 1 }
-      cuts.append(cut)
-    }
-    cuts.append(bytes.count)
-    return zip(cuts, cuts.dropFirst()).map { String(decoding: bytes[$0..<$1], as: UTF8.self) }
+  struct SplitText {
+    let parts: [String]
+    let boundaries: [String]
+
+    var pieces: [String] { parts + boundaries }
   }
 
-  static func checkedRecords(_ records: [Data], admit: ([String]) throws -> [String]) throws
-    -> [Data]
-  {
-    let parts = try records.map { parts(try text($0)) }
-    let pending = parts.flatMap { $0 }
+  static func split(_ text: String) -> SplitText {
+    let bytes = Array(text.utf8)
+    guard bytes.count > maximumPieceBytes else { return SplitText(parts: [text], boundaries: []) }
+    func aligned(_ offset: Int, isForward: Bool) -> Int {
+      var offset = offset
+      while offset > 0, offset < bytes.count, bytes[offset] & 0xC0 == 0x80 {
+        offset += isForward ? 1 : -1
+      }
+      return offset
+    }
+    let count = (bytes.count + maximumPieceBytes - 5) / (maximumPieceBytes - 4)
+    let cuts = (1..<count).map { aligned(bytes.count * $0 / count, isForward: true) }
+    let edges = [0] + cuts + [bytes.count]
+    let windows = cuts.map {
+      aligned(max(0, $0 - splitBoundaryBytes), isForward: false)..<aligned(
+        min(bytes.count, $0 + splitBoundaryBytes), isForward: true)
+    }
+    return SplitText(
+      parts: zip(edges, edges.dropFirst()).map {
+        String(decoding: bytes[$0..<$1], as: UTF8.self)
+      },
+      boundaries: windows.map { String(decoding: bytes[$0], as: UTF8.self) })
+  }
+
+  static func isJoinChecked(left: String, right: String, boundary: String) -> Bool {
+    let left = Array(left.utf8)
+    let right = Array(right.utf8)
+    let boundary = Array(boundary.utf8)
+    return (0...boundary.count).contains { split in
+      split <= left.count && boundary.count - split <= right.count
+        && left.suffix(split).elementsEqual(boundary.prefix(split))
+        && right.prefix(boundary.count - split).elementsEqual(boundary.suffix(
+          boundary.count - split))
+    }
+  }
+
+  static func checkedRecords(
+    _ records: [(bytes: Data, stub: Data)], admit: ([String]) throws -> [String]
+  ) throws -> [(bytes: Data, isStub: Bool)] {
+    let requests = try records.map { record in
+      let split = split(try text(record.bytes))
+      return (split: split, stub: split.boundaries.isEmpty ? [] : [try text(record.stub)])
+    }
+    let pending = requests.flatMap { $0.split.pieces + $0.stub }
     let checked = pending.isEmpty ? [] : try admit(pending)
     guard checked.count == pending.count else { throw DreamSourceProtectionError.invalidReply }
     var offset = 0
-    return parts.map { record in
-      defer { offset += record.count }
-      return Data(checked[offset..<offset + record.count].joined().utf8)
+    func take(_ count: Int) -> ArraySlice<String> {
+      defer { offset += count }
+      return checked[offset..<offset + count]
+    }
+    return requests.map { request in
+      let parts = Array(take(request.split.parts.count))
+      let boundaries = Array(take(request.split.boundaries.count))
+      let stub = take(request.stub.count)
+      let isJoined = boundaries.indices.allSatisfy {
+        isJoinChecked(left: parts[$0], right: parts[$0 + 1], boundary: boundaries[$0])
+      }
+      guard !isJoined, let stub = stub.first else { return (Data(parts.joined().utf8), false) }
+      return (Data(stub.utf8), true)
     }
   }
 
@@ -120,6 +163,13 @@ package enum DreamSourceProtection {
     return text
   }
 
+  static func pieces(_ view: DreamAdmittedView) throws -> [String] {
+    try view.records.flatMap {
+      split(try text(view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd))))
+        .pieces
+    }
+  }
+
   static func pieces(_ batch: PreparedSessionBatch) throws -> [String] {
     if batch.admittedViews.isEmpty {
       try requireAdmissibleReadProvenance(
@@ -128,11 +178,7 @@ package enum DreamSourceProtection {
           return try JSONSerialization.jsonObject(with: bytes) as? [String: Any]
         })
     }
-    var pieces: [String] = try batch.admittedViews.flatMap { view in
-      try view.records.flatMap {
-        parts(try text(view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd))))
-      }
-    }
+    var pieces: [String] = try batch.admittedViews.flatMap { try Self.pieces($0) }
     for position in batch.positionsAfter { pieces.append(position.relativePath.rawValue) }
     for record in batch.exactSourceRecords {
       if let bytes = record.bytes { pieces.append(try text(bytes)) }

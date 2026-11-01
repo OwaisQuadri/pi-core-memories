@@ -392,18 +392,36 @@ private func admittedWindows(
     "a1", "SYNTHETIC_SECRET " + String(repeating: "\u{E9}", count: 750_000))
   try fixture.append(parted)
   try fixture.append(try assistantThinking("a2", String(repeating: "x", count: 2_200_000)))
+  try fixture.append(
+    try sessionLine([
+      "type": "message", "id": "a3", "timestamp": dreamOld,
+      "message": [
+        "role": "assistant",
+        "content": [
+          ["type": "toolCall", "id": "read3", "name": "read", "arguments": ["path": ".env"]]
+        ],
+      ],
+    ]))
+  try fixture.append(
+    try sessionLine([
+      "type": "message", "id": "r3", "timestamp": dreamOld,
+      "message": [
+        "role": "toolResult", "toolCallId": "read3", "toolName": "read", "isError": false,
+        "content": [["type": "text", "text": String(repeating: "y", count: 2_200_000)]],
+      ],
+    ]))
   try fixture.append(dreamUser("u2", nil, dreamOld, "Prefer dark mode.") + "\n")
   var sent: [String] = []
   var relations: [(record: DreamAdmittedView.Record, piece: Data)] = []
   var limitations: [String] = []
   var evidence: [String] = []
   _ = try admittedWindows(fixture, isReplayChecked: true, inspect: { sent += $0 }) {
-    progress, _, batch in
+    _, _, batch in
     let view = batch.admittedViews[0]
     relations += view.records.map {
       ($0, view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd)))
     }
-    limitations += try batch.admissionLimitations(after: progress)
+    limitations += batch.admissionLimitations
     evidence += batch.evidence.map(\.exactText)
   }
   #expect(sent.allSatisfy { $0.utf8.count <= DreamSourceProtection.maximumPieceBytes })
@@ -427,4 +445,98 @@ private func admittedWindows(
       "1 source records larger than 2097152 bytes were omitted; only their identity was kept.",
     ])
   #expect(evidence.contains("Prefer dark mode."))
+}
+
+@Test func admittedWindowsOmitARecordWhoseSecretCrossesASplitPoint() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: ["Use green buttons."])
+  let filler = try assistantThinking("a1", String(repeating: "x", count: 1_500_000))
+  let cut = filler.utf8.count / 2
+  let secretStart = try #require(filler.range(of: "xxxx")).lowerBound
+  let offset = cut - 8 - filler.utf8.distance(from: filler.utf8.startIndex, to: secretStart)
+  let thinking =
+    String(repeating: "x", count: offset) + "SYNTHETIC_SECRET"
+    + String(repeating: "x", count: 1_500_000 - offset - 16)
+  let straddling = try assistantThinking("a1", thinking)
+  #expect(straddling.utf8.count == filler.utf8.count)
+  try fixture.append(straddling)
+  try fixture.append(dreamUser("u2", nil, dreamOld, "Prefer dark mode.") + "\n")
+  var admitted = Data()
+  var limitations: [String] = []
+  var isOmitted = false
+  _ = try admittedWindows(fixture) { _, _, batch in
+    let view = batch.admittedViews[0]
+    admitted.append(view.bytes)
+    limitations += batch.admissionLimitations
+    if view.records.contains(where: {
+      $0.isOmitted && $0.originalEnd - $0.originalStart == UInt64(straddling.utf8.count)
+    }) {
+      isOmitted = true
+    }
+  }
+  let text = String(decoding: admitted, as: UTF8.self)
+  let isFragmentAdmitted = text.contains("SYNTHETI") || text.contains("C_SECRET")
+  #expect(!isFragmentAdmitted)
+  #expect(isOmitted)
+  #expect(
+    limitations == [
+      "1 source records had a redaction at a split point and were omitted; only their identity was kept."
+    ])
+}
+
+@Test func admittedWindowsDropUnchangedViewsThatNoLongerFitTheSourceCheck() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let folder = fixture.source.deletingLastPathComponent()
+  var sizes: [String: UInt64] = [:]
+  for name in ["one", "two"] {
+    var lines = [
+      dreamHeader(name, cwd: fixture.root.path, name: nil) + "\n",
+      dreamUser("u-\(name)", nil, dreamOld, "Prefer \(name) mode.") + "\n",
+    ]
+    for index in 0..<18 {
+      lines.append(try assistantThinking("a\(index)", String(repeating: "x", count: 56_000)))
+    }
+    lines.append(try assistantThinking("big", String(repeating: "z", count: 1_900_000)))
+    let file = folder.appendingPathComponent("\(name).jsonl")
+    try fixture.write(lines.joined(), file: file)
+    sizes["--fixture--/\(name).jsonl"] = UInt64(lines.joined().utf8.count)
+    try FileManager.default.setAttributes(
+      [.modificationDate: Date().addingTimeInterval(name == "one" ? -86_400 : -3_600)],
+      ofItemAtPath: file.path)
+  }
+  var progress = try DreamProgress()
+  var priorByPath: [String: DreamAdmittedView] = [:]
+  var isDropSeen = false
+  var evidence: [String] = []
+  for _ in 0..<32 {
+    let batch = try admittedBatch(
+      fixture, progress: progress, prior: Array(priorByPath.values))
+    if batch.exactSourceRecords.isEmpty { break }
+    try DreamRunEncoding.validate(progress: progress, batch: batch, limits: DreamRunLimits())
+    let pieces = try DreamSourceProtection.pieces(batch)
+    try DreamSourceProtection.validate(
+      pieces, maximumBytes: DreamSourceProtection.maximumInputBytes)
+    let checkedBytes = pieces.reduce(0) { $0 + $1.utf8.count }
+    for (path, view) in priorByPath
+    where !batch.admittedViews.contains(where: { $0.path == path })
+      && progress.positions.contains(where: {
+        $0.relativePath.rawValue == path && $0.completeBytes == sizes[path]
+      })
+    {
+      isDropSeen = true
+      let droppedBytes = try DreamSourceProtection.pieces(view).reduce(0) { $0 + $1.utf8.count }
+      #expect(checkedBytes + droppedBytes > DreamSourceProtection.maximumInputBytes)
+    }
+    for view in batch.admittedViews {
+      if let previous = priorByPath[view.path] { try view.requireExtension(of: previous) }
+      priorByPath[view.path] = view
+    }
+    evidence += batch.evidence.map(\.exactText)
+    progress = try DreamProgress(
+      generation: progress.generation + 1, positions: batch.positionsAfter)
+  }
+  #expect(isDropSeen)
+  #expect(Set(evidence).isSuperset(of: ["Prefer one mode.", "Prefer two mode."]))
 }

@@ -231,50 +231,7 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
 extension PreparedSessionBatch {
   var admittedViews: [DreamAdmittedView] { provenance?.admittedViews ?? [] }
 
-  func admissionLimitations(after progress: DreamProgress) throws -> [String] {
-    var imageRecords = 0
-    var partRecords = 0
-    var omittedRecords = 0
-    for view in admittedViews {
-      let cursor =
-        progress.positions.first { $0.relativePath.rawValue == view.path }?.completeBytes ?? 0
-      for record in view.records where record.originalStart >= cursor {
-        if record.isOmitted {
-          if record.originalEnd - record.originalStart
-            > UInt64(DreamSourceProtection.maximumSplitRecordBytes)
-          {
-            omittedRecords += 1
-          }
-          continue
-        }
-        let piece = view.bytes.subdata(in: Int(record.admittedStart)..<Int(record.admittedEnd))
-        if piece.count > DreamSourceProtection.maximumPieceBytes { partRecords += 1 }
-        let object = try SessionReader.decodeRecord(piece) as? [String: Any]
-        let blocks =
-          (object?["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
-        if blocks.contains(where: { $0["type"] as? String == "image" && $0.count == 1 }) {
-          imageRecords += 1
-        }
-      }
-    }
-    var limitations: [String] = []
-    if imageRecords > 0 {
-      limitations.append(
-        "Image data was removed from \(imageRecords) source records before source checks; their text was kept."
-      )
-    }
-    if partRecords > 0 {
-      limitations.append(
-        "\(partRecords) source records larger than \(DreamSourceProtection.maximumPieceBytes) bytes were checked in parts."
-      )
-    }
-    if omittedRecords > 0 {
-      limitations.append(
-        "\(omittedRecords) source records larger than \(DreamSourceProtection.maximumSplitRecordBytes) bytes were omitted; only their identity was kept."
-      )
-    }
-    return limitations
-  }
+  var admissionLimitations: [String] { provenance?.admissionLimitations ?? [] }
 
   func admittedProgress(_ progress: DreamProgress) throws -> DreamProgress {
     try DreamProgress(

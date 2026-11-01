@@ -2,10 +2,9 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { AssistantMessage, AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DreamRequest, DreamSelection, DreamStart } from "./dream.ts";
-type SubscriptionSimpleStreamOptions = NonNullable<Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2]> & { onDispatch?: (physical: { provider: string; modelID: string; api: string }) => void };
 
 import { tuiURL } from "./test/host.ts";
 const dream = await import("./dream.ts");
@@ -19,12 +18,12 @@ const model = { provider: "openai", id: "selected", api: "openai-responses" } as
 function message(change: Partial<AssistantMessage> = {}): AssistantMessage {
 	return { role: "assistant", provider: selection.provider, model: selection.modelID, api: "openai-responses", content: [{ type: "text", text: " {" }, { type: "thinking", thinking: "not decision JSON" }, { type: "text", text: "🌱} \n" }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, ...change };
 }
-function registry(events: AssistantMessageEvent[], result = message()) {
+const subscription = { isUsingOAuth: () => true, getProvider: () => ({ auth: { oauth: { isSubscription: true } } }) };
+function registry(result = message()) {
 	const calls: { model: unknown; context: Context; options: unknown }[] = [];
-	const ctx = { modelRegistry: { streamSubscriptionSimple(current: typeof model, context: Context, options: SubscriptionSimpleStreamOptions) {
+	const ctx = { modelRegistry: { ...subscription, streamSimple(current: typeof model, context: Context, options: unknown) {
 		calls.push({ model: current, context, options });
-		options.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
-		return { async *[Symbol.asyncIterator]() { yield* events; }, result: async () => result };
+		return { result: async () => result };
 	} } } as unknown as ExtensionContext;
 	return { ctx, calls };
 }
@@ -49,176 +48,58 @@ test("a recorded call selection is accepted only in its exact shape on a pending
 	assert.throws(() => dream.dreamReport({ ...pending, callSelection: null }, start));
 });
 
-test("subscription registry receives only pinned bytes and timestamps, captured model, and transport-only off mapping", async () => {
+test("registry streamSimple receives only pinned bytes and timestamps, captured model, and transport-only off mapping", async () => {
 	for (const level of ["off", "medium"]) {
 		const captured = { ...selection, thinkingLevel: level };
-		const f = registry([{ type: "done", reason: "stop", message: message() }]);
+		const f = registry();
 		const signal = new AbortController().signal;
 		assert.equal(await dream.callDreamModel({ ...request, selection: captured }, f.ctx, model, captured, signal), " {🌱} \n");
 		assert.equal(f.calls.length, 1); assert.strictEqual(f.calls[0].model, model);
 		assert.deepEqual(f.calls[0].context, { systemPrompt: request.systemPrompt, messages: [{ role: "user", content: request.messages[0].text, timestamp: 0 }] });
-		assert.deepEqual(Object.keys(f.calls[0].options as object).sort(), ["onDispatch", "reasoning", "signal"]);
+		assert.deepEqual(Object.keys(f.calls[0].options as object).sort(), ["reasoning", "signal"]);
+		assert.strictEqual((f.calls[0].options as { signal?: AbortSignal }).signal, signal);
 		assert.equal((f.calls[0].options as { reasoning?: string }).reasoning, level === "off" ? undefined : level);
 		assert.equal(request.selection.thinkingLevel, "off");
 	}
 });
 
-const incompleteCauses = {
-	length: "response reached the output token limit", toolUse: "unexpected tool call", error: "provider error (no error message)",
-	aborted: "provider aborted the response (no error message)", pending: "response is pending", deferred: "response was deferred",
-};
-for (const reason of ["length", "toolUse", "error", "aborted", "pending", "deferred"] as const) test(`registry explains ${reason} terminal and final failures without accepting incomplete text`, async () => {
-	const reply = message({ stopReason: reason });
-	const event = reason === "error" || reason === "aborted" ? { type: "error", reason, error: reply } : { type: "done", reason, message: reply };
-	for (const events of [[event as AssistantMessageEvent], [{ type: "done", reason: "stop", message: message() } as AssistantMessageEvent]]) {
-		const f = registry(events, reply);
-		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${incompleteCauses[reason]}` });
-	}
-});
-
-test("provider error events retain only bounded errorMessage, not response content or payload fields", async () => {
+test("a stop reason other than stop reports the stop reason and bounded errorMessage, not response content", async () => {
 	const forbidden = new Proxy([], { get: () => assert.fail("Error content must not be inspected"), ownKeys: () => assert.fail("Error content must not be serialized") });
-	for (const reason of ["error", "aborted"] as const) {
-		const reply = message({ stopReason: reason, errorMessage: "fixture quota exceeded", content: forbidden });
-		for (const events of [[{ type: "error", reason, error: reply }], [{ type: "done", reason: "stop", message: message() }]] as AssistantMessageEvent[][]) {
-			const f = registry(events, reply);
-			await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${reason === "error" ? "provider error" : "provider aborted the response"}: fixture quota exceeded` });
-		}
+	for (const [errorMessage, cause] of [["fixture quota exceeded", "error: fixture quota exceeded"], [undefined, "error: no error message"]] as const) {
+		const f = registry(message({ stopReason: "error", errorMessage, content: forbidden }));
+		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${cause}` });
 	}
 	const reply = message({ stopReason: "error", errorMessage: "fixture failure\0\u001b[31m\u202e" + "🌱".repeat(1000) + "OMITTED", content: forbidden });
-	const f = registry([{ type: "error", reason: "error", error: reply }], reply);
+	const f = registry(reply);
 	await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), (error: Error) => {
 		assert.ok(Buffer.byteLength(error.message) < 1000);
-		assert.ok(error.message.startsWith("Dream model call failed: provider error: fixture failure\\u{0}\\u{1B}[31m\\u{202E}"));
+		assert.ok(error.message.startsWith("Dream model call failed: error: fixture failure\\u{0}\\u{1B}[31m\\u{202E}"));
 		assert.ok(!error.message.includes("OMITTED"));
 		const report = dream.dreamReport({ ...final, status: "pending", runID: "run", base: "b".repeat(40), reason: "callbackFailure", detail: `Model call: ${error.message}` }, start);
 		assert.ok(dream.dreamReviewText(report).includes(`Cause: ${report.detail}`));
 		return true;
 	});
-	for (const errorMessage of [undefined, "", "  ", { toString: () => assert.fail("Non-text error must not be serialized") }] as unknown as (string | undefined)[]) {
-		const reply = message({ stopReason: "error", errorMessage, content: forbidden });
-		const f = registry([{ type: "error", reason: "error", error: reply }], reply);
-		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: provider error (no error message)" });
+});
+
+test("an empty or oversized response is refused", async () => {
+	for (const content of [[{ type: "toolCall", id: "x", name: "write", arguments: {} }], [{ type: "text", text: "x".repeat(262145) }]] as AssistantMessage["content"][]) {
+		const f = registry(message({ content }));
+		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: empty or oversized response" });
 	}
 });
 
-test("unexpected tool-call events explain rejection without reading tool names or arguments", async () => {
-	const forbidden = new Proxy({ type: "toolCall" as const, id: "fixture", name: "fixture", arguments: {} }, { get: () => assert.fail("Tool payload must not be inspected"), ownKeys: () => assert.fail("Tool payload must not be serialized") });
-	for (const type of ["toolcall_start", "toolcall_delta", "toolcall_end"] as const) {
-		const f = registry([{ type, contentIndex: 0, partial: message({ content: [forbidden] }), toolCall: forbidden, delta: "" } as AssistantMessageEvent]);
-		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: unexpected tool call" });
+test("only a subscription sign-in reaches streamSimple, so dreaming never bills an API key", async () => {
+	for (const [current, change] of [
+		[model, { isUsingOAuth: () => false }],
+		[model, { getProvider: () => ({ auth: { oauth: { isSubscription: false } } }) }],
+		[{ ...model, api: "pi-virtual" }, {}],
+	] as [typeof model, object][]) {
+		const ctx = { modelRegistry: { ...subscription, ...change, streamSimple: () => assert.fail("A non-subscription route must not be dispatched") } } as unknown as ExtensionContext;
+		await assert.rejects(dream.callDreamModel(request, ctx, current, selection, new AbortController().signal), { message: "Dream model call failed: the selected model is not using a subscription sign-in; nothing was dispatched" });
 	}
 });
 
-for (const [change, cause] of [
-	[{ provider: "other" }, "response identity does not match the dispatched model"],
-	[{ model: "other" }, "response identity does not match the dispatched model"],
-	[{ content: [] }, "response contained no text"],
-	[{ content: [{ type: "toolCall", id: "x", name: "write", arguments: {} }] }, "unexpected non-text response content"],
-	[{ content: [{ type: "text", text: "x".repeat(262145) }] }, "response exceeded the 262144-byte text limit"],
-	[{ content: [{ type: "text", text: "\ud800" }] }, "response text contains invalid Unicode"],
-] as [Partial<AssistantMessage>, string][]) test(`registry explains invalid result: ${cause}`, async () => {
-	const reply = message(change);
-	const f = registry([{ type: "done", reason: "stop", message: reply }], reply);
-	await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${cause}` });
-});
-
-test("missing done, mismatched done/result, post-terminal updates, partial tools and over-limit partials explain failure", async () => {
-	for (const [events, cause] of [
-		[[], "stream ended without a terminal response"],
-		[[{ type: "done", reason: "stop", message: message({ content: [{ type: "text", text: "different" }] }) }], "terminal and final response text do not match"],
-		[[{ type: "done", reason: "stop", message: message() }, { type: "start", partial: message() }], "stream continued after its terminal event"],
-		[[{ type: "start", partial: message({ content: [{ type: "toolCall", id: "x", name: "x", arguments: {} }] }) }], "unexpected non-text response content"],
-		[[{ type: "start", partial: message({ content: [{ type: "text", text: "x".repeat(262145) }] }) }], "response exceeded the 262144-byte text limit"],
-	] as [AssistantMessageEvent[], string][]) {
-		const f = registry(events);
-		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${cause}` });
-	}
-});
-
-test("unsupported stock route refuses ordinary streaming before dispatch", async () => {
-	const ctx = { modelRegistry: { streamSimple: () => assert.fail("Ordinary streaming must not substitute for subscription dispatch") } } as unknown as ExtensionContext;
-	await assert.rejects(dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: the selected route cannot guarantee subscription-only dreaming on this Pi SDK; nothing was dispatched" });
-});
-
-for (const scenario of ["valid", "api-key", "not-subscription", "changed", "missing-auth", "missing-key"]) {
-	test(`stock subscription provider ${scenario} uses only the captured public route`, async () => {
-		let calls = 0; let lookups = 0; let authCalls = 0;
-		const provider = {
-			id: model.provider,
-			auth: { oauth: { isSubscription: scenario !== "not-subscription" }, ...(scenario === "api-key" ? { apiKey: {} } : {}) },
-			streamSimple(current: typeof model, context: Context, options: { apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }) {
-				calls++; assert.equal(current.id, model.id); assert.equal(options.apiKey, "synthetic-subscription");
-				assert.equal(current.baseUrl, "https://selected-model.invalid");
-				assert.deepEqual(options.headers, { "x-selected-model": "synthetic-header" });
-				assert.deepEqual(options.env, { SYNTHETIC_REQUEST: "selected-model" });
-				assert.equal(context.messages[0].role, "system");
-				return { async *[Symbol.asyncIterator]() { yield { type: "done", reason: "stop", message: message() }; }, result: async () => message() };
-			},
-		};
-		const ctx = { modelRegistry: {
-			getProvider: () => { lookups++; return scenario === "changed" && lookups > 1 ? { ...provider } : provider; },
-			getRegisteredProviderConfig: () => undefined,
-			getRegisteredNativeProvider: () => undefined,
-			getProviderAuth: async () => assert.fail("Provider-only auth would drop selected-model headers."),
-			getApiKeyAndHeaders: async (current: typeof model) => {
-				authCalls++; assert.strictEqual(current, model);
-				return scenario === "missing-auth" ? { ok: false, error: "Synthetic auth unavailable." } : { ok: true, apiKey: scenario === "missing-key" ? undefined : "synthetic-subscription", baseUrl: "https://selected-model.invalid", headers: { "x-selected-model": "synthetic-header" }, env: { SYNTHETIC_REQUEST: "selected-model" } };
-			},
-			streamSimple: () => assert.fail("Stock dispatch must not resolve credentials a second time."),
-		} } as unknown as ExtensionContext;
-		if (scenario === "valid") {
-			assert.equal(await dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), " {🌱} \n");
-			assert.equal(calls, 1); assert.equal(authCalls, 1);
-		} else {
-			await assert.rejects(dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), /nothing was dispatched/);
-			assert.equal(calls, 0);
-			if (scenario === "api-key" || scenario === "not-subscription") assert.equal(authCalls, 0);
-		}
-	});
-}
-
-test("registry cancellation rejects a stalled stream immediately and passes a client-owned signal", async () => {
-	const controller = new AbortController(); let received: AbortSignal | undefined;
-	const ctx = { modelRegistry: { streamSubscriptionSimple(_model: unknown, _context: unknown, options: { signal: AbortSignal }) {
-		received = options.signal;
-		return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }), result: () => new Promise(() => {}) };
-	} } } as unknown as ExtensionContext;
-	const pending = dream.callDreamModel(request, ctx, model, selection, controller.signal);
-	controller.abort();
-	await assert.rejects(pending, { message: "Dream call cancelled." });
-	assert.equal(received?.aborted, true);
-});
-
-for (const scenario of ["missing", "conflict", "unapproved", "eventMismatch", "resultMismatch", "same"] as const) test(`virtual selection subscription dispatch observer ${scenario}`, async () => {
-	const virtualModel = { ...model, api: "pi-virtual" };
-	const physical = Object.freeze({ provider: "anthropic", modelID: "physical", api: "anthropic-messages" });
-	const physicalMessage = message({ provider: physical.provider, model: physical.modelID, api: physical.api });
-	let calls = 0;
-	const ctx = { modelRegistry: { streamSubscriptionSimple(current: unknown, context: Context, options: SubscriptionSimpleStreamOptions) {
-		calls++; assert.strictEqual(current, virtualModel); assert.equal(context.systemPrompt, request.systemPrompt);
-		assert.deepEqual(Object.keys(options).sort(), ["onDispatch", "reasoning", "signal"]);
-		assert.ok(options.onDispatch);
-		if (scenario !== "missing") {
-			if (scenario === "unapproved") assert.throws(() => options.onDispatch!({ ...physical, provider: "unsupported" }));
-			else assert.equal(options.onDispatch(physical), undefined);
-			if (scenario === "same") assert.equal(options.onDispatch(physical), undefined);
-			if (scenario === "conflict") { try { options.onDispatch({ ...physical, modelID: "changed" }); } catch {} }
-		}
-		const eventMessage = scenario === "eventMismatch" ? message() : physicalMessage;
-		const resultMessage = scenario === "resultMismatch" ? message() : physicalMessage;
-		return { async *[Symbol.asyncIterator]() { yield { type: "done", reason: "stop", message: eventMessage }; }, result: async () => resultMessage };
-	} } } as unknown as ExtensionContext;
-	const work = dream.callDreamModel(request, ctx, virtualModel, selection, new AbortController().signal);
-	if (scenario === "same") assert.equal(await work, " {🌱} \n");
-	else await assert.rejects(work, { message: `Dream model call failed: ${scenario === "conflict" || scenario === "unapproved" ? "physical dispatch changed or was invalid" : "response identity does not match the dispatched model"}` });
-	assert.equal(calls, 1);
-});
-
-test("selection mismatch fails before registry; process environment excludes provider and Pi auth", async () => {
-	const f = registry([]);
-	await assert.rejects(dream.callDreamModel(request, f.ctx, { ...model, id: "changed" }, selection, new AbortController().signal), { message: "Dream model call failed: model selection does not match the request" });
-	assert.equal(f.calls.length, 0);
+test("process environment excludes provider and Pi auth", () => {
 	assert.deepEqual(dream.workerEnvironment({ HOME: "/home", PATH: "/bin", TMPDIR: "/tmp", LANG: "C", LC_ALL: "C", OPENAI_API_KEY: "forbidden", PI_CODING_AGENT_DIR: "forbidden", GIT_DIR: "forbidden" }), { HOME: "/home", PATH: "/bin", TMPDIR: "/tmp", LANG: "C", LC_ALL: "C" });
 });
 

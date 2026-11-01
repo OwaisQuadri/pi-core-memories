@@ -7,7 +7,8 @@ import { test, type TestContext } from "node:test";
 import type { AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DreamCoverage, DreamRequest, DreamStart } from "./dream.ts";
-type GuardedRegistryFixture = { streamSubscriptionSimple: (model: NonNullable<ExtensionContext["model"]>, context: Context, options: NonNullable<Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2]> & { onDispatch?: (physical: { provider: string; modelID: string; api: string }) => void }) => ReturnType<ExtensionContext["modelRegistry"]["streamSimple"]> };
+type RegistryFixture = Pick<ExtensionContext["modelRegistry"], "streamSimple">;
+const subscription = { isUsingOAuth: () => true, getProvider: () => ({ auth: { oauth: { isSubscription: true } } }) };
 
 import { sdkURL, aiURL } from "./test/host.ts";
 const nativeDream = await import("./dream.ts");
@@ -100,22 +101,21 @@ test("interrupted call stays pending, explicit retry uses exact saved input afte
 	assert.equal(completed.status, "completed"); assert.equal(completed.generation, "1");
 });
 
-test("real worker withholds provider error text, saves no response, and calls again only on explicit retry", async (t) => {
+test("real worker reports the provider's error cause but never its response, saves no response, and calls again only on explicit retry", async (t) => {
 	const f = await fixture(t); let saved: DreamRequest | undefined; let calls = 0;
 	const model = { provider: f.start.selection.provider, id: f.start.selection.modelID, api: "offline" } as Parameters<typeof dream.callDreamModel>[2];
 	const memoryBefore = f.cli("render", "--repo", f.repo, "--cwd", f.root);
 	const report = await dream.runDreamWorker(f.start, async (request, signal) => {
 		saved = request;
-		const registry = { streamSubscriptionSimple(current, _context, options) {
+		const registry = { streamSimple(current) {
 			calls++;
-			options?.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
 			const reply: AssistantMessage = { role: "assistant", api: current.api, provider: current.provider, model: current.id, content: [{ type: "text", text: "PRIVATE PARTIAL RESPONSE" }], stopReason: "error", errorMessage: "fixture provider quota exceeded", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 			const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "error", reason: "error", error: reply }); return stream;
-		} } satisfies GuardedRegistryFixture;
-		return dream.callDreamModel(request, { modelRegistry: registry as unknown as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, f.start.selection, signal);
+		} } satisfies RegistryFixture;
+		return dream.callDreamModel(request, { modelRegistry: { ...subscription, ...registry } as unknown as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, f.start.selection, signal);
 	}, new AbortController().signal);
 	assert.equal(report.status, "pending"); assert.equal(report.reason, "callbackFailure"); assert.equal(report.generation, "0"); assert.equal(calls, 1);
-	assert.equal(report.detail, "The dream model call did not complete.");
+	assert.equal(report.detail, "Dream model call failed: error: fixture provider quota exceeded");
 	const display = dream.dreamReviewText(report);
 	assert.ok(display.includes(`Cause: ${report.detail}`)); assert.ok(display.includes("Discuss recovery in conversation before another model call.")); assert.ok(!display.includes("/dream")); assert.ok(!display.includes("PRIVATE PARTIAL RESPONSE"));
 	const directory = join(f.roots.state, "runs", report.runID!);
@@ -161,15 +161,14 @@ test("explicit worker replacement alone dispatches current selection and archive
 	const calls: { model: unknown; context: Context; reasoning: unknown }[] = [];
 	const selectedModel: Model<"offline"> = { provider: "openai", id: "selected", api: "offline", name: "Synthetic model", baseUrl: "https://offline.invalid", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 262_144, maxTokens: 16_384 };
 	const current = { ...selectedModel, provider: "anthropic", id: "current" };
-	const registry = { streamSubscriptionSimple(model, context, options) {
+	const registry = { streamSimple(model, context, options) {
 		calls.push({ model, context, reasoning: options?.reasoning });
-		options?.onDispatch?.(Object.freeze({ provider: model.provider, modelID: model.id, api: model.api }));
 		const payload = JSON.parse(context.messages[0].content as string) as { contextHash: string; primaryEvidence: { source: unknown }[] };
 		const text = calls.length === 1 ? " \nInvalid café 🌱 reply\r\n " : JSON.stringify({ schemaVersion: 1, contextHash: payload.contextHash, decisions: payload.primaryEvidence.map((entry) => ({ kind: "noChange", sources: [entry.source], reasonCode: "notDurable", explanation: "Offline replacement." })) });
 		const reply: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [{ type: "text", text }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 		const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
-	} } satisfies GuardedRegistryFixture;
-	const ctx = { cwd: f.root, mode: "rpc", model: selectedModel, thinkingLevel: "off", waitForIdle: async () => {}, ui: { notify: () => {} }, modelRegistry: registry };
+	} } satisfies RegistryFixture;
+	const ctx = { cwd: f.root, mode: "rpc", model: selectedModel, thinkingLevel: "off", waitForIdle: async () => {}, ui: { notify: () => {} }, modelRegistry: { ...subscription, ...registry } };
 	const launch = (start: DreamStart) => dream.runDreamWorker(start, (request, signal) => dream.callDreamModel(request, ctx as unknown as import("@earendil-works/pi-coding-agent").ExtensionContext, ctx.model, start.selection, signal), new AbortController().signal);
 	const memoryBefore = f.cli("render", "--repo", f.repo, "--cwd", f.root);
 	const first = await launch(f.start);
@@ -247,16 +246,15 @@ test("resumed worker dispatches its recorded provider, model and thinking with e
 		let calls = 0;
 		const report = await dream.runDreamWorker(start, async (request, signal) => {
 			assert.deepEqual(request, { ...saved, selection });
-			const registry = { streamSubscriptionSimple(current, context, options) {
-				options?.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
+			const registry = { streamSimple(current, context, options) {
 				calls++; assert.strictEqual(current, model);
 				assert.equal(options?.reasoning, selection.thinkingLevel === "off" ? undefined : "high");
 				assert.equal(context.systemPrompt, saved!.systemPrompt);
 				assert.deepEqual(context.messages, saved!.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })));
 				const reply: AssistantMessage = { role: "assistant", api: current.api, provider: current.provider, model: current.id, content: [{ type: "text", text: decision(request) }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 				const stream = ai.createAssistantMessageEventStream(); stream.push({ type: "done", reason: "stop", message: reply }); stream.end(reply); return stream;
-			} } satisfies GuardedRegistryFixture;
-			return dream.callDreamModel(request, { modelRegistry: registry as unknown as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, selection, signal);
+			} } satisfies RegistryFixture;
+			return dream.callDreamModel(request, { modelRegistry: { ...subscription, ...registry } as unknown as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, selection, signal);
 		}, new AbortController().signal);
 		assert.equal(report.status, "completed"); assert.equal(calls, 1);
 		assert.deepEqual(await Promise.all(names.map((name) => readFile(join(directory, name)))), frozen);
@@ -288,31 +286,6 @@ test("exclusions-only complete and no-new records never call registry", async (t
 	const forbidden = async () => { assert.fail("No primary evidence, no registry call"); };
 	assert.equal((await dream.runDreamWorker(f.start, forbidden, new AbortController().signal)).status, "completed");
 	assert.equal((await dream.runDreamWorker(f.start, forbidden, new AbortController().signal)).status, "noNewRecords");
-});
-
-test("SDK custom virtual transport never receives a subscription-only request", async (t) => {
-	const f = await fixture(t);
-	const runtime = await sdk.ModelRuntime.create({ authPath: join(f.agent, "auth.json"), modelsPath: null, modelsStorePath: join(f.agent, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
-	const baseline = runtime.getModels("openai").find((item) => item.reasoning); assert.ok(baseline);
-	const native: Model<"offline-native-api"> = { provider: "offline-native", id: "physical", name: "Offline physical model", api: "offline-native-api", baseUrl: "https://fixture.invalid", reasoning: true, input: ["text"], cost: { ...baseline.cost }, contextWindow: baseline.contextWindow, maxTokens: baseline.maxTokens };
-	let nativeCalls = 0; let routes = 0;
-	const scripted: typeof runtime.streamSimple = () => {
-		nativeCalls++; throw new Error("Custom transport must not receive subscription-only requests");
-	};
-	runtime.registerNativeProvider(ai.createProvider({ id: native.provider, auth: { apiKey: { name: "Offline fixture", resolve: async () => ({ auth: {}, source: "fixture" }) } }, models: [native], api: { stream: scripted, streamSimple: scripted } }));
-	await runtime.refresh({ allowNetwork: false });
-	runtime.registerVirtualModel({ provider: "offline-virtual", id: "selected", name: "Offline virtual selection", thinkingLevels: ["medium"], route: (routing) => {
-		routes++; assert.equal(routing.reason, "direct"); assert.equal(routing.thinkingLevel, "medium"); assert.equal(routing.model.api, "pi-virtual");
-		assert.ok(JSON.stringify(routing.messages).includes("EXACT saved context"));
-		return { model: native, thinkingLevel: "high" };
-	} });
-	const captured = runtime.getModelOfType("chat", "offline-virtual", "selected"); assert.ok(captured);
-	const selection = { provider: captured.provider, modelID: captured.id, thinkingLevel: "medium" };
-	const request = { version: 1, type: "modelRequest", invocationID: "invocation", requestID: "run:" + "a".repeat(64), runID: "run", generation: "0", inputHash: "b".repeat(64), contextHash: "c".repeat(64), requestHash: "a".repeat(64), selection, systemPrompt: "EXACT saved context", messages: [{ role: "user", text: "saved input", timestampMilliseconds: 0 }] } as DreamRequest;
-	const registry = new sdk.ModelRegistry(runtime);
-	const isGuarded = "streamSubscriptionSimple" in registry && typeof registry.streamSubscriptionSimple === "function";
-	await assert.rejects(dream.callDreamModel(request, { modelRegistry: registry }, captured, selection, new AbortController().signal), isGuarded ? /Subscription transport could not be established for offline-native\/physical/ : /the selected route cannot guarantee subscription-only dreaming/);
-	assert.equal(routes, isGuarded ? 1 : 0); assert.equal(nativeCalls, 0); assert.equal(captured.api, "pi-virtual"); assert.equal(request.selection.thinkingLevel, "medium");
 });
 
 function contentHash(context: Context): string {

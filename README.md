@@ -119,6 +119,9 @@ another command, review mode, or host change.
   `dreaming: active · 1 to review`. `to review` counts pending proposals.
 - `dreaming: error(code: X, message: "...")` reports a blocked or failed attempt.
   The code and message use fixed safe text, not raw exceptions or source data.
+  The exception is `backendFailure`: its message is the cause that the model
+  call reported, escaped, with provider error text cut to 800 bytes. It never
+  contains the model's response.
 - `dreaming: error(code: blocked, reason: R, message: "...")` adds the native
   worker's reason code, for example `workerFailure`, `protocolFailure`,
   `cancelled`, `sourceProtection:invalidReply` or
@@ -130,8 +133,7 @@ another command, review mode, or host change.
   detail is either empty or fixed text from the worker or the extension, never
   source text.
 - `dreaming: error(code: pending, reason: R, message: "...")` reports a run that
-  the native worker kept pending, for example `callbackFailure`,
-  `invalidDecision` or `staleUnpublishedPlans` (saved proposals waiting for
+  the native worker kept pending, for example `invalidDecision` or `staleUnpublishedPlans` (saved proposals waiting for
   saved-suggestion recovery). Like a blocked run, it stops dispatch until your
   next input or a model or thinking level change. A `cancelled` run, and a
   `droppedBatch` run whose batch was dropped because approved memory or
@@ -146,15 +148,10 @@ response and native run records remain the evidence for successful dreaming.
 
 Dreaming uses the selected provider, model, and thinking level. It must not fall
 back to a paid application programming interface (API) key or switch selections.
-On public Pi, the selected route must be an OAuth (Open Authorization)-only
-subscription provider with no registered override. Authentication is resolved
-once for the selected model, including its headers and endpoint, before calling
-the captured provider.
-
-A host with an existing stronger subscription guard can use it, but that guard
-is optional. Mixed-authentication, virtual, changed, or unverified public routes
-stay blocked when the adapter cannot establish subscription-only dispatch.
-It does not install a fork or choose another provider to bypass that limit.
+The selected model must be signed in through OAuth (Open Authorization) to a
+subscription provider; virtual models are refused. The call then goes through
+Pi's model registry, the same authentication path as a normal session, which resolves
+authentication, headers, and endpoint for the selected model.
 
 ## Review in conversation
 

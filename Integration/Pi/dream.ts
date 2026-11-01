@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { normalizeContext, type AssistantMessage, type Context } from "@earendil-works/pi-ai";
+import type { Context } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { commandPath, commandReady } from "./command.ts";
@@ -90,9 +90,6 @@ export type DreamSourceProtectionCall = (request: unknown, signal: AbortSignal) 
 function failure(): never {
 	const frames = (new Error().stack ?? "").split("\n").slice(2, 4).map((frame) => frame.trim().replace(/\(.*\//, "("));
 	throw new Error(`Dream check failed ${frames.join(" ") || "at unknown location"}`);
-}
-function message(error: unknown): string {
-	return Buffer.from(error instanceof Error ? error.message : String(error)).subarray(0, 1000).toString();
 }
 function object(value: unknown): ObjectValue {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return failure();
@@ -361,9 +358,9 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 			if (controller.signal.aborted) return;
 			if (!result || !isWellFormedText(result) || Buffer.byteLength(result) > maximumTextBytes) failure();
 			response = { ...binding, type: "modelResponse", text: result };
-		} catch {
+		} catch (error) {
 			if (controller.signal.aborted) return;
-			modelError = "The dream model call did not complete.";
+			modelError = error instanceof DreamCallFailure ? error.message : "The dream model call did not complete.";
 			response = { ...binding, type: "modelFailure", category: "incomplete" };
 		}
 		if (final || isClosed || error || isReplySent) return rejectTransport("model reply arrived after the run ended");
@@ -445,105 +442,16 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 	return completion;
 }
 
-type DreamSubscriptionOptions = NonNullable<Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2]> & { onDispatch?: (physical: { provider: string; modelID: string; api: string }) => void };
-type DreamSubscriptionRegistry = ExtensionContext["modelRegistry"] & { streamSubscriptionSimple?: (model: NonNullable<ExtensionContext["model"]>, context: Context, options: DreamSubscriptionOptions) => ReturnType<ExtensionContext["modelRegistry"]["streamSimple"]> };
+export class DreamCallFailure extends Error {}
 export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionContext, "modelRegistry">, model: NonNullable<ExtensionContext["model"]>, selection: DreamSelection, signal: AbortSignal): Promise<string> {
-	function modelFailure(cause: string): never { throw new Error(`Dream model call failed: ${cause}`); }
-	function incompleteResponse(reason: AssistantMessage["stopReason"], errorMessage?: string): never {
-		const causes = { stop: "unexpected stop reason", length: "response reached the output token limit", toolUse: "unexpected tool call", error: "provider error", aborted: "provider aborted the response", pending: "response is pending", deferred: "response was deferred" };
-		const diagnostic = reason === "error" || reason === "aborted"
-			? typeof errorMessage === "string" && errorMessage.trim() ? `: ${Buffer.from(escapeDreamDisplay(errorMessage.slice(0, 800))).subarray(0, 800).toString()}` : " (no error message)"
-			: "";
-		return modelFailure((causes[reason] ?? "unknown stop reason") + diagnostic);
-	}
-	if (signal.aborted) throw new Error("Dream call cancelled.");
-	if (!isSameSelection(request.selection, selection) || model.provider !== selection.provider || model.id !== selection.modelID) modelFailure("model selection does not match the request");
-	const registry = ctx.modelRegistry as DreamSubscriptionRegistry;
-	const guardedStream = registry.streamSubscriptionSimple;
-	const stockProvider = typeof guardedStream === "function" ? undefined : registry.getProvider?.(model.provider);
-	if (typeof guardedStream !== "function" && (!stockProvider || model.api === "pi-virtual" || stockProvider.id !== model.provider || stockProvider.auth.apiKey || stockProvider.auth.oauth?.isSubscription !== true || registry.getRegisteredProviderConfig(model.provider) || registry.getRegisteredNativeProvider(model.provider))) modelFailure("the selected route cannot guarantee subscription-only dreaming on this Pi SDK; nothing was dispatched");
+	if (model.api === "pi-virtual" || !ctx.modelRegistry.isUsingOAuth(model) || ctx.modelRegistry.getProvider(model.provider)?.auth.oauth?.isSubscription !== true) throw new DreamCallFailure("Dream model call failed: the selected model is not using a subscription sign-in; nothing was dispatched");
 	const context: Context = { systemPrompt: request.systemPrompt, messages: request.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })) };
 	const reasoning = selection.thinkingLevel === "off" ? undefined : selection.thinkingLevel as "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-	const controller = new AbortController();
-	const abort = () => controller.abort();
-	signal.addEventListener("abort", abort, { once: true });
-	let rejectAbort!: (reason: Error) => void;
-	const cancelled = new Promise<never>((_done, fail) => { rejectAbort = fail; });
-	let isDispatchInvalid = false;
-	controller.signal.addEventListener("abort", () => rejectAbort(new Error(isDispatchInvalid ? "Dream model call failed: physical dispatch changed or was invalid" : "Dream call cancelled.")), { once: true });
-	void cancelled.catch(() => {});
-	let dispatch: Parameters<NonNullable<DreamSubscriptionOptions["onDispatch"]>>[0] | undefined;
-	const onDispatch: NonNullable<DreamSubscriptionOptions["onDispatch"]> = (physical) => {
-		try {
-			const observed = { provider: text(physical.provider, 256), modelID: text(physical.modelID, 256), api: text(physical.api, 256) };
-			if (!["openai", "openai-codex", "anthropic"].includes(observed.provider) || !observed.modelID || !observed.api || observed.api === "pi-virtual") failure();
-			if (model.api !== "pi-virtual" && (observed.provider !== model.provider || observed.modelID !== model.id || observed.api !== model.api)) failure();
-			if (dispatch && (dispatch.provider !== observed.provider || dispatch.modelID !== observed.modelID || dispatch.api !== observed.api)) failure();
-			dispatch = observed;
-		} catch { isDispatchInvalid = true; controller.abort(); modelFailure("physical dispatch changed or was invalid"); }
-	};
-	function isExpectedIdentity(message: AssistantMessage): boolean {
-		return !isDispatchInvalid && dispatch !== undefined && message.provider === dispatch.provider && message.model === dispatch.modelID && message.api === dispatch.api;
-	}
-	try {
-	const stream = typeof guardedStream === "function" ? guardedStream.call(registry, model, context, { signal: controller.signal, reasoning, onDispatch }) : await (async () => {
-		if (!stockProvider) modelFailure("subscription provider is unavailable");
-		const resolved = await Promise.race([registry.getApiKeyAndHeaders(model), cancelled]);
-		controller.signal.throwIfAborted();
-		if (registry.getProvider(model.provider) !== stockProvider || stockProvider.auth.apiKey || stockProvider.auth.oauth?.isSubscription !== true || registry.getRegisteredProviderConfig(model.provider) || registry.getRegisteredNativeProvider(model.provider) || !resolved.ok || !resolved.apiKey) modelFailure("subscription authentication or provider changed before dispatch; nothing was dispatched");
-		onDispatch({ provider: model.provider, modelID: model.id, api: model.api });
-		return stockProvider.streamSimple(resolved.baseUrl ? { ...model, baseUrl: resolved.baseUrl } : model, normalizeContext(context), { signal: controller.signal, reasoning, apiKey: resolved.apiKey, headers: resolved.headers, env: resolved.env });
-	})();
-	let terminal: AssistantMessage | undefined;
-	let isDone = false;
-	const iterator = stream[Symbol.asyncIterator]();
-	while (true) {
-		const next = await Promise.race([iterator.next(), cancelled]);
-		if (next.done) break;
-		const event = next.value;
-		if (signal.aborted) throw new Error("Dream call cancelled.");
-		if (isDone) modelFailure("stream continued after its terminal event");
-		if (event.type.startsWith("toolcall")) modelFailure("unexpected tool call");
-		if (event.type === "error") incompleteResponse(event.reason, event.error.errorMessage);
-		if ("partial" in event) {
-			let bytes = 0;
-			for (const part of event.partial.content) {
-				if (part.type === "thinking") continue;
-				if (part.type !== "text") modelFailure("unexpected non-text response content");
-				bytes += Buffer.byteLength(part.text);
-				if (bytes > maximumTextBytes) modelFailure(`response exceeded the ${maximumTextBytes}-byte text limit`);
-			}
-		}
-		if (event.type === "done") {
-			if (event.reason !== "stop") incompleteResponse(event.reason);
-			if (!isExpectedIdentity(event.message)) modelFailure("response identity does not match the dispatched model");
-			terminal = event.message; isDone = true;
-		}
-	}
-	if (signal.aborted) throw new Error("Dream call cancelled.");
-	if (!isDone || !terminal) modelFailure("stream ended without a terminal response");
-	const result = await Promise.race([stream.result(), cancelled]);
-	function completed(message: AssistantMessage): string {
-		if (message.stopReason !== "stop") incompleteResponse(message.stopReason, message.errorMessage);
-		if (!isExpectedIdentity(message)) modelFailure("response identity does not match the dispatched model");
-		let bytes = 0;
-		const blocks: string[] = [];
-		for (const part of message.content) {
-			if (part.type === "thinking") continue;
-			if (part.type !== "text") modelFailure("unexpected non-text response content");
-			if (!isWellFormedText(part.text)) modelFailure("response text contains invalid Unicode");
-			bytes += Buffer.byteLength(part.text);
-			if (bytes > maximumTextBytes) modelFailure(`response exceeded the ${maximumTextBytes}-byte text limit`);
-			blocks.push(part.text);
-		}
-		if (!bytes) modelFailure("response contained no text");
-		return blocks.join("");
-	}
-	const resultText = completed(result);
-	if (completed(terminal) !== resultText) modelFailure("terminal and final response text do not match");
-	if (signal.aborted) throw new Error("Dream call cancelled.");
-	return resultText;
-	} finally { signal.removeEventListener("abort", abort); controller.abort(); }
+	const message = await ctx.modelRegistry.streamSimple(model, context, { signal, reasoning }).result();
+	if (message.stopReason !== "stop") throw new DreamCallFailure(`Dream model call failed: ${message.stopReason}: ${Buffer.from(escapeDreamDisplay((message.errorMessage ?? "no error message").slice(0, 800))).subarray(0, 800).toString()}`);
+	const reply = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("");
+	if (!reply || Buffer.byteLength(reply) > maximumTextBytes) throw new DreamCallFailure("Dream model call failed: empty or oversized response");
+	return reply;
 }
 
 function absolutePath(value: unknown): string {

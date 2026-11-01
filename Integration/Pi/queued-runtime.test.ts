@@ -11,6 +11,7 @@ import type { DreamReport, DreamRequest, DreamStart, runDreamWorker } from "./dr
 import type { openQueueClient } from "./queue-client.ts";
 import "./test/host.ts";
 const { memoryRequestIdentity, registerQueuedRuntime, assertArchivedRequest } = await import("./queued-runtime.ts");
+const { DreamCallFailure } = await import("./dream.ts");
 const { ExtensionRunner, createExtensionRuntime } = await import("@earendil-works/pi-coding-agent");
 const stateDirectory = await mkdtemp(join(tmpdir(), "pi-core-memories-runtime-"));
 after(() => rm(stateDirectory, { recursive: true, force: true }));
@@ -239,6 +240,18 @@ test("dream status reports backend failure without exposing the model error", as
 		await f.emit("session_start"); await sleep(30);
 		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: backendFailure,/);
 		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /PRIVATE/);
+	} finally { await f.stop(); }
+});
+
+test("dream status keeps the cause that the model call reported after the worker leaves the run pending", async () => {
+	const f = runtime(async (start, call, signal) => {
+		try { await call(archivedRequest(start), signal); }
+		catch (error) { return { status: "pending", reason: "callbackFailure", detail: (error as Error).message } as DreamReport; }
+		return { status: "noNewRecords" } as DreamReport;
+	}, "tui", undefined, { call: async () => { throw new DreamCallFailure("Dream model call failed: provider error: prompt is too long\u001b[2J"); } });
+	try {
+		await f.emit("session_start"); await sleep(30);
+		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: backendFailure, message: "Dream model call failed: provider error: prompt is too long\\\\u{1B}[2J")');
 	} finally { await f.stop(); }
 });
 

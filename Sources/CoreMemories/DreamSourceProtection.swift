@@ -6,6 +6,7 @@ package enum DreamSourceProtectionError: Error, Equatable, Sendable {
 
 package enum DreamSourceProtection {
   package static let maximumPieces = 1_000
+  package static let maximumRunRequests = 16
   package static let maximumPieceBytes = 1_048_576
   package static let maximumInputBytes = 4_194_304
   package static let maximumOutputBytes = 8_388_608

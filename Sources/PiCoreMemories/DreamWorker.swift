@@ -245,7 +245,7 @@ private final class WorkerInput: @unchecked Sendable {
   static let maximumStartBytes = 65_536
   static let maximumReplyBytes = DreamSourceProtection.maximumOutputBytes * 6 + 8192
   static let maximumModelReplyBytes = 262_144 * 6 + 8192
-  static let maximumProtectionRequests = 16
+  static let maximumProtectionRequests = DreamSourceProtection.maximumRunRequests
   static let maximumAggregateBytes =
     maximumStartBytes + maximumReplyBytes * maximumProtectionRequests + 262_144 * 6 + 8192
   private let condition = NSCondition()

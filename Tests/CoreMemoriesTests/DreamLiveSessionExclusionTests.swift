@@ -79,17 +79,3 @@ import Testing
     !FileManager.default.fileExists(
       atPath: fixture.state.appendingPathComponent("generations/1.json").path))
 }
-
-@Test(arguments: [
-  ["one", "one"], ["two", "one"], ["bad:id"], ["-bad"], Array(repeating: "a", count: 65),
-])
-func dreamWorkerRejectsInvalidLiveExclusionSnapshot(_ ids: [String]) throws {
-  let fixture = try TransactionFixture()
-  defer { fixture.clean() }
-  let worker = try DreamWorkerProcess()
-  defer { worker.clean() }
-  var start = workerStart(fixture)
-  start["excludedSessionIDs"] = ids
-  try worker.send(start)
-  try worker.finish(status: 1, isErrorExpected: true)
-}

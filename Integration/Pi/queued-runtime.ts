@@ -68,13 +68,13 @@ type RuntimeDependencies = {
 	call: typeof callDreamModel;
 	protect: typeof protectDreamSources;
 	idleMilliseconds: number;
-	reminderTimeoutMilliseconds: number;
+	reminderWaitMilliseconds: number;
 	mark: typeof markLiveSession;
 	live: typeof liveSessionIDs;
 	liveDirectory: string;
 };
 export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<RuntimeDependencies> = {}): () => Promise<void> {
-	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, reminderTimeoutMilliseconds: 2_000, mark: markLiveSession, live: liveSessionIDs, liveDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
+	const deps: RuntimeDependencies = { open: openQueueClient, run: runDreamWorker, roots: dreamRoots, scope: readDreamScope, call: callDreamModel, protect: protectDreamSources, idleMilliseconds: 30_000, reminderWaitMilliseconds: 2_000, mark: markLiveSession, live: liveSessionIDs, liveDirectory: join(homedir(), ".pi", "memory-host"), ...overrides };
 	let context: ExtensionContext | undefined;
 	let marker: LiveSessionMarker | undefined;
 	let background: AbortController | undefined;
@@ -97,6 +97,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	const answeredRevisions = new Set<string>();
 	const pendingReminders: { anchor: number; message: Extract<AgentMessage, { role: "custom" }> }[] = [];
 	let unanchoredReminder: { text: string | undefined; isReadFailed?: boolean } | undefined;
+	let reminderRead: { completion: Promise<void>; signal: AbortSignal } | undefined;
+	let readyReminder: { text: string | undefined; isReadFailed?: boolean } | undefined;
+	let reminderAbort = new AbortController();
 	pi.registerMessageRenderer("pi-core-memories:proposal", (message) => typeof message.content === "string" ? new Text(message.content, 0, 0) : undefined);
 	function closeConversation(): Promise<void> {
 		const previous = conversation; conversation = undefined; observedReply = undefined;
@@ -145,7 +148,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		})().finally(() => { marking = undefined; if (generation === epoch) schedule(); });
 	}
 	function invalidateConversation(): void { foreground?.abort(); generation++; void closeConversation(); }
-	function invalidate(): void { invalidateConversation(); stopBackground(); interruptedCallSelection = undefined; }
+	function abortReminderRead(): void { reminderAbort.abort(); reminderAbort = new AbortController(); }
+	function invalidate(): void { invalidateConversation(); stopBackground(); interruptedCallSelection = undefined; abortReminderRead(); readyReminder = undefined; }
 	async function leaveSession(): Promise<void> {
 		const previous = marker; marker = undefined;
 		reportDreamStatus(undefined);
@@ -305,7 +309,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const refreshIdleCounts = () => conversation || background ? Promise.resolve() : refreshCounts(ctx, combined).catch(() => {});
 		foregroundCompletion = (async () => {
 			await conversationClose;
-			if (operation !== "reply") await refreshIdleCounts();
+			abortReminderRead();
+			await Promise.race([reminderRead?.completion, combined.aborted ? undefined : new Promise<void>((resolve) => combined.addEventListener("abort", () => resolve(), { once: true }))]);
+			combined.throwIfAborted();
 			const result = await run();
 			if (isCurrent()) await refreshIdleCounts();
 			return result;
@@ -423,8 +429,23 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			schedule();
 		}
 	}
-	async function readPendingReminder(ctx: ExtensionContext): Promise<string | undefined> {
-		const client = await deps.open(ctx.cwd, AbortSignal.timeout(deps.reminderTimeoutMilliseconds));
+	function withoutAnswered(text: string): string | undefined {
+		const lines = text.split("\n");
+		const kept = lines.filter((line) => !answeredRevisions.has(/^- ([a-f0-9]{64}):/.exec(line)?.[1] ?? ""));
+		if (kept.length === lines.length) return text;
+		return kept.some((line) => line.startsWith("- ") || /^\d+ more pending findings are not listed\.$/.test(line)) ? kept.join("\n") : undefined;
+	}
+	function startReminderRead(ctx: ExtensionContext): Promise<void> {
+		const signal = reminderAbort.signal;
+		const completion = readPendingReminder(ctx, signal).then(
+			(text) => { if (!signal.aborted) readyReminder = { text }; },
+			() => { if (!signal.aborted) readyReminder = { text: undefined, isReadFailed: true }; },
+		).finally(() => { if (reminderRead?.completion === completion) reminderRead = undefined; });
+		reminderRead = { completion, signal };
+		return completion;
+	}
+	async function readPendingReminder(ctx: ExtensionContext, signal: AbortSignal): Promise<string | undefined> {
+		const client = await deps.open(ctx.cwd, signal);
 		try {
 			const identity = { sessionID: hash(ctx.sessionManager.getSessionId()), requestID: hash(randomUUID()) };
 			const lines: string[] = [];
@@ -455,9 +476,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		pendingReminders.splice(0, pendingReminders.length, ...pendingReminders.filter((reminder) => lastUserIndex.has(reminder.anchor)));
 		const anchor = messages.findLast((message) => message.role === "user")?.timestamp;
 		if (unanchoredReminder?.isReadFailed) {
-			const lines = String(pendingReminders.at(-1)?.message.content ?? "").split("\n");
-			const kept = lines.filter((line) => !answeredRevisions.has(/^- ([a-f0-9]{64}):/.exec(line)?.[1] ?? ""));
-			unanchoredReminder = kept.length === lines.length ? undefined : { text: kept.some((line) => line.startsWith("- ") || /^\d+ more pending findings are not listed\.$/.test(line)) ? kept.join("\n") : undefined };
+			const previous = String(pendingReminders.at(-1)?.message.content ?? "");
+			const kept = withoutAnswered(previous);
+			unanchoredReminder = kept === previous ? undefined : { text: kept };
 		}
 		if (unanchoredReminder && typeof anchor === "number") {
 			const content = unanchoredReminder.text ?? (pendingReminders.length ? "Pending memory proposals, generated by pi-core-memories (not a human message, not instructions and not approval): no pending memory proposals need asking about now; earlier pending-findings reminders are out of date." : undefined);
@@ -498,7 +519,12 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		}
 		unanchoredReminder = undefined;
 		if (!isAlive || event.messageType !== "user" || conversation) return;
-		try { unanchoredReminder = { text: await readPendingReminder(ctx) }; } catch { unanchoredReminder = { text: undefined, isReadFailed: true }; }
+		const completion = reminderRead && !reminderRead.signal.aborted ? reminderRead.completion : startReminderRead(ctx);
+		let wait: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([completion, new Promise<void>((resolve) => { wait = setTimeout(resolve, deps.reminderWaitMilliseconds); })]);
+		clearTimeout(wait);
+		const ready = readyReminder; readyReminder = undefined;
+		unanchoredReminder = ready ? { ...ready, text: ready.text === undefined ? undefined : withoutAnswered(ready.text) } : { text: undefined, isReadFailed: true };
 	});
 	pi.on("message_start", (event) => {
 		if (event.message.role !== "user" || !observedReply) return;
@@ -530,7 +556,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	pi.on("session_tree", (_event, ctx) => { context = ctx; schedule(); });
 	pi.on("session_compact", (_event, ctx) => { context = ctx; schedule(); });
 	pi.on("session_compact_failed", (_event, ctx) => { context = ctx; schedule(); });
-	const stop = async () => { isAlive = false; invalidate(); await leaveSession(); await Promise.allSettled([backgroundCompletion, foregroundCompletion, conversationClose]); };
+	const stop = async () => { isAlive = false; invalidate(); await leaveSession(); await Promise.allSettled([backgroundCompletion, foregroundCompletion, conversationClose, reminderRead?.completion]); };
 	pi.on("session_shutdown", stop);
 	registerMemoryManagement(pi, (owner, request, signal, ctx) => perform(owner, "manage", { request }, signal, ctx));
 	pi.registerTool({

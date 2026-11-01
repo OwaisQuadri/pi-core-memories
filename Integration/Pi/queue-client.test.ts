@@ -100,22 +100,23 @@ input(createReadStream(null, { fd: 3 }), "private");
 	process.env.PI_CORE_MEMORIES_EXECUTABLE = executable;
 	try {
 		const controller = new AbortController();
-		const client = await openQueueClient(directory, controller.signal);
-		await t.test("inventory survives the ordinary deadline but still expires at 120 seconds", async (t) => {
-			t.mock.timers.enable({ apis: ["setTimeout"] });
-			try {
-				const inventory = client.request("inventory");
-				t.mock.timers.tick(15_000);
-				assert.equal((await inventory).channel, "stdin");
-				const expired = assert.rejects(client.request("inventory", { isSilent: true }), /Native memory service stopped/);
-				t.mock.timers.tick(119_999);
-				assert.equal(client.signal?.aborted, false);
-				t.mock.timers.tick(1);
-				await expired;
-				assert.equal(client.signal?.aborted, true);
-			} finally { t.mock.timers.reset(); }
-		});
-		await client.close();
+		for (const type of ["inventory", "list"]) {
+			await t.test(`${type} survives the ordinary deadline but still expires at 120 seconds`, async (t) => {
+				const client = await openQueueClient(directory, controller.signal);
+				t.mock.timers.enable({ apis: ["setTimeout"] });
+				try {
+					const verified = client.request(type);
+					t.mock.timers.tick(15_000);
+					assert.equal((await verified).channel, "stdin");
+					const expired = assert.rejects(client.request(type, { isSilent: true }), /Native memory service stopped/);
+					t.mock.timers.tick(119_999);
+					assert.equal(client.signal?.aborted, false);
+					t.mock.timers.tick(1);
+					await expired;
+					assert.equal(client.signal?.aborted, true);
+				} finally { t.mock.timers.reset(); await client.close(); }
+			});
+		}
 		await t.test("ordinary requests still expire at 15 seconds", async (t) => {
 			const ordinary = await openQueueClient(directory, controller.signal);
 			t.mock.timers.enable({ apis: ["setTimeout"] });

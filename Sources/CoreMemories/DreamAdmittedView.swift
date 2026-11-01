@@ -193,25 +193,88 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
   }
 
   static func omitted(_ bytes: Data) throws -> Data {
-    guard var object = try SessionReader.decodeRecord(bytes) as? [String: Any],
-      var message = object["message"] as? [String: Any], message["role"] as? String == "toolResult"
-    else { throw DreamSourceProtectionError.blocked }
-    message = [
-      "role": "toolResult", "toolCallId": message["toolCallId"] ?? "",
-      "toolName": message["toolName"] ?? "", "isError": message["isError"] ?? false, "content": [],
-    ]
+    guard let object = try SessionReader.decodeRecord(bytes) as? [String: Any] else {
+      throw DreamSourceProtectionError.blocked
+    }
     var stub: [String: Any] = [
       "type": object["type"] ?? "", "id": object["id"] ?? "",
-      "timestamp": object["timestamp"] ?? "", "message": message,
+      "timestamp": object["timestamp"] ?? "",
     ]
     stub["parentId"] = object["parentId"]
-    object = stub
-    return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) + Data([10])
+    if let message = object["message"] as? [String: Any] {
+      stub["message"] =
+        message["role"] as? String == "toolResult"
+        ? [
+          "role": "toolResult", "toolCallId": message["toolCallId"] ?? "",
+          "toolName": message["toolName"] ?? "", "isError": message["isError"] ?? false,
+          "content": [],
+        ] : ["role": message["role"] ?? "", "content": []]
+    } else {
+      for key in ["cwd", "parentSession", "name"] { stub[key] = object[key] }
+    }
+    return try JSONSerialization.data(withJSONObject: stub, options: [.sortedKeys]) + Data([10])
+  }
+
+  static func withoutImageData(_ bytes: Data, object: [String: Any]) throws -> Data {
+    guard var message = object["message"] as? [String: Any],
+      let content = message["content"] as? [[String: Any]],
+      content.contains(where: { $0["type"] as? String == "image" && $0.count > 1 })
+    else { return bytes }
+    message["content"] = content.map { $0["type"] as? String == "image" ? ["type": "image"] : $0 }
+    var stripped = object
+    stripped["message"] = message
+    return try JSONSerialization.data(
+      withJSONObject: stripped, options: [.sortedKeys, .withoutEscapingSlashes]) + Data([10])
   }
 }
 
 extension PreparedSessionBatch {
   var admittedViews: [DreamAdmittedView] { provenance?.admittedViews ?? [] }
+
+  func admissionLimitations(after progress: DreamProgress) throws -> [String] {
+    var imageRecords = 0
+    var partRecords = 0
+    var omittedRecords = 0
+    for view in admittedViews {
+      let cursor =
+        progress.positions.first { $0.relativePath.rawValue == view.path }?.completeBytes ?? 0
+      for record in view.records where record.originalStart >= cursor {
+        if record.isOmitted {
+          if record.originalEnd - record.originalStart
+            > UInt64(DreamSourceProtection.maximumSplitRecordBytes)
+          {
+            omittedRecords += 1
+          }
+          continue
+        }
+        let piece = view.bytes.subdata(in: Int(record.admittedStart)..<Int(record.admittedEnd))
+        if piece.count > DreamSourceProtection.maximumPieceBytes { partRecords += 1 }
+        let object = try SessionReader.decodeRecord(piece) as? [String: Any]
+        let blocks =
+          (object?["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+        if blocks.contains(where: { $0["type"] as? String == "image" && $0.count == 1 }) {
+          imageRecords += 1
+        }
+      }
+    }
+    var limitations: [String] = []
+    if imageRecords > 0 {
+      limitations.append(
+        "Image data was removed from \(imageRecords) source records before source checks; their text was kept."
+      )
+    }
+    if partRecords > 0 {
+      limitations.append(
+        "\(partRecords) source records larger than \(DreamSourceProtection.maximumPieceBytes) bytes were checked in parts."
+      )
+    }
+    if omittedRecords > 0 {
+      limitations.append(
+        "\(omittedRecords) source records larger than \(DreamSourceProtection.maximumSplitRecordBytes) bytes were omitted; only their identity was kept."
+      )
+    }
+    return limitations
+  }
 
   func admittedProgress(_ progress: DreamProgress) throws -> DreamProgress {
     try DreamProgress(

@@ -9,6 +9,36 @@ package enum DreamSourceProtection {
   package static let maximumPieceBytes = 1_048_576
   package static let maximumInputBytes = 4_194_304
   package static let maximumOutputBytes = 8_388_608
+  static let maximumSplitRecordBytes = 2 * maximumPieceBytes
+  static let maximumContextBytes = maximumPieceBytes
+
+  static func parts(_ text: String) -> [String] {
+    let bytes = Array(text.utf8)
+    guard bytes.count > maximumPieceBytes else { return [text] }
+    let count = (bytes.count + maximumPieceBytes - 5) / (maximumPieceBytes - 4)
+    var cuts = [0]
+    for part in 1..<count {
+      var cut = bytes.count * part / count
+      while cut < bytes.count, bytes[cut] & 0xC0 == 0x80 { cut += 1 }
+      cuts.append(cut)
+    }
+    cuts.append(bytes.count)
+    return zip(cuts, cuts.dropFirst()).map { String(decoding: bytes[$0..<$1], as: UTF8.self) }
+  }
+
+  static func checkedRecords(_ records: [Data], admit: ([String]) throws -> [String]) throws
+    -> [Data]
+  {
+    let parts = try records.map { parts(try text($0)) }
+    let pending = parts.flatMap { $0 }
+    let checked = pending.isEmpty ? [] : try admit(pending)
+    guard checked.count == pending.count else { throw DreamSourceProtectionError.invalidReply }
+    var offset = 0
+    return parts.map { record in
+      defer { offset += record.count }
+      return Data(checked[offset..<offset + record.count].joined().utf8)
+    }
+  }
 
   package static func digest(_ pieces: [String]) -> SourceDigest {
     var bytes = Data()
@@ -99,8 +129,8 @@ package enum DreamSourceProtection {
         })
     }
     var pieces: [String] = try batch.admittedViews.flatMap { view in
-      try view.records.map {
-        try text(view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd)))
+      try view.records.flatMap {
+        parts(try text(view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd))))
       }
     }
     for position in batch.positionsAfter { pieces.append(position.relativePath.rawValue) }

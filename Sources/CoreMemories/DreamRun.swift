@@ -1500,7 +1500,7 @@ public final class DreamRunStore {
     let decisionLimits = try DreamDecisionLimits(
       maximumResponseBytes: limits.maximumResponseBytes,
       maximumFrozenBytes: limits.maximumFrozenBytes)
-    var limitations: [String] = []
+    var limitations = try run.batch.admissionLimitations(after: run.progress)
     var relatedBatches = try selectRetainedBatches(
       current: run.batch, retained: retainedBatches, excludedSessionIDs: excludedSessionIDs,
       limitations: &limitations)

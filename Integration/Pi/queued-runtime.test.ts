@@ -463,8 +463,7 @@ for (const cancellation of ["tool abort", "user input"] as const) {
 			if (cancellation === "tool abort") controller.abort(); else await f.emit("input", { text: "Stop that.", source: "interactive" });
 			await promptly(assert.rejects(call));
 			releaseClose();
-			await sleep(0);
-			assert.equal(reminder.isClosed, true);
+			await until(() => reminder.isClosed, "The stopped reminder worker did not close");
 		} finally { releaseClose(); await f.stop(); }
 	});
 }

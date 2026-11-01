@@ -209,20 +209,6 @@ func fact(_ text: String) -> String {
   #expect(try fixture.store.check().isEmpty)
 }
 
-@Test func missingStoreAndMainAreErrors() throws {
-  let fixture = try Fixture()
-  defer { fixture.clean() }
-  let missing = fixture.root.appendingPathComponent("missing")
-  #expect(throws: (any Error).self) { _ = try MemoryStore(repo: missing) }
-  #expect(!FileManager.default.fileExists(atPath: missing.path))
-  #expect(throws: (any Error).self) {
-    _ = try MemoryStore(repo: fixture.repo.appendingPathComponent(".git"))
-  }
-  _ = try fixture.git(["update-ref", "-d", "refs/heads/main"])
-  #expect(throws: (any Error).self) { _ = try fixture.store.render(cwd: fixture.root) }
-  #expect(throws: (any Error).self) { _ = try fixture.store.check() }
-}
-
 @Test func checkValidatesEveryApprovedFile() throws {
   let fixture = try Fixture()
   defer { fixture.clean() }

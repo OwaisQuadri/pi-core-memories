@@ -144,6 +144,16 @@ This is a session-local status, not an aggregate of other workers. Errors stay
 visible until an eligible reset. Shutdown clears the status. Completed request,
 response and native run records remain the evidence for successful dreaming.
 
+An `invalidDecision` run stays pending until you approve a separate model call.
+The `memory_dream_recover` tool first displays the saved run ID, baseline request
+hash, and selected model in this conversation. It requires your later original
+interactive reply of `yes` to that display before it calls the model once. A tool
+argument, queued message, or earlier reply cannot approve the call. For a saved
+version 5 request, it appends a version 6 model call with the missing scope fields.
+It retains the original request and rejected reply. The worker checks the target
+again before it can call the model. The replacement still must pass native
+validation. It does not approve a memory.
+
 ## Subscription-only model calls
 
 Dreaming uses the selected provider, model, and thinking level. It must not fall

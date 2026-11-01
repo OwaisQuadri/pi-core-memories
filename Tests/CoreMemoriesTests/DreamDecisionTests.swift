@@ -216,7 +216,7 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
   defer { fixture.clean() }
   let context = try fixture.context()
   for (schema, rendering) in [
-    (3, 5), (3, nil), (3, 1), (3, 2), (3, 3), (3, 4), (2, 3), (3, 6), (4, 4),
+    (3, 6), (3, 5), (3, nil), (3, 1), (3, 2), (3, 3), (3, 4), (2, 3), (3, 7), (4, 4),
   ] as [(Int, Int?)]
   {
     let request = DreamRunEncoding.Request(
@@ -226,12 +226,12 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
       messages: try context.requestMessages(timestampMilliseconds: 123), renderingVersion: rendering
     )
     let bytes = try DreamRunEncoding.encode(request)
-    if schema == 3 && rendering == 5 {
+    if schema == 3 && rendering == 6 {
       let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
       #expect(
         try saved.domain(run: fixture.run, context: context, bytes: bytes).requestHash
           == SourceDigest(bytes: bytes))
-    } else if schema == 3 && [2, 3, 4].contains(rendering) {
+    } else if schema == 3 && [2, 3, 4, 5].contains(rendering) {
       #expect(throws: DreamRunError.corruption) {
         try request.domain(run: fixture.run, context: context, bytes: bytes)
       }
@@ -241,6 +241,55 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
       }
     }
   }
+}
+
+@Test func dreamCurrentRequestSuppliesAllowedReasonsAndPreservesSavedV5() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  let current = try context.requestMessages(timestampMilliseconds: 123)
+  let body = try #require(
+    JSONSerialization.jsonObject(with: Data(current[0].text.utf8)) as? [String: Any])
+  let scopes = try #require(body["scopes"] as? [[String: Any]])
+  let resolved = try #require(scopes.first)
+  #expect(
+    resolved["allowedNoChangeReasons"] as? [String]
+      == ["notDurable", "alreadyRepresented", "insufficientEvidence"])
+  let eligible = try #require(resolved["eligibleProposalScopes"] as? [[String: Any]])
+  #expect(eligible.contains { $0["kind"] as? String == "global" })
+  let schema = try #require(body["decisionSchema"] as? [String: Any])
+  let properties = try #require(schema["properties"] as? [String: Any])
+  let decisions = try #require(properties["decisions"] as? [String: Any])
+  let items = try #require(decisions["items"] as? [String: Any])
+  let variants = try #require(items["oneOf"] as? [[String: Any]])
+  let noChange = try #require(variants.first { ($0["properties"] as? [String: Any])?["reasonCode"] != nil })
+  let reasons = try #require((noChange["properties"] as? [String: Any])?["reasonCode"] as? [String: Any])
+  #expect((reasons["oneOf"] as? [[String: Any]])?.count == 4)
+
+  let unresolved = try fixture.context(resolution: .unresolved)
+  let unresolvedBody = try #require(
+    JSONSerialization.jsonObject(
+      with: Data(try unresolved.requestMessages(timestampMilliseconds: 123)[0].text.utf8))
+      as? [String: Any])
+  let unresolvedScopes = try #require(unresolvedBody["scopes"] as? [[String: Any]])
+  #expect(unresolvedScopes.first?["allowedNoChangeReasons"] as? [String] == ["unresolvedScope"])
+  #expect((unresolvedScopes.first?["eligibleProposalScopes"] as? [[String: Any]])?.isEmpty == true)
+
+  let saved = DreamRunEncoding.Request(
+    schemaVersion: 3, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+    inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+    systemPrompt: context.systemPrompt(rendering: .priorContextV5),
+    messages: try context.requestMessages(timestampMilliseconds: 123, rendering: .priorContextV5),
+    renderingVersion: DreamRequestRendering.priorContextV5.rawValue)
+  let bytes = try DreamRunEncoding.encode(saved)
+  let replay = try saved.verifiedDomain(run: fixture.run, context: context, bytes: bytes)
+  #expect(replay.rendering == .priorContextV5)
+  #expect(replay.request.requestHash == SourceDigest(bytes: bytes))
+  let oldBody = try #require(
+    JSONSerialization.jsonObject(with: Data(saved.messages[0].text.utf8)) as? [String: Any])
+  let oldScopes = try #require(oldBody["scopes"] as? [[String: Any]])
+  #expect(oldScopes.first?["allowedNoChangeReasons"] == nil)
+  #expect(oldScopes.first?["eligibleProposalScopes"] == nil)
 }
 
 @Test(arguments: [DreamRequestRendering.connectedV3, .stuckDetectionV4])
@@ -268,7 +317,7 @@ func dreamRequestSavedV3AndV4StillVerifyWithoutPriorContextSections(
   #expect(body["priorFindingsNotPrimaryEvidence"] == nil)
 }
 
-@Test func dreamRequestOnlyV5RendersPriorHistoryAfterTheStuckDetectionPrompt() throws {
+@Test func dreamRequestV5AndV6RenderPriorHistoryAfterTheStuckDetectionPrompt() throws {
   let fixture = try DecisionFixture()
   defer { fixture.clean() }
   let plain = try fixture.context()

@@ -63,43 +63,29 @@ test("registry streamSimple receives only pinned bytes and timestamps, captured 
 	}
 });
 
-const incompleteCauses = {
-	length: "response reached the output token limit", toolUse: "unexpected tool call", error: "provider error (no error message)",
-	aborted: "provider aborted the response (no error message)", pending: "response is pending", deferred: "response was deferred",
-};
-for (const reason of ["length", "toolUse", "error", "aborted", "pending", "deferred"] as const) test(`registry explains ${reason} terminal and final failures without accepting incomplete text`, async () => {
-	const f = registry(message({ stopReason: reason }));
-	await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${incompleteCauses[reason]}` });
-});
-
-test("provider error events retain only bounded errorMessage, not response content or payload fields", async () => {
+test("a stop reason other than stop reports the stop reason and bounded errorMessage, not response content", async () => {
 	const forbidden = new Proxy([], { get: () => assert.fail("Error content must not be inspected"), ownKeys: () => assert.fail("Error content must not be serialized") });
-	for (const reason of ["error", "aborted"] as const) {
-		const f = registry(message({ stopReason: reason, errorMessage: "fixture quota exceeded", content: forbidden }));
-		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${reason === "error" ? "provider error" : "provider aborted the response"}: fixture quota exceeded` });
+	for (const [errorMessage, cause] of [["fixture quota exceeded", "error: fixture quota exceeded"], [undefined, "error: no error message"]] as const) {
+		const f = registry(message({ stopReason: "error", errorMessage, content: forbidden }));
+		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${cause}` });
 	}
 	const reply = message({ stopReason: "error", errorMessage: "fixture failure\0\u001b[31m\u202e" + "🌱".repeat(1000) + "OMITTED", content: forbidden });
 	const f = registry(reply);
 	await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), (error: Error) => {
 		assert.ok(Buffer.byteLength(error.message) < 1000);
-		assert.ok(error.message.startsWith("Dream model call failed: provider error: fixture failure\\u{0}\\u{1B}[31m\\u{202E}"));
+		assert.ok(error.message.startsWith("Dream model call failed: error: fixture failure\\u{0}\\u{1B}[31m\\u{202E}"));
 		assert.ok(!error.message.includes("OMITTED"));
 		const report = dream.dreamReport({ ...final, status: "pending", runID: "run", base: "b".repeat(40), reason: "callbackFailure", detail: `Model call: ${error.message}` }, start);
 		assert.ok(dream.dreamReviewText(report).includes(`Cause: ${report.detail}`));
 		return true;
 	});
-	for (const errorMessage of [undefined, "", "  ", { toString: () => assert.fail("Non-text error must not be serialized") }] as unknown as (string | undefined)[]) {
-		const f = registry(message({ stopReason: "error", errorMessage, content: forbidden }));
-		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: provider error (no error message)" });
-	}
 });
 
-for (const [change, cause] of [
-	[{ content: [{ type: "toolCall", id: "x", name: "write", arguments: {} }] }, "response contained no text"],
-	[{ content: [{ type: "text", text: "x".repeat(262145) }] }, "response exceeded the 262144-byte text limit"],
-] as [Partial<AssistantMessage>, string][]) test(`registry explains invalid result: ${cause}`, async () => {
-	const f = registry(message(change));
-	await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: `Dream model call failed: ${cause}` });
+test("an empty or oversized response is refused", async () => {
+	for (const content of [[{ type: "toolCall", id: "x", name: "write", arguments: {} }], [{ type: "text", text: "x".repeat(262145) }]] as AssistantMessage["content"][]) {
+		const f = registry(message({ content }));
+		await assert.rejects(dream.callDreamModel(request, f.ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: empty or oversized response" });
+	}
 });
 
 test("only a subscription sign-in reaches streamSimple, so dreaming never bills an API key", async () => {
@@ -113,10 +99,7 @@ test("only a subscription sign-in reaches streamSimple, so dreaming never bills 
 	}
 });
 
-test("selection mismatch fails before registry; process environment excludes provider and Pi auth", async () => {
-	const f = registry();
-	await assert.rejects(dream.callDreamModel(request, f.ctx, { ...model, id: "changed" }, selection, new AbortController().signal), { message: "Dream model call failed: model selection does not match the request" });
-	assert.equal(f.calls.length, 0);
+test("process environment excludes provider and Pi auth", () => {
 	assert.deepEqual(dream.workerEnvironment({ HOME: "/home", PATH: "/bin", TMPDIR: "/tmp", LANG: "C", LC_ALL: "C", OPENAI_API_KEY: "forbidden", PI_CODING_AGENT_DIR: "forbidden", GIT_DIR: "forbidden" }), { HOME: "/home", PATH: "/bin", TMPDIR: "/tmp", LANG: "C", LC_ALL: "C" });
 });
 

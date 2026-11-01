@@ -115,7 +115,7 @@ test("real worker reports the provider's error cause but never its response, sav
 		return dream.callDreamModel(request, { modelRegistry: { ...subscription, ...registry } as unknown as Parameters<typeof dream.callDreamModel>[1]["modelRegistry"] }, model, f.start.selection, signal);
 	}, new AbortController().signal);
 	assert.equal(report.status, "pending"); assert.equal(report.reason, "callbackFailure"); assert.equal(report.generation, "0"); assert.equal(calls, 1);
-	assert.equal(report.detail, "Dream model call failed: provider error: fixture provider quota exceeded");
+	assert.equal(report.detail, "Dream model call failed: error: fixture provider quota exceeded");
 	const display = dream.dreamReviewText(report);
 	assert.ok(display.includes(`Cause: ${report.detail}`)); assert.ok(display.includes("Discuss recovery in conversation before another model call.")); assert.ok(!display.includes("/dream")); assert.ok(!display.includes("PRIVATE PARTIAL RESPONSE"));
 	const directory = join(f.roots.state, "runs", report.runID!);

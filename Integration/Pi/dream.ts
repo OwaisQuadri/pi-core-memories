@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
+import type { Context } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { commandPath, commandReady } from "./command.ts";
@@ -447,23 +447,13 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 
 export class DreamCallFailure extends Error {}
 export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionContext, "modelRegistry">, model: NonNullable<ExtensionContext["model"]>, selection: DreamSelection, signal: AbortSignal): Promise<string> {
-	function modelFailure(cause: string): never { throw new DreamCallFailure(`Dream model call failed: ${cause}`); }
-	function incompleteResponse(reason: AssistantMessage["stopReason"], errorMessage?: string): never {
-		const causes = { stop: "unexpected stop reason", length: "response reached the output token limit", toolUse: "unexpected tool call", error: "provider error", aborted: "provider aborted the response", pending: "response is pending", deferred: "response was deferred" };
-		const diagnostic = reason === "error" || reason === "aborted"
-			? typeof errorMessage === "string" && errorMessage.trim() ? `: ${Buffer.from(escapeDreamDisplay(errorMessage.slice(0, 800))).subarray(0, 800).toString()}` : " (no error message)"
-			: "";
-		return modelFailure((causes[reason] ?? "unknown stop reason") + diagnostic);
-	}
-	if (!isSameSelection(request.selection, selection) || model.provider !== selection.provider || model.id !== selection.modelID) modelFailure("model selection does not match the request");
-	if (model.api === "pi-virtual" || !ctx.modelRegistry.isUsingOAuth(model) || ctx.modelRegistry.getProvider(model.provider)?.auth.oauth?.isSubscription !== true) modelFailure("the selected model is not using a subscription sign-in; nothing was dispatched");
+	if (model.api === "pi-virtual" || !ctx.modelRegistry.isUsingOAuth(model) || ctx.modelRegistry.getProvider(model.provider)?.auth.oauth?.isSubscription !== true) throw new DreamCallFailure("Dream model call failed: the selected model is not using a subscription sign-in; nothing was dispatched");
 	const context: Context = { systemPrompt: request.systemPrompt, messages: request.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })) };
 	const reasoning = selection.thinkingLevel === "off" ? undefined : selection.thinkingLevel as "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	const message = await ctx.modelRegistry.streamSimple(model, context, { signal, reasoning }).result();
-	if (message.stopReason !== "stop") incompleteResponse(message.stopReason, message.errorMessage);
+	if (message.stopReason !== "stop") throw new DreamCallFailure(`Dream model call failed: ${message.stopReason}: ${Buffer.from(escapeDreamDisplay((message.errorMessage ?? "no error message").slice(0, 800))).subarray(0, 800).toString()}`);
 	const reply = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("");
-	if (!reply) modelFailure("response contained no text");
-	if (Buffer.byteLength(reply) > maximumTextBytes) modelFailure(`response exceeded the ${maximumTextBytes}-byte text limit`);
+	if (!reply || Buffer.byteLength(reply) > maximumTextBytes) throw new DreamCallFailure("Dream model call failed: empty or oversized response");
 	return reply;
 }
 

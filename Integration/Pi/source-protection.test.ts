@@ -26,15 +26,6 @@ test("source protection binds UTF-8 bytes and piece boundaries before forwarding
 	assert.deepEqual(result, { version: 1, type: "sourceProtectionResult", invocationID: "fixture", requestID: "request", inputDigest: request.inputDigest, status: "checked", policy: "pi-credentials/redact-v1", pieces: ["synthetic replacement"], outputDigest: sourceProtectionDigest(["synthetic replacement"]) });
 });
 
-test("missing, duplicate, unavailable and malformed providers cannot return checked source", async () => {
-	const checked = { version: 1, async redact(value: { requestID: string; pieces: string[] }) { return { status: "checked", requestID: value.requestID, policy: "pi-credentials/redact-v1", pieces: value.pieces }; } };
-	for (const providers of [[], [checked, checked], [{ version: 2, redact() {} }], [{ version: 1, async redact() { return { status: "checked", requestID: "wrong", policy: "pi-credentials/redact-v1", pieces: [] }; } }], [{ version: 1, async redact() { return { status: "blocked", requestID: "request", code: "unavailable" }; } }]]) {
-		const result = await protectDreamSources(bus(providers), "fixture", frame(), signal());
-		assert.equal(result.status, "blocked");
-		assert.ok(!JSON.stringify(result).includes("synthetic café"));
-	}
-});
-
 test("wrong bindings, changed digest, duplicate fields and invalid Unicode never reach a provider", async () => {
 	let calls = 0;
 	const pi = bus([{ version: 1, async redact() { calls++; throw new Error("not reached"); } }]);

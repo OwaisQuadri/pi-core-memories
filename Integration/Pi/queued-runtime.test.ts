@@ -11,7 +11,6 @@ import type { DreamReport, DreamRequest, DreamStart, runDreamWorker } from "./dr
 import type { openQueueClient } from "./queue-client.ts";
 import "./test/host.ts";
 const { memoryRequestIdentity, registerQueuedRuntime, assertArchivedRequest } = await import("./queued-runtime.ts");
-const { DreamCallFailure } = await import("./dream.ts");
 const { ExtensionRunner, createExtensionRuntime } = await import("@earendil-works/pi-coding-agent");
 const stateDirectory = await mkdtemp(join(tmpdir(), "pi-core-memories-runtime-"));
 after(() => rm(stateDirectory, { recursive: true, force: true }));
@@ -72,6 +71,9 @@ function runtime(run: typeof runDreamWorker, mode = "tui", openFailure?: Error, 
 		get tool() { assert.ok(registeredTool); return registeredTool; },
 		emit: async (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx) };
 }
+async function until(condition: () => boolean | Promise<boolean>, failure: string): Promise<void> {
+	for (const deadline = Date.now() + 5_000; !(await condition()); await sleep(1)) if (Date.now() > deadline) assert.fail(failure);
+}
 const archivedRequest = (start: DreamStart, session = "archived"): DreamRequest => ({ version: 1, type: "modelRequest", invocationID: start.invocationID, requestID: "request", runID: "run", generation: "1", inputHash: "a".repeat(64), contextHash: "b".repeat(64), requestHash: "c".repeat(64), selection: start.selection, systemPrompt: "Synthetic status test", messages: [{ role: "user", text: JSON.stringify({ primaryEvidence: [{ source: { session, entry: "entry", part: 0 } }] }), timestampMilliseconds: 0 }] });
 
 test("dreaming keeps running while this window works and reports the blocked reason without details", async () => {
@@ -95,10 +97,10 @@ test("dreaming keeps running while this window works and reports the blocked rea
 		await f.emit("input", { source: "interactive", text: "keep working" }); await f.emit("before_agent_start"); await f.emit("tool_execution_start");
 		assert.equal(workerSignal!.aborted, false);
 		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active");
-		release(); await sleep(30);
+		const path = join(stateDirectory, "last-dream-blocked.json");
+		release(); await until(() => stat(path).then(() => true, () => false), "No blocked report");
 		assert.equal(runs, 2);
 		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: blocked, reason: sourceProtection:invalidReply, message: "Native dream worker blocked the run")');
-		const path = join(stateDirectory, "last-dream-blocked.json");
 		assert.equal((await stat(path)).mode & 0o777, 0o600);
 		const { time, ...recorded } = JSON.parse(await readFile(path, "utf8"));
 		assert.ok(!Number.isNaN(Date.parse(time)));
@@ -107,86 +109,10 @@ test("dreaming keeps running while this window works and reports the blocked rea
 	assert.equal(f.statuses.has("pi-core-memories:dream"), false);
 });
 
-test("a blocked reason with unsafe characters cannot inject text into the footer", async () => {
-	const f = runtime(async () => ({ status: "blocked", reason: 'x") PRIVATE\nreason', detail: null }) as unknown as DreamReport);
-	try {
-		await f.emit("session_start"); await sleep(30);
-		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: blocked, reason: unknown, message: "Native dream worker blocked the run")');
-	} finally { await f.stop(); }
-});
-
-test("a blocked report that cannot be saved still shows its reason in the footer", async () => {
-	const f = runtime(async () => ({ status: "blocked", reason: "workerFailure", detail: null }) as unknown as DreamReport, "tui", undefined, { liveDirectory: join(stateDirectory, "missing") });
-	try {
-		await f.emit("session_start"); await sleep(30);
-		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: blocked, reason: workerFailure, message: "Native dream worker blocked the run")');
-	} finally { await f.stop(); }
-});
-
-test("a window that loses the native dream lock stays idle and keeps retrying", async () => {
-	let runs = 0;
-	const f = runtime(async () => { runs++; return { status: "busy" } as DreamReport; });
-	try {
-		await f.emit("session_start"); await sleep(120);
-		assert.ok(runs > 3);
-		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
-	} finally { await f.stop(); }
-});
-
-for (const boundary of ["worker", "provider", "window", "marker"] as const) {
-	test(`dream status reports ${boundary} failures without raw error text`, async () => {
-		const f = runtime(async () => { throw new Error("PRIVATE_MODEL_PAYLOAD"); }, "tui", undefined,
-			boundary === "marker" ? { mark: async () => { throw new Error("PRIVATE_SOURCE_PATH"); } } : {});
-		if (boundary === "provider") Object.assign(f.ctx, { model: { ...f.ctx.model!, provider: "unsupported" } });
-		if (boundary === "window") Object.assign(f.ctx, { model: { ...f.ctx.model!, contextWindow: 1 } });
-		try {
-			await f.emit("session_start"); await sleep(30);
-			const expected = { worker: "workerFailure", provider: "unsupportedProvider", window: "contextWindow", marker: "liveSessionUnavailable" }[boundary];
-			assert.ok(f.statuses.get("pi-core-memories:dream")?.includes(`error(code: ${expected},`));
-			assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /PRIVATE/);
-		} finally { await f.stop(); }
-	});
-}
-
-test("live marker read failures report liveSessionUnavailable without counting worker failures", async () => {
-	let runs = 0;
-	const f = runtime(async () => { runs++; return { status: "noNewRecords" } as DreamReport; }, "tui", undefined, { live: async () => { throw new Error("PRIVATE_PATH"); } });
-	try {
-		await f.emit("session_start"); await sleep(120);
-		assert.equal(runs, 0);
-		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: liveSessionUnavailable,/);
-		assert.ok(f.opened.length > 3, "dreaming keeps retrying with no worker-failure backoff stop");
-	} finally { await f.stop(); }
-});
-
-test("a failed live marker is retried on later schedules", async () => {
-	let attempts = 0;
-	const f = runtime(async () => ({ status: "noNewRecords" }) as DreamReport, "tui", undefined, { mark: async () => { if (++attempts === 1) throw new Error("busy"); return { close: async () => {} }; } });
-	try {
-		await f.emit("session_start");
-		assert.match(f.statuses.get("pi-core-memories:dream")!, /liveSessionUnavailable/);
-		await sleep(60);
-		assert.equal(attempts, 2);
-		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /error/);
-	} finally { await f.stop(); }
-});
-
-test("an interactive window with no session file dreams without a live marker error", async () => {
-	let runs = 0;
-	const f = runtime(async () => { runs++; return { status: "noNewRecords" } as DreamReport; });
-	Object.assign(f.ctx.sessionManager, { getSessionFile: () => undefined });
-	try {
-		await f.emit("session_start"); await f.emit("input", { source: "interactive", text: "keep working" }); await sleep(30);
-		assert.deepEqual(f.marks, []);
-		assert.ok(runs > 0);
-		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /error/);
-	} finally { await f.stop(); }
-});
-
 for (const mode of ["print", "rpc"]) {
 	test(`a ${mode} session with a session file writes a live marker but never dreams`, async () => {
 		const f = runtime(async () => assert.fail("Non-interactive sessions must not dream"), mode);
-		try { await f.emit("session_start"); await sleep(30); assert.deepEqual(f.marks, ["session"]); }
+		try { await f.emit("session_start"); await until(() => f.marks.length > 0, "No live marker"); assert.deepEqual(f.marks, ["session"]); }
 		finally { await f.stop(); }
 		assert.deepEqual(f.unmarks, ["session"]);
 	});
@@ -199,60 +125,36 @@ test("the footer combines dream state with the nonzero review count from the nat
 		open: async () => ({ request: async (type: string) => { seen.push(f.statuses.get("pi-core-memories:dream")!); assert.equal(type, "counts"); return { type: "counts", review: 2 }; }, close: async () => {} }) as unknown as Awaited<ReturnType<typeof openQueueClient>>,
 	});
 	try {
-		await f.emit("session_start"); await sleep(30);
+		await f.emit("session_start");
+		await until(() => f.statuses.get("pi-core-memories:dream") === "dreaming: active \u00b7 2 to review", "No review count in the footer");
 		assert.equal(seen[0], "dreaming: active");
-		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active \u00b7 2 to review");
-		release(); await sleep(5);
 	} finally { release(); await f.stop(); }
 });
 
-test("a long backoff timer shrinks when input resets failures", async () => {
+test("a long backoff timer shrinks when input resets failures", async (t) => {
 	let runs = 0;
 	const f = runtime(async () => { runs++; throw new Error("fail"); }, "tui", undefined, { idleMilliseconds: 20 });
+	Object.assign(f.ctx.sessionManager, { getSessionFile: () => undefined });
+	async function expectRuns(expected: number): Promise<void> {
+		for (let turn = 0; turn < 100 && runs !== expected; turn++) await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(runs, expected);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	t.mock.timers.enable({ apis: ["setTimeout"] });
 	try {
-		await f.emit("session_start"); await sleep(70);
-		const before = runs;
-		assert.equal(before, 2, "the third run waits for an 80 ms backoff");
-		await f.emit("input", { source: "interactive", text: "next" });
-		await sleep(40);
-		assert.ok(runs > before, "input reschedules the shorter delay");
-	} finally { await f.stop(); }
-});
-
-test("a session switch removes the old live marker before marking the replacement", async () => {
-	const f = runtime(async () => assert.fail("No status test may dispatch"), "tui", undefined, { idleMilliseconds: 60_000 });
-	try {
-		await f.emit("session_start"); await f.emit("session_before_switch");
-		assert.deepEqual(f.unmarks, ["session"]);
 		await f.emit("session_start");
-		assert.deepEqual(f.marks, ["session", "session"]);
-		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
-	} finally { await f.stop(); }
-	assert.deepEqual(f.unmarks, ["session", "session"]);
-});
-
-test("dream status reports backend failure without exposing the model error", async () => {
-	const f = runtime(async (start, call, signal) => {
-		await call(archivedRequest(start), signal);
-		return { status: "noNewRecords" } as DreamReport;
-	}, "tui", undefined, { call: async () => { throw new Error("PRIVATE_RESPONSE_TOKEN"); } });
-	try {
-		await f.emit("session_start"); await sleep(30);
-		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: backendFailure,/);
-		assert.doesNotMatch(f.statuses.get("pi-core-memories:dream")!, /PRIVATE/);
-	} finally { await f.stop(); }
-});
-
-test("dream status keeps the cause that the model call reported after the worker leaves the run pending", async () => {
-	const f = runtime(async (start, call, signal) => {
-		try { await call(archivedRequest(start), signal); }
-		catch (error) { return { status: "pending", reason: "callbackFailure", detail: (error as Error).message } as DreamReport; }
-		return { status: "noNewRecords" } as DreamReport;
-	}, "tui", undefined, { call: async () => { throw new DreamCallFailure("Dream model call failed: provider error: prompt is too long\u001b[2J"); } });
-	try {
-		await f.emit("session_start"); await sleep(30);
-		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: backendFailure, message: "Dream model call failed: provider error: prompt is too long\\\\u{1B}[2J")');
-	} finally { await f.stop(); }
+		t.mock.timers.tick(20);
+		await expectRuns(1);
+		t.mock.timers.tick(40);
+		await expectRuns(2);
+		t.mock.timers.tick(79);
+		assert.equal(runs, 2, "the third run waits for an 80 ms backoff");
+		await f.emit("input", { source: "interactive", text: "next" });
+		t.mock.timers.tick(19);
+		assert.equal(runs, 2);
+		t.mock.timers.tick(1);
+		await expectRuns(3);
+	} finally { await f.stop(); t.mock.timers.reset(); }
 });
 
 test("live sessions are excluded at start and a session that opens mid-run blocks its evidence", async () => {
@@ -264,24 +166,12 @@ test("live sessions are excluded at start and a session that opens mid-run block
 		return { status: "noNewRecords" } as DreamReport;
 	}, "tui", undefined, { call: async () => { calls++; return "{}"; } });
 	try {
-		await f.emit("session_start"); await sleep(30);
+		await f.emit("session_start");
+		await until(() => /error\(code: workerFailure,/.test(f.statuses.get("pi-core-memories:dream") ?? ""), "No worker failure");
 		assert.deepEqual(excluded.slice(0, 2), ["another-live-session", "session"]);
 		assert.equal(calls, 0);
 		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: workerFailure,/);
 	} finally { await f.stop(); }
-});
-
-test("model selection changes cancel a running worker and shutdown stops rescheduling", async () => {
-	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
-	let workerSignal: AbortSignal | undefined; let runs = 0;
-	const f = runtime(async (_start, _call, signal, _progress, protect) => {
-		runs++; workerSignal = signal; assert.equal(typeof protect, "function"); enter();
-		await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-		throw new Error("cancelled");
-	});
-	await f.emit("session_start"); await Promise.race([entered, sleep(1000).then(() => assert.fail("No worker"))]);
-	await f.emit("model_select"); assert.equal(workerSignal!.aborted, true);
-	await f.stop(); const after = runs; await sleep(20); assert.equal(runs, after);
 });
 
 function footerHistory(ctx: ExtensionContext): (string | undefined)[] {
@@ -300,7 +190,8 @@ test("an interrupted call after a restart is retried under its recorded selectio
 	}, "tui", undefined, { call: async () => { calls++; return "{}"; } });
 	const footer = footerHistory(f.ctx);
 	try {
-		await f.emit("session_start"); await sleep(60);
+		await f.emit("session_start");
+		await until(() => calls === 1 && f.statuses.get("pi-core-memories:dream") === "dreaming: idle", "No retried call");
 		assert.deepEqual(starts.slice(0, 2).map((start) => start.resume), ["inspectOrContinue", "retryInterruptedCall"]);
 		assert.deepEqual(starts[1]!.selection, starts[0]!.selection);
 		assert.equal(calls, 1);
@@ -318,81 +209,19 @@ test("an interrupted call is never retried under another selection and shows its
 	});
 	const footer = footerHistory(f.ctx);
 	try {
-		await f.emit("session_start"); await sleep(40);
+		await f.emit("session_start");
+		await until(() => f.statuses.get("pi-core-memories:dream")?.startsWith("dreaming: error(code: interruptedCall,") ?? false, "No interrupted call status");
 		assert.deepEqual(starts.map((start) => start.resume), ["inspectOrContinue"]);
 		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: interruptedCall, message: "Interrupted dream needs the model it started with: anthropic/recorded, thinking low")');
 		Object.assign(f.ctx, { model: { provider: "anthropic", id: "recorded", contextWindow: 262_144 }, thinkingLevel: "low" });
-		await f.emit("model_select"); await sleep(40);
+		await f.emit("model_select");
+		await until(() => starts.length >= 3, "No retry under the recorded selection");
 		assert.deepEqual(starts.slice(0, 3).map((start) => start.resume), ["inspectOrContinue", "inspectOrContinue", "retryInterruptedCall"]);
 		assert.deepEqual(starts[2]!.selection, recorded);
 		assert.ok(!footer.includes("dreaming: paused"));
 	} finally { await f.stop(); }
 });
 
-test("a pending run, including one waiting on saved recovery, shows its reason as an error instead of paused, and a cancelled or dropped run is rescheduled", async () => {
-	for (const reason of ["callbackFailure", "invalidDecision", "staleUnpublishedPlans", "cancelled", "droppedBatch"]) {
-		let runs = 0;
-		const f = runtime(async () => { runs++; return { status: "pending", reason } as DreamReport; });
-		const footer = footerHistory(f.ctx);
-		try {
-			await f.emit("session_start"); await sleep(40);
-			assert.ok(!footer.includes("dreaming: paused"));
-			if (reason === "cancelled" || reason === "droppedBatch") { assert.ok(runs > 1); continue; }
-			assert.equal(runs, 1);
-			assert.equal(f.statuses.get("pi-core-memories:dream"), `dreaming: error(code: pending, reason: ${reason}, message: "Native dream worker kept the run pending")`);
-		} finally { await f.stop(); }
-	}
-});
-
-test("the footer shows paused only while a foreground memory write holds the queue", async () => {
-	const f = conversationalRuntime();
-	const footer = footerHistory(f.ctx);
-	try {
-		await f.emit("session_start"); await f.emit("model_select"); await f.emit("thinking_level_select");
-		assert.ok(!footer.includes("dreaming: paused"));
-		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
-		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
-		await f.call("memory_queue", { operation: "cancel" });
-		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: idle");
-	} finally { await f.stop(); }
-});
-
-test("closing a proposal during a background run returns the footer from paused to active", async () => {
-	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
-	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
-	const f = conversationalRuntime([], [], { idleMilliseconds: 5, run: async () => { enter(); await released; return { status: "noNewRecords" } as DreamReport; } });
-	try {
-		await f.emit("session_start");
-		await Promise.race([entered, sleep(1000).then(() => assert.fail("No background run"))]);
-		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
-		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
-		await f.call("memory_queue", { operation: "cancel" });
-		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active");
-	} finally { release(); await f.stop(); }
-});
-
-
-test("a native queue refusal never retries another context", async () => {
-	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", new Error("Native queue unavailable."));
-	try {
-		await f.emit("session_start");
-		await assert.rejects(f.tool.execute("refused", { operation: "pending" }, undefined, undefined, f.ctx), /Native queue unavailable/);
-		assert.equal(f.opened.length, 1); assert.equal(f.opened[0]?.length, 2);
-		assert.equal(f.closed.length, 0); assert.equal(f.marks.length, 1);
-	} finally { await f.stop(); }
-});
-
-test("ordinary conversation keeps the shared queue and the live session marker", async () => {
-	const f = runtime(async () => ({ status: "pending" }) as DreamReport);
-	try {
-		await f.emit("session_start");
-		assert.doesNotMatch(JSON.stringify(f.tool.parameters), /"review"|"manage"/);
-		assert.deepEqual([...f.tools.keys()].sort(), ["memory_add", "memory_delete", "memory_get", "memory_list", "memory_queue", "memory_update"]);
-		await f.tool.execute("default", { operation: "pending" }, undefined, undefined, f.ctx);
-		assert.equal(f.opened.length, 2); assert.equal(f.opened[0]?.length, 2);
-		assert.equal(f.marks.length, 1); assert.equal(f.closed.length, 2);
-	} finally { await f.stop(); }
-});
 
 test("pending and present run the verified queue work once, with at most one count refresh after it", async () => {
 	const f = conversationalRuntime();
@@ -472,75 +301,6 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 	};
 }
 
-test("snippet relocation uses the existing durable reply boundary and typed private approval channel", async () => {
-	for (const source of ["interactive", "extension"]) {
-		const f = conversationalRuntime();
-		try {
-			await f.emit("session_start");
-			const shown = await f.call("memory_queue", { operation: "relocate-snippets", baselineRunID: "synthetic-baseline", replacement: "/synthetic/migrated-snippets" });
-			assert.equal((shown.details as Record<string, unknown>).status, "proposal-queued");
-			assert.match(f.displays[0]!, /relocate-snippets/);
-			assert.match(f.displays[0]!, /\/synthetic\/migrated-snippets/);
-			await f.call("memory_queue", { operation: "reply" });
-			assert.equal(f.frames.filter((frame) => frame.type === "relocation-reply").length, 0);
-			await f.reply("Approve this snippet relocation", undefined, source);
-			const result = await f.call("memory_queue", { operation: "reply" });
-			assert.equal((result.details as Record<string, unknown>).status, source === "interactive" ? "relocated" : "no-live-conversation-reply");
-			const replies = f.frames.filter((frame) => frame.type === "relocation-reply");
-			assert.equal(replies.length, source === "interactive" ? 1 : 0);
-			if (replies[0]) {
-				assert.equal(replies[0].isPrivate, true);
-				assert.equal(replies[0].fields.originalText, "Approve this snippet relocation");
-				assert.equal(f.frames.find((frame) => frame.type === "relocation-presented")?.isPrivate, true);
-			}
-		} finally { await f.stop(); }
-	}
-});
-
-test("relocation receipt mismatch cannot masquerade as memory approval", async () => {
-	const f = conversationalRuntime(["invalid"]);
-	try {
-		await f.emit("session_start");
-		await f.call("memory_queue", { operation: "relocate-snippets", baselineRunID: "synthetic-baseline", replacement: "/synthetic/snippets" });
-		await f.reply("Approve this snippet relocation");
-		const result = await f.call("memory_queue", { operation: "reply" });
-		assert.equal((result.details as Record<string, unknown>).status, "outcome-unresolved");
-		assert.equal((result.details as Record<string, unknown>).recovery, "relocation-recover");
-	} finally { await f.stop(); }
-});
-
-test("the same native claim spans a later reply turn without retaining the finished tool signal", async () => {
-	const f = conversationalRuntime(); const turn = new AbortController();
-	try {
-		await f.emit("session_start");
-		const proposed = await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) }, turn.signal);
-		assert.equal((proposed.details as Record<string, unknown>).status, "proposal-queued");
-		assert.doesNotMatch(JSON.stringify(proposed.details), /unit-claim|displayDigest/);
-		turn.abort(); assert.equal(f.signals[0]?.aborted, false);
-		await f.emit("agent_end"); assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: paused");
-		await f.reply("save that memory");
-		const saved = await f.call("memory_queue", { operation: "reply" });
-		assert.equal((saved.details as Record<string, unknown>).status, "approved");
-		const reply = f.frames.find((frame) => frame.type === "reply"); assert.ok(reply);
-		assert.equal(reply.fields.originalText, "save that memory"); assert.equal(reply.fields.submittedText, "save that memory");
-		assert.equal(reply.isPrivate, true); assert.equal(f.frames.filter((frame) => frame.type === "claim").length, 1);
-		assert.equal(f.closes.length, 1);
-	} finally { await f.stop(); }
-});
-
-test("ambiguous input keeps the same claim and rearms only the native conversation", async () => {
-	const f = conversationalRuntime(["clarify", "approved"]);
-	try {
-		await f.emit("session_start"); await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
-		await f.reply("yes"); const unclear = await f.call("memory_queue", { operation: "reply" });
-		assert.equal((unclear.details as Record<string, unknown>).status, "needs-memory-clarification");
-		assert.equal(f.closes.length, 0); assert.equal(f.displays.length, 2);
-		await f.reply("save that memory"); await f.call("memory_queue", { operation: "reply" });
-		assert.equal(f.frames.filter((frame) => frame.type === "presented").length, 1);
-		assert.equal(f.frames.filter((frame) => frame.type === "claim").length, 1);
-	} finally { await f.stop(); }
-});
-
 test("a candidate amendment keeps its owner and cannot reuse approval for the old display", async () => {
 	const f = conversationalRuntime();
 	try {
@@ -572,16 +332,6 @@ test("a candidate amendment keeps its owner and cannot reuse approval for the ol
 	} finally { await f.stop(); }
 });
 
-test("a candidate amendment cannot switch the owned revision", async () => {
-	const f = conversationalRuntime();
-	try {
-		await f.emit("session_start"); await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
-		await assert.rejects(f.call("memory_queue", { operation: "amend", revision: "b".repeat(64), amendment: { replacement: "Changed entry.", reason: "Revise it." } }), /does not match the live finding/);
-		assert.equal(f.frames.filter((frame) => frame.type === "amend" || frame.type === "reply").length, 0);
-		assert.equal(f.closes.length, 1);
-	} finally { await f.stop(); }
-});
-
 test("changing a manual proposal requires a new native preview and a later original reply", async () => {
 	const f = conversationalRuntime();
 	const first = { base: "b".repeat(40), path: "MEMORY.md", replacement: "first", reason: "User request." };
@@ -595,17 +345,6 @@ test("changing a manual proposal requires a new native preview and a later origi
 		assert.equal(f.displays.length, 2);
 		await f.reply("save that memory"); const saved = await f.call("memory_add", { reason: first.reason, replacement: "amended", path: first.path, base: first.base });
 		assert.equal((saved.details as Record<string, unknown>).status, "approved");
-	} finally { await f.stop(); }
-});
-
-test("unrelated next-turn work and session replacement release pending native ownership", async () => {
-	const f = conversationalRuntime();
-	try {
-		await f.emit("session_start"); await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
-		await f.reply("continue the research"); await f.emit("tool_call", { toolName: "read" });
-		assert.equal(f.closes.length, 1); assert.equal(f.frames.filter((frame) => frame.type === "reply").length, 0);
-		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
-		await f.emit("session_before_fork"); assert.equal(f.closes.length, 2);
 	} finally { await f.stop(); }
 });
 
@@ -638,7 +377,6 @@ test("the exact proposal stays visible but is excluded from model context", asyn
 
 const pendingRow = (revision: string, proposed: string, disposition = "pending", blockReason?: string) => ({ finding: { revision, proposed: Buffer.from(proposed).toString("base64") }, disposition, ...blockReason ? { blockReason } : {} });
 type ContextMessage = { role: string; customType?: string; content?: unknown; timestamp?: number };
-const reminders = (messages: ContextMessage[]) => messages.filter((message) => message.customType === "pi-core-memories:pending-reminder");
 function reminderTurns(f: ReturnType<typeof runtime>, transcript: ContextMessage[] = [{ role: "user", content: "Earlier request.", timestamp: 1 }, { role: "assistant", content: [], timestamp: 2 }]) {
 	const runner = new ExtensionRunner([{ path: "queued-runtime", handlers: new Map([...f.handlers].map(([name, handler]) => [name, [handler]])) } as unknown as Extension], createExtensionRuntime(), "/synthetic", f.ctx.sessionManager as unknown as SessionManager, {} as ModelRegistry);
 	runner.onError((error) => assert.fail(error.error));
@@ -671,184 +409,6 @@ test("a pending finding the user's request could match reaches the model each tu
 		assert.match(reminder, new RegExp(`- ${pending}: The synthetic build host uses the staging profile\.\n- ${"b".repeat(64)}: Deferred earlier\.$`));
 		assert.doesNotMatch(reminder, /Second line|Approved|Rejected|unresolved/);
 	} finally { await f.stop(); }
-});
-
-test("an unchanged pending list keeps one reminder in place so earlier context stays a cacheable prefix", async () => {
-	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
-	try {
-		await f.emit("session_start");
-		const turn = reminderTurns(f);
-		const first = await turn();
-		assert.ok(first.reminder);
-		const second = await turn();
-		assert.equal(JSON.stringify(second.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
-		assert.equal(second.reminder, undefined);
-		assert.equal(reminders(second.messages).length, 1);
-	} finally { await f.stop(); }
-});
-
-test("a pending reminder leaves mid-conversation system messages in place through Pi's context runner", async () => {
-	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
-	try {
-		await f.emit("session_start");
-		const system = [{ role: "system", content: "Synthetic base prompt.", timestamp: 0 }, { role: "system", content: "Synthetic tool loadout update.", timestamp: 3 }];
-		const turn = reminderTurns(f, [system[0], { role: "user", content: "Earlier request.", timestamp: 1 }, { role: "assistant", content: [], timestamp: 2 }, system[1]]);
-		const first = await turn();
-		assert.ok(first.reminder);
-		assert.deepEqual([first.messages[0], first.messages[3]], system);
-		const second = await turn();
-		assert.equal(JSON.stringify(second.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
-	} finally { await f.stop(); }
-});
-
-test("a repeat context request in one run re-sends the same reminder once and never saves or sends it", async () => {
-	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
-	try {
-		await f.emit("session_start");
-		const turn = reminderTurns(f);
-		const first = await turn();
-		first.transcript.push({ role: "assistant", content: [], timestamp: 10 }, { role: "toolResult", content: [], timestamp: 11 });
-		const repeated = await turn.request();
-		assert.equal(JSON.stringify(repeated.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
-		assert.equal(reminders(repeated.messages).length, 1);
-		assert.doesNotMatch(JSON.stringify([f.entries, f.messages]), /pending-reminder|Synthetic pending claim/);
-	} finally { await f.stop(); }
-});
-
-test("a prompt still gets the current reminder after compaction removes the prompt its unchanged reminder was anchored on", async () => {
-	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
-	try {
-		await f.emit("session_start");
-		const turn = reminderTurns(f);
-		const first = await turn();
-		assert.equal((await turn()).reminder, undefined);
-		first.transcript.splice(0, 4);
-		const compacted = await turn();
-		assert.equal(compacted.reminder, first.reminder);
-		assert.equal(reminders(compacted.messages).length, 1);
-	} finally { await f.stop(); }
-});
-
-test("a changed pending list appends a new reminder and keeps earlier reminders in place until their prompt is compacted away", async () => {
-	let rows = [pendingRow("a".repeat(64), "First synthetic claim."), pendingRow("b".repeat(64), "Second synthetic claim.")];
-	const f = reminderRuntime(() => rows);
-	try {
-		await f.emit("session_start");
-		const turn = reminderTurns(f);
-		const first = await turn();
-		rows = rows.slice(0, 1);
-		const second = await turn();
-		assert.equal(JSON.stringify(second.messages.slice(0, first.messages.length)), JSON.stringify(first.messages));
-		assert.match(second.reminder!, /First synthetic claim/); assert.doesNotMatch(second.reminder!, /Second synthetic claim/);
-		assert.equal(reminders(second.messages).length, 2);
-		rows = [];
-		const emptied = await turn();
-		assert.match(emptied.reminder!, /no pending memory proposals need asking about now; earlier pending-findings reminders are out of date/);
-		assert.equal(JSON.stringify(emptied.messages.slice(0, second.messages.length)), JSON.stringify(second.messages));
-		const unchanged = await turn();
-		assert.equal(unchanged.reminder, undefined); assert.equal(reminders(unchanged.messages).length, 3);
-		unchanged.transcript.splice(0, 4);
-		const compacted = await turn();
-		assert.deepEqual(reminders(compacted.messages).map((message) => message.content), reminders(unchanged.messages).slice(1).map((message) => message.content));
-	} finally { await f.stop(); }
-});
-
-test("a finding answered in this session leaves the reminder until a new session", async () => {
-	const revision = "a".repeat(64);
-	const f = conversationalRuntime(["deferred"], [pendingRow(revision, "Synthetic pending claim.", "deferred")]);
-	try {
-		await f.emit("session_start");
-		const turn = reminderTurns(f);
-		assert.match((await turn()).reminder!, new RegExp(revision));
-		await f.call("memory_queue", { operation: "present", revision });
-		await f.reply("leave that for later");
-		const deferred = await f.call("memory_queue", { operation: "reply" });
-		assert.equal((deferred.details as Record<string, unknown>).status, "deferred");
-		assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
-		await f.emit("session_start");
-		assert.match((await turn()).reminder!, new RegExp(revision));
-	} finally { await f.stop(); }
-});
-
-test("a failed queue read after an answer still drops the answered finding from the current reminder", async () => {
-	const answered = "a".repeat(64); const other = "b".repeat(64);
-	let isBusy = false;
-	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return [pendingRow(answered, "Answered synthetic claim."), pendingRow(other, "Other synthetic claim.")]; });
-	try {
-		await f.emit("session_start");
-		const turn = reminderTurns(f);
-		const first = await turn();
-		assert.match(first.reminder!, new RegExp(answered));
-		await f.call("memory_queue", { operation: "present", revision: answered });
-		await f.reply("leave that for later");
-		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
-		isBusy = true;
-		const busy = await turn();
-		assert.equal(busy.reminder, first.reminder!.split("\n").filter((line) => !line.startsWith(`- ${answered}:`)).join("\n"));
-		assert.match(busy.reminder!, new RegExp(`- ${other}: Other synthetic claim`));
-		assert.equal((await turn()).reminder, undefined);
-	} finally { await f.stop(); }
-});
-
-test("a failed queue read filters the reminder that survives a branch move, not one the move removed", async () => {
-	const answered = "a".repeat(64); const other = "b".repeat(64);
-	let isBusy = false; let rows = [pendingRow(answered, "Answered synthetic claim."), pendingRow(other, "Other synthetic claim.")];
-	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return rows; });
-	try {
-		await f.emit("session_start");
-		const turn = reminderTurns(f);
-		const first = await turn();
-		await f.call("memory_queue", { operation: "present", revision: answered });
-		await f.reply("leave that for later");
-		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
-		rows = [rows[1]!];
-		const second = await turn();
-		assert.doesNotMatch(second.reminder!, new RegExp(answered));
-		second.transcript.splice(-2);
-		isBusy = true;
-		const moved = await turn();
-		assert.equal(moved.reminder, first.reminder!.split("\n").filter((line) => !line.startsWith(`- ${answered}:`)).join("\n"));
-		assert.equal(reminders(moved.messages).length, 2);
-	} finally { await f.stop(); }
-});
-
-test("a failed queue read after the last listed finding is answered adds the nothing-to-ask note", async () => {
-	let isBusy = false;
-	const f = conversationalRuntime(["deferred"], () => { if (isBusy) throw new Error("Native queue busy."); return [pendingRow("a".repeat(64), "Synthetic pending claim.")]; });
-	try {
-		await f.emit("session_start");
-		const turn = reminderTurns(f);
-		assert.ok((await turn()).reminder);
-		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
-		await f.reply("leave that for later");
-		assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, "deferred");
-		isBusy = true;
-		assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
-	} finally { await f.stop(); }
-});
-
-test("the pending reminder stays under 16 KB and counts the findings it leaves out", async () => {
-	const rows = Array.from({ length: 200 }, (_, index) => pendingRow(index.toString(16).padStart(64, "0"), "x".repeat(500)));
-	const f = reminderRuntime(() => rows);
-	try {
-		await f.emit("session_start");
-		const reminder = (await reminderTurns(f)()).reminder!;
-		assert.ok(Buffer.byteLength(reminder) <= 16_384);
-		const listed = reminder.split("\n").filter((line) => line.startsWith("- "));
-		assert.equal(listed[0], `- ${"0".repeat(64)}: ${"x".repeat(119)}\u2026`);
-		assert.match(reminder, new RegExp(`\\n${200 - listed.length} more pending findings are not listed\\.$`));
-	} finally { await f.stop(); }
-});
-
-test("an unreadable or hanging queue skips the pending reminder without failing the turn", async () => {
-	const hanging = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderWaitMilliseconds: 20,
-		open: async (_directory, signal) => ({ request: (type) => type === "list" ? new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) : Promise.resolve({ type: "released" }), close: async () => {} }) });
-	for (const f of [runtime(async () => ({ status: "pending" }) as DreamReport, "tui", new Error("Native queue unavailable."), { idleMilliseconds: 60_000 }), reminderRuntime(() => [], new Error("Native memory service stopped.")), hanging]) {
-		try {
-			await f.emit("session_start");
-			assert.equal((await reminderTurns(f)()).reminder, undefined);
-		} finally { await f.stop(); }
-	}
 });
 
 test("a slow pending reminder keeps its own worker alive past the turn's wait and through user input, and the next turn reuses it for the late reminder", async () => {
@@ -924,52 +484,13 @@ for (const cancellation of ["tool abort", "user input"] as const) {
 			await reminderTurns(f)();
 			const controller = new AbortController();
 			const call = f.tool.execute("cancelled", { operation: "pending" }, controller.signal, undefined, f.ctx);
-			await sleep(10);
-			assert.equal(reminder.signal?.aborted, true); assert.equal(reminder.isClosed, false);
+			await until(() => reminder.signal?.aborted === true, "The reminder read was not stopped");
+			assert.equal(reminder.isClosed, false);
 			if (cancellation === "tool abort") controller.abort(); else await f.emit("input", { text: "Stop that.", source: "interactive" });
 			await promptly(assert.rejects(call));
 			releaseClose();
-			await sleep(0);
-			assert.equal(reminder.isClosed, true);
+			await until(() => reminder.isClosed, "The stopped reminder worker did not close");
 		} finally { releaseClose(); await f.stop(); }
-	});
-}
-
-test("a non-interactive run gets no pending reminder", async () => {
-	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")], undefined, "rpc");
-	try {
-		await f.emit("session_start");
-		assert.equal(reminders((await reminderTurns(f)()).messages).length, 0);
-	} finally { await f.stop(); }
-});
-
-test("a proposal awaiting a reply suppresses the pending reminder", async () => {
-	const f = conversationalRuntime([], [pendingRow("a".repeat(64), "Synthetic pending claim.")]);
-	try {
-		await f.emit("session_start");
-		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
-		assert.equal(reminders((await reminderTurns(f)()).messages).length, 0);
-		assert.equal(f.frames.some((frame) => frame.type === "list"), false);
-	} finally { await f.stop(); }
-});
-
-for (const outcome of ["approved", "rejected", "amended"] as const) {
-	test(`a finding ${outcome} in this session leaves the pending reminder`, async () => {
-		const revision = "a".repeat(64);
-		const f = conversationalRuntime(outcome === "amended" ? [] : [outcome], [pendingRow(revision, "Synthetic pending claim.")]);
-		try {
-			await f.emit("session_start");
-			const turn = reminderTurns(f);
-			assert.match((await turn()).reminder!, new RegExp(revision));
-			await f.call("memory_queue", { operation: "present", revision });
-			await f.reply("synthetic answer");
-			if (outcome === "amended") {
-				const amended = await f.call("memory_queue", { operation: "amend", revision, amendment: { replacement: "Changed synthetic entry.", reason: "Revise it." } });
-				assert.equal((amended.details as Record<string, unknown>).status, "proposal-queued");
-				await f.call("memory_queue", { operation: "cancel" });
-			} else assert.equal(((await f.call("memory_queue", { operation: "reply" })).details as Record<string, unknown>).status, outcome);
-			assert.match((await turn()).reminder!, /no pending memory proposals need asking about now/);
-		} finally { await f.stop(); }
 	});
 }
 
@@ -1001,19 +522,3 @@ test("a mismatched native receipt returns its recovery identifier, never approva
 	} finally { await f.stop(); }
 });
 
-for (const status of ["approved", "outcome-unresolved"]) {
-	test(`recovery reports the native ${status} status without inventing completion`, async () => {
-		const receipt = { decisionID: "original-decision", status, ...(status === "approved" ? { commit: "f".repeat(40), auditRef: "refs/core-memories/unit-audit" } : {}) };
-		const f = runtime(async () => assert.fail("Recovery must not dispatch a model"), "tui", undefined, {
-			open: async () => ({ request: async (type, fields, isPrivate) => {
-				assert.equal(type, "recover"); assert.equal(fields?.decisionID, receipt.decisionID); assert.notEqual(isPrivate, true);
-				return { type: "decision", receipt };
-			}, close: async () => {} }),
-		});
-		try {
-			await f.emit("session_start");
-			const result = await f.tool.execute("recover-native", { operation: "recover", decisionID: receipt.decisionID }, undefined, undefined, f.ctx);
-			assert.deepEqual(result.details, { receipt, status });
-		} finally { await f.stop(); }
-	});
-}

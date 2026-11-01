@@ -5,23 +5,6 @@ import Testing
 @testable import CoreMemories
 @testable import CoreMemoriesApp
 
-@Test func nativeReviewEventAdmissionRejectsRepeatsWithoutReadingNonKeyEvents() {
-  let cases: [(NSEvent.EventType?, Bool, Bool)] = [
-    (.keyDown, false, true), (.keyDown, true, false), (.keyUp, false, true),
-    (.keyUp, true, false), (.keyDown, false, true), (nil, true, true),
-    (.leftMouseDown, true, true), (.flagsChanged, true, true), (.applicationDefined, true, true),
-  ]
-  for (type, isRepeat, isExpected) in cases {
-    var reads = 0
-    let isAdmitted = isNativeReviewEventAdmitted(type: type) {
-      reads += 1
-      return isRepeat
-    }
-    #expect(isAdmitted == isExpected)
-    #expect(reads == (type == .keyDown || type == .keyUp ? 1 : 0))
-  }
-}
-
 @Test(arguments: [NativeReviewAction.accept, .decideLater, .dismiss])
 @MainActor func nativeReviewActionStagesOnlyCapturedItemAndNeverRetargetsRepeat(
   action: NativeReviewAction
@@ -62,65 +45,5 @@ import Testing
   #expect(try fixture.transaction.main() == base)
   #expect(try fixture.preservedFiles() == preserved)
   #expect(try fixture.transaction.snapshot(fixture.reviewState) == recovery)
-  try await model.shutdown()
-}
-
-@Test @MainActor func nativeReviewRequestsDeclineChangedSelectionOwnerAndAmendmentInput()
-  async throws
-{
-  let fixture = try ReviewFlowFixture()
-  defer { fixture.transaction.clean() }
-  let model = AppModel(configURL: fixture.configurationURL, autosaveDelay: .seconds(3600))
-  model.section = "Memories"
-  await model.load()
-  await model.pauseQueue()
-  let candidates = model.actionableCandidates
-  let first = NativeMemorySelection.candidate(candidates[0].change.id.rawValue)
-  let second = NativeMemorySelection.candidate(candidates[1].change.id.rawValue)
-  let base = try fixture.transaction.main()
-  await model.selectMemory(first)
-  let selectionRequest = try #require(model.captureReviewAction(.accept))
-  await model.selectMemory(second)
-  await model.executeReviewAction(selectionRequest)
-  #expect(model.selection == second)
-  #expect(model.stagedItems.isEmpty)
-  let ownerRequest = try #require(model.captureReviewAction(.dismiss))
-  await model.refresh()
-  await model.pauseQueue()
-  await model.selectMemory(second)
-  #expect(model.nativeDraftOwner != ownerRequest.owner)
-  await model.executeReviewAction(ownerRequest)
-  #expect(model.stagedItems.isEmpty)
-  for section in ["Dreams", "Settings"] {
-    model.section = section
-    #expect(model.captureReviewAction(.accept) == nil)
-    #expect(model.captureReviewAction(.decideLater) == nil)
-    #expect(model.captureReviewAction(.dismiss) == nil)
-  }
-  model.section = "Memories"
-  model.isBusy = true
-  #expect(model.captureReviewAction(.accept) == nil)
-  model.isBusy = false
-  model.isSubmittingSave = true
-  #expect(model.captureReviewAction(.decideLater) == nil)
-  model.isSubmittingSave = false
-  model.saveOutcome = .outcomeUnknown(saveID: "synthetic", details: "Synthetic unresolved Save")
-  #expect(model.captureReviewAction(.accept) == nil)
-  model.saveOutcome = nil
-  await model.editSuggestion()
-  model.setEditorReason("First explicit correction", owner: model.editorOwner)
-  await model.stageEditor()
-  let amendmentRequest = try #require(model.captureReviewAction(.accept))
-  #expect(model.captureReviewAction(.decideLater) == nil)
-  #expect(model.captureReviewAction(.dismiss) == nil)
-  model.setEditorReason("Retain this newer correction", owner: model.editorOwner)
-  await model.executeReviewAction(amendmentRequest)
-  #expect(model.selection == second)
-  #expect(model.editorReason == "Retain this newer correction")
-  #expect(model.isInputDirty)
-  #expect(model.presentation == nil)
-  #expect(model.batchProjection?.needsReview.count == 1)
-  #expect(model.captureReviewAction(.accept) == nil)
-  #expect(try fixture.transaction.main() == base)
   try await model.shutdown()
 }

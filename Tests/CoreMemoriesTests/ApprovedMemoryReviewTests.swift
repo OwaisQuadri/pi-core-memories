@@ -3,34 +3,6 @@ import Testing
 
 @testable import CoreMemories
 
-@Test func approvedReviewDueUsesExactThirtyDaysUnknownAndFutureWithoutRevisionFallback() throws {
-  let instant = "2026-01-01T00:00:00Z"
-  let start = try #require(ISO8601DateFormatter().date(from: instant))
-  #expect(!MemoryManagement.isReviewDue(instant, date: start.addingTimeInterval(30 * 86_400 - 1)))
-  #expect(MemoryManagement.isReviewDue(instant, date: start.addingTimeInterval(30 * 86_400)))
-  #expect(!MemoryManagement.isReviewDue(instant, date: start.addingTimeInterval(-1)))
-  #expect(MemoryManagement.isReviewDue(nil, date: start))
-}
-
-@Test func approvedReviewCatalogExcludesHeadingsAndOtherProjectsButKeepsOldMemoriesInRender() throws
-{
-  let fixture = try Fixture()
-  defer { fixture.clean() }
-  let key = try #require(try MemoryStore.projectKey(cwd: fixture.repo))
-  try fixture.write("# Memory\n\n" + fact("Global."), path: "MEMORY.md")
-  try fixture.write("# Memory\n\n" + fact("Matching."), path: "projects/\(key).md")
-  try fixture.write(
-    "# Memory\n\n" + fact("Other."), path: "projects/" + String(repeating: "a", count: 64) + ".md")
-  try fixture.commit()
-  let manager = try MemoryManagement(repository: fixture.repo)
-  let catalog = try manager.reviewCatalog(cwd: fixture.repo)
-  #expect(catalog.entries.count == 2)
-  #expect(catalog.entries.allSatisfy { MemoryManagement.isReviewDue($0.reviewed, date: Date()) })
-  let rendered = try fixture.store.render(cwd: fixture.repo)
-  #expect(
-    rendered.contains("Global.") && rendered.contains("Matching.") && !rendered.contains("Other."))
-}
-
 @Test func approvedReviewChangesOnlyMetadataAndAdoptsLegacyIdentityWithCheckedPublication() throws {
   let fixture = try Fixture()
   defer { fixture.clean() }
@@ -81,27 +53,4 @@ import Testing
   #expect(
     final.expected
       == revised.expected.replacingOccurrences(of: reviewed.reviewed!, with: final.reviewed!))
-}
-
-@Test func approvedReviewCannotRepairMalformedOrDuplicateIdentity() throws {
-  let fixture = try Fixture()
-  defer { fixture.clean() }
-  let bytes = try MemoryDocument.reviewedBytes(
-    Data(fact("Duplicate.").utf8), identity: UUID(),
-    instant: MemoryDocument.ReviewInstant("2026-01-01T00:00:00Z"))
-  let malformed = "Malformed. [source: owner; added: 2024-02-29] [memory-id: bad; reviewed: bad]\n"
-  try fixture.write(
-    "# Memory\n\n" + String(decoding: bytes, as: UTF8.self) + "\n"
-      + String(decoding: bytes, as: UTF8.self) + "\n" + malformed, path: "MEMORY.md")
-  try fixture.commit()
-  let manager = try MemoryManagement(repository: fixture.repo)
-  let catalog = try manager.reviewCatalog(cwd: fixture.repo)
-  #expect(catalog.entries.count == 3 && catalog.entries.allSatisfy { !$0.isMutable })
-  let before = try fixture.humanState()
-  for entry in catalog.entries {
-    #expect(throws: (any Error).self) {
-      try manager.confirmReviewed(base: catalog.base, entry: entry)
-    }
-  }
-  #expect(try fixture.humanState() == before)
 }

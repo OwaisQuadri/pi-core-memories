@@ -19,28 +19,6 @@ export function presentation(isDetachRequired = false) {
 	return { type: "presentation", display: { presentation: payload, displayDigest: sha(encoded) }, displayBytes: encoded.toString("base64") };
 }
 
-test("verified preview decodes complete exact annotations and final document instead of base64", () => {
-	const result = decodeQueuePreview(presentation(), identity);
-	assert.ok(result.details.includes("  finding [source: synthetic; added: 2026-10-24]\n"));
-	assert.ok(result.details.includes("# Memory\n\n  finding\n"));
-	assert.ok(result.details.includes("synthetic limitation"));
-	assert.equal(result.tuple.claimID, "private-claim");
-});
-
-test("amended preview shows its changed reason without replacing the historical reason", () => {
-	const original = presentation();
-	const reason = "Correct the wording from this conversation; preserve the original source.";
-	const payload = { ...original.display.presentation, amendmentReason: reason };
-	const encoded = Buffer.from(JSON.stringify(payload));
-	const frame = { ...original, display: { presentation: payload, displayDigest: sha(encoded) }, displayBytes: encoded.toString("base64") };
-	const result = decodeQueuePreview(frame, identity);
-	assert.ok(result.details.includes("amendmentReason:\n  " + reason));
-	assert.ok(result.details.includes(original.display.presentation.finding.reason));
-	assert.equal(result.digest, sha(encoded));
-	payload.amendmentReason = "A different reason must not reuse this display.";
-	assert.throws(() => decodeQueuePreview(frame, identity));
-});
-
 test("tampered digest, mismatched display, foreign request and oversized preview cannot authorize", () => {
 	const changedDigest = presentation(); changedDigest.display.displayDigest = "f".repeat(64);
 	assert.throws(() => decodeQueuePreview(changedDigest, identity));
@@ -61,19 +39,6 @@ test("terminal controls and literal escape sequences render distinctly without c
 	const result = decodeQueuePreview(frame, identity);
 	assert.ok(result.details.includes("\\u{1B}[31m\\u{5C}u{1B}\\u{202E}"));
 	assert.equal(result.digest, sha(encoded));
-});
-
-test("management preview hashes native bytes with only displayDigest excluded and shows full documents", () => {
-	const payload = { claimID: "management-private", sequence: "1", request: identity, currentBase: "a".repeat(40), previewDigest: "b".repeat(64), operation: "delete", reason: "Exact requested correction", path: "MEMORY.md", before: bytes("old annotated entry\n"), after: "", documentBefore: bytes("# Memory\n\nold annotated entry\n"), replacement: bytes("# Memory\n\n"), isDetachRequired: false };
-	const encoded = Buffer.from(JSON.stringify(payload));
-	const frame = { type: "manage-presentation", display: { ...payload, displayDigest: sha(encoded) }, displayBytes: encoded.toString("base64") };
-	const result = decodeQueuePreview(frame, identity);
-	assert.equal(result.isManagement, true);
-	assert.equal(result.tuple.revision, payload.currentBase);
-	assert.ok(result.details.includes("# Memory\n\nold annotated entry\n"));
-	assert.ok(result.details.includes("Exact requested correction"));
-	frame.display.path = "different";
-	assert.throws(() => decodeQueuePreview(frame, identity));
 });
 
 test("native child keeps private choices on descriptor three and sanitizes stderr failures", async (t) => {

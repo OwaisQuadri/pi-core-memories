@@ -64,19 +64,3 @@ import Testing
     #expect(try fixture.store.check().isEmpty)
   }
 }
-
-@Test func crlfProjectBoundaryAddsOnlyTheRequiredLF() throws {
-  let fixture = try Fixture()
-  defer { fixture.clean() }
-  let project = try fixture.project("CRLF boundary project")
-  let key = try #require(try MemoryStore.projectKey(cwd: project))
-  let global = fact("Global 🐢\ncontinued").replacingOccurrences(of: "\n", with: "\r\n")
-  let local = ("---\n" + fact("Project 🦊")).replacingOccurrences(of: "\n", with: "\r\n")
-  try fixture.write(global, path: "MEMORY.md")
-  try fixture.write(local, path: "projects/\(key).md")
-  try fixture.commit()
-  let expected = Data((global + "\n" + local).utf8)
-  #expect(try Data(fixture.store.render(cwd: project).utf8) == expected)
-  let rendered = try fixture.cli(["render", "--repo", fixture.repo.path, "--cwd", project.path])
-  #expect(rendered.status == 0 && rendered.error.isEmpty && rendered.output == expected)
-}

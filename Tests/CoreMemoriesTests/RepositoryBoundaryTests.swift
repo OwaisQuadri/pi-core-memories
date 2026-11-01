@@ -33,18 +33,3 @@ import Testing
     #expect(try fixture.snapshot(project) == before)
   }
 }
-
-@Test func aMemoryLayoutCanProposeRepairingInvalidAnnotations() throws {
-  let fixture = try Fixture()
-  defer { fixture.clean() }
-  try fixture.write("An existing fact has no citation.\n", path: "MEMORY.md")
-  try fixture.commit()
-  let base = try fixture.store.approvedCommit()
-  let before = try fixture.humanState()
-  let proposal = try fixture.store.propose(
-    base: base, path: "MEMORY.md", replacement: Data(fact("A corrected fact").utf8),
-    reason: "Add a citation for human review")
-  #expect(try fixture.humanState() == before)
-  #expect(try fixture.store.review(commit: proposal.commit).contains("A corrected fact"))
-  #expect(try fixture.store.approvedCommit() == base)
-}

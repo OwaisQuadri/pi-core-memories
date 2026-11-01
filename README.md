@@ -148,15 +148,10 @@ response and native run records remain the evidence for successful dreaming.
 
 Dreaming uses the selected provider, model, and thinking level. It must not fall
 back to a paid application programming interface (API) key or switch selections.
-On public Pi, the selected route must be an OAuth (Open Authorization)-only
-subscription provider with no registered override. Authentication is resolved
-once for the selected model, including its headers and endpoint, before calling
-the captured provider.
-
-A host with an existing stronger subscription guard can use it, but that guard
-is optional. Mixed-authentication, virtual, changed, or unverified public routes
-stay blocked when the adapter cannot establish subscription-only dispatch.
-It does not install a fork or choose another provider to bypass that limit.
+The selected model must be signed in through OAuth (Open Authorization) to a
+subscription provider; virtual models are refused. The call then goes through
+Pi's model registry, the same request path as a normal session, which resolves
+authentication, headers, and endpoint for the selected model.
 
 ## Review in conversation
 

@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { normalizeContext, type AssistantMessage, type Context } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { commandPath, commandReady } from "./command.ts";
@@ -445,8 +445,6 @@ export async function runDreamWorker(start: DreamStart, call: DreamCall, signal:
 	return completion;
 }
 
-type DreamSubscriptionOptions = NonNullable<Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2]> & { onDispatch?: (physical: { provider: string; modelID: string; api: string }) => void };
-type DreamSubscriptionRegistry = ExtensionContext["modelRegistry"] & { streamSubscriptionSimple?: (model: NonNullable<ExtensionContext["model"]>, context: Context, options: DreamSubscriptionOptions) => ReturnType<ExtensionContext["modelRegistry"]["streamSimple"]> };
 export class DreamCallFailure extends Error {}
 export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionContext, "modelRegistry">, model: NonNullable<ExtensionContext["model"]>, selection: DreamSelection, signal: AbortSignal): Promise<string> {
 	function modelFailure(cause: string): never { throw new DreamCallFailure(`Dream model call failed: ${cause}`); }
@@ -459,10 +457,7 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	}
 	if (signal.aborted) throw new Error("Dream call cancelled.");
 	if (!isSameSelection(request.selection, selection) || model.provider !== selection.provider || model.id !== selection.modelID) modelFailure("model selection does not match the request");
-	const registry = ctx.modelRegistry as DreamSubscriptionRegistry;
-	const guardedStream = registry.streamSubscriptionSimple;
-	const stockProvider = typeof guardedStream === "function" ? undefined : registry.getProvider?.(model.provider);
-	if (typeof guardedStream !== "function" && (!stockProvider || model.api === "pi-virtual" || stockProvider.id !== model.provider || stockProvider.auth.apiKey || stockProvider.auth.oauth?.isSubscription !== true || registry.getRegisteredProviderConfig(model.provider) || registry.getRegisteredNativeProvider(model.provider))) modelFailure("the selected route cannot guarantee subscription-only dreaming on this Pi SDK; nothing was dispatched");
+	if (model.api === "pi-virtual" || !ctx.modelRegistry.isUsingOAuth(model) || ctx.modelRegistry.getProvider(model.provider)?.auth.oauth?.isSubscription !== true) modelFailure("the selected model is not using a subscription sign-in; nothing was dispatched");
 	const context: Context = { systemPrompt: request.systemPrompt, messages: request.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })) };
 	const reasoning = selection.thinkingLevel === "off" ? undefined : selection.thinkingLevel as "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	const controller = new AbortController();
@@ -473,8 +468,8 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	let isDispatchInvalid = false;
 	controller.signal.addEventListener("abort", () => rejectAbort(isDispatchInvalid ? new DreamCallFailure("Dream model call failed: physical dispatch changed or was invalid") : new Error("Dream call cancelled.")), { once: true });
 	void cancelled.catch(() => {});
-	let dispatch: Parameters<NonNullable<DreamSubscriptionOptions["onDispatch"]>>[0] | undefined;
-	const onDispatch: NonNullable<DreamSubscriptionOptions["onDispatch"]> = (physical) => {
+	let dispatch: { provider: string; modelID: string; api: string } | undefined;
+	const onDispatch = (physical: { provider: string; modelID: string; api: string }) => {
 		try {
 			const observed = { provider: text(physical.provider, 256), modelID: text(physical.modelID, 256), api: text(physical.api, 256) };
 			if (!["openai", "openai-codex", "anthropic"].includes(observed.provider) || !observed.modelID || !observed.api || observed.api === "pi-virtual") failure();
@@ -487,14 +482,8 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 		return !isDispatchInvalid && dispatch !== undefined && message.provider === dispatch.provider && message.model === dispatch.modelID && message.api === dispatch.api;
 	}
 	try {
-	const stream = typeof guardedStream === "function" ? guardedStream.call(registry, model, context, { signal: controller.signal, reasoning, onDispatch }) : await (async () => {
-		if (!stockProvider) modelFailure("subscription provider is unavailable");
-		const resolved = await Promise.race([registry.getApiKeyAndHeaders(model), cancelled]);
-		controller.signal.throwIfAborted();
-		if (registry.getProvider(model.provider) !== stockProvider || stockProvider.auth.apiKey || stockProvider.auth.oauth?.isSubscription !== true || registry.getRegisteredProviderConfig(model.provider) || registry.getRegisteredNativeProvider(model.provider) || !resolved.ok || !resolved.apiKey) modelFailure("subscription authentication or provider changed before dispatch; nothing was dispatched");
-		onDispatch({ provider: model.provider, modelID: model.id, api: model.api });
-		return stockProvider.streamSimple(resolved.baseUrl ? { ...model, baseUrl: resolved.baseUrl } : model, normalizeContext(context), { signal: controller.signal, reasoning, apiKey: resolved.apiKey, headers: resolved.headers, env: resolved.env });
-	})();
+	onDispatch({ provider: model.provider, modelID: model.id, api: model.api });
+	const stream = ctx.modelRegistry.streamSimple(model, context, { signal: controller.signal, reasoning });
 	let terminal: AssistantMessage | undefined;
 	let isDone = false;
 	const iterator = stream[Symbol.asyncIterator]();

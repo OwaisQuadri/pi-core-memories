@@ -5,7 +5,6 @@ import { test } from "node:test";
 import type { AssistantMessage, AssistantMessageEvent, Context } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DreamRequest, DreamSelection, DreamStart } from "./dream.ts";
-type SubscriptionSimpleStreamOptions = NonNullable<Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2]> & { onDispatch?: (physical: { provider: string; modelID: string; api: string }) => void };
 
 import { tuiURL } from "./test/host.ts";
 const dream = await import("./dream.ts");
@@ -19,11 +18,11 @@ const model = { provider: "openai", id: "selected", api: "openai-responses" } as
 function message(change: Partial<AssistantMessage> = {}): AssistantMessage {
 	return { role: "assistant", provider: selection.provider, model: selection.modelID, api: "openai-responses", content: [{ type: "text", text: " {" }, { type: "thinking", thinking: "not decision JSON" }, { type: "text", text: "🌱} \n" }], stopReason: "stop", timestamp: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, ...change };
 }
+const subscription = { isUsingOAuth: () => true, getProvider: () => ({ auth: { oauth: { isSubscription: true } } }) };
 function registry(events: AssistantMessageEvent[], result = message()) {
 	const calls: { model: unknown; context: Context; options: unknown }[] = [];
-	const ctx = { modelRegistry: { streamSubscriptionSimple(current: typeof model, context: Context, options: SubscriptionSimpleStreamOptions) {
+	const ctx = { modelRegistry: { ...subscription, streamSimple(current: typeof model, context: Context, options: unknown) {
 		calls.push({ model: current, context, options });
-		options.onDispatch?.(Object.freeze({ provider: current.provider, modelID: current.id, api: current.api }));
 		return { async *[Symbol.asyncIterator]() { yield* events; }, result: async () => result };
 	} } } as unknown as ExtensionContext;
 	return { ctx, calls };
@@ -49,7 +48,7 @@ test("a recorded call selection is accepted only in its exact shape on a pending
 	assert.throws(() => dream.dreamReport({ ...pending, callSelection: null }, start));
 });
 
-test("subscription registry receives only pinned bytes and timestamps, captured model, and transport-only off mapping", async () => {
+test("registry streamSimple receives only pinned bytes and timestamps, captured model, and transport-only off mapping", async () => {
 	for (const level of ["off", "medium"]) {
 		const captured = { ...selection, thinkingLevel: level };
 		const f = registry([{ type: "done", reason: "stop", message: message() }]);
@@ -57,7 +56,7 @@ test("subscription registry receives only pinned bytes and timestamps, captured 
 		assert.equal(await dream.callDreamModel({ ...request, selection: captured }, f.ctx, model, captured, signal), " {🌱} \n");
 		assert.equal(f.calls.length, 1); assert.strictEqual(f.calls[0].model, model);
 		assert.deepEqual(f.calls[0].context, { systemPrompt: request.systemPrompt, messages: [{ role: "user", content: request.messages[0].text, timestamp: 0 }] });
-		assert.deepEqual(Object.keys(f.calls[0].options as object).sort(), ["onDispatch", "reasoning", "signal"]);
+		assert.deepEqual(Object.keys(f.calls[0].options as object).sort(), ["reasoning", "signal"]);
 		assert.equal((f.calls[0].options as { reasoning?: string }).reasoning, level === "off" ? undefined : level);
 		assert.equal(request.selection.thinkingLevel, "off");
 	}
@@ -136,51 +135,20 @@ test("missing done, mismatched done/result, post-terminal updates, partial tools
 	}
 });
 
-test("unsupported stock route refuses ordinary streaming before dispatch", async () => {
-	const ctx = { modelRegistry: { streamSimple: () => assert.fail("Ordinary streaming must not substitute for subscription dispatch") } } as unknown as ExtensionContext;
-	await assert.rejects(dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), { message: "Dream model call failed: the selected route cannot guarantee subscription-only dreaming on this Pi SDK; nothing was dispatched" });
+test("only a subscription sign-in reaches streamSimple, so dreaming never bills an API key", async () => {
+	for (const [current, change] of [
+		[model, { isUsingOAuth: () => false }],
+		[model, { getProvider: () => ({ auth: { oauth: { isSubscription: false } } }) }],
+		[{ ...model, api: "pi-virtual" }, {}],
+	] as [typeof model, object][]) {
+		const ctx = { modelRegistry: { ...subscription, ...change, streamSimple: () => assert.fail("A non-subscription route must not be dispatched") } } as unknown as ExtensionContext;
+		await assert.rejects(dream.callDreamModel(request, ctx, current, selection, new AbortController().signal), { message: "Dream model call failed: the selected model is not using a subscription sign-in; nothing was dispatched" });
+	}
 });
-
-for (const scenario of ["valid", "api-key", "not-subscription", "changed", "missing-auth", "missing-key"]) {
-	test(`stock subscription provider ${scenario} uses only the captured public route`, async () => {
-		let calls = 0; let lookups = 0; let authCalls = 0;
-		const provider = {
-			id: model.provider,
-			auth: { oauth: { isSubscription: scenario !== "not-subscription" }, ...(scenario === "api-key" ? { apiKey: {} } : {}) },
-			streamSimple(current: typeof model, context: Context, options: { apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }) {
-				calls++; assert.equal(current.id, model.id); assert.equal(options.apiKey, "synthetic-subscription");
-				assert.equal(current.baseUrl, "https://selected-model.invalid");
-				assert.deepEqual(options.headers, { "x-selected-model": "synthetic-header" });
-				assert.deepEqual(options.env, { SYNTHETIC_REQUEST: "selected-model" });
-				assert.equal(context.messages[0].role, "system");
-				return { async *[Symbol.asyncIterator]() { yield { type: "done", reason: "stop", message: message() }; }, result: async () => message() };
-			},
-		};
-		const ctx = { modelRegistry: {
-			getProvider: () => { lookups++; return scenario === "changed" && lookups > 1 ? { ...provider } : provider; },
-			getRegisteredProviderConfig: () => undefined,
-			getRegisteredNativeProvider: () => undefined,
-			getProviderAuth: async () => assert.fail("Provider-only auth would drop selected-model headers."),
-			getApiKeyAndHeaders: async (current: typeof model) => {
-				authCalls++; assert.strictEqual(current, model);
-				return scenario === "missing-auth" ? { ok: false, error: "Synthetic auth unavailable." } : { ok: true, apiKey: scenario === "missing-key" ? undefined : "synthetic-subscription", baseUrl: "https://selected-model.invalid", headers: { "x-selected-model": "synthetic-header" }, env: { SYNTHETIC_REQUEST: "selected-model" } };
-			},
-			streamSimple: () => assert.fail("Stock dispatch must not resolve credentials a second time."),
-		} } as unknown as ExtensionContext;
-		if (scenario === "valid") {
-			assert.equal(await dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), " {🌱} \n");
-			assert.equal(calls, 1); assert.equal(authCalls, 1);
-		} else {
-			await assert.rejects(dream.callDreamModel(request, ctx, model, selection, new AbortController().signal), /nothing was dispatched/);
-			assert.equal(calls, 0);
-			if (scenario === "api-key" || scenario === "not-subscription") assert.equal(authCalls, 0);
-		}
-	});
-}
 
 test("registry cancellation rejects a stalled stream immediately and passes a client-owned signal", async () => {
 	const controller = new AbortController(); let received: AbortSignal | undefined;
-	const ctx = { modelRegistry: { streamSubscriptionSimple(_model: unknown, _context: unknown, options: { signal: AbortSignal }) {
+	const ctx = { modelRegistry: { ...subscription, streamSimple(_model: unknown, _context: unknown, options: { signal: AbortSignal }) {
 		received = options.signal;
 		return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }), result: () => new Promise(() => {}) };
 	} } } as unknown as ExtensionContext;
@@ -188,35 +156,6 @@ test("registry cancellation rejects a stalled stream immediately and passes a cl
 	controller.abort();
 	await assert.rejects(pending, { message: "Dream call cancelled." });
 	assert.equal(received?.aborted, true);
-});
-
-for (const scenario of ["missing", "conflict", "unapproved", "eventMismatch", "resultMismatch", "same"] as const) test(`virtual selection subscription dispatch observer ${scenario}`, async () => {
-	const virtualModel = { ...model, api: "pi-virtual" };
-	const physical = Object.freeze({ provider: "anthropic", modelID: "physical", api: "anthropic-messages" });
-	const physicalMessage = message({ provider: physical.provider, model: physical.modelID, api: physical.api });
-	let calls = 0;
-	const ctx = { modelRegistry: { streamSubscriptionSimple(current: unknown, context: Context, options: SubscriptionSimpleStreamOptions) {
-		calls++; assert.strictEqual(current, virtualModel); assert.equal(context.systemPrompt, request.systemPrompt);
-		assert.deepEqual(Object.keys(options).sort(), ["onDispatch", "reasoning", "signal"]);
-		assert.ok(options.onDispatch);
-		if (scenario !== "missing") {
-			if (scenario === "unapproved") assert.throws(() => options.onDispatch!({ ...physical, provider: "unsupported" }));
-			else assert.equal(options.onDispatch(physical), undefined);
-			if (scenario === "same") assert.equal(options.onDispatch(physical), undefined);
-			if (scenario === "conflict") { try { options.onDispatch({ ...physical, modelID: "changed" }); } catch {} }
-		}
-		const eventMessage = scenario === "eventMismatch" ? message() : physicalMessage;
-		const resultMessage = scenario === "resultMismatch" ? message() : physicalMessage;
-		return { async *[Symbol.asyncIterator]() { yield { type: "done", reason: "stop", message: eventMessage }; }, result: async () => resultMessage };
-	} } } as unknown as ExtensionContext;
-	const work = dream.callDreamModel(request, ctx, virtualModel, selection, new AbortController().signal);
-	if (scenario === "same") assert.equal(await work, " {🌱} \n");
-	else await assert.rejects(work, (error: unknown) => {
-		assert.ok(error instanceof dream.DreamCallFailure);
-		assert.equal(error.message, `Dream model call failed: ${scenario === "conflict" || scenario === "unapproved" ? "physical dispatch changed or was invalid" : "response identity does not match the dispatched model"}`);
-		return true;
-	});
-	assert.equal(calls, 1);
 });
 
 test("selection mismatch fails before registry; process environment excludes provider and Pi auth", async () => {

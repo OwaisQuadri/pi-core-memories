@@ -228,6 +228,7 @@ enum DreamPersistenceEvent: Equatable {
 }
 
 public final class DreamRunStore {
+  private static let stateTemporaryPrefix = ".pending-state-"
   private let root: DreamStateDirectory
   private let reviewStateURL: URL
   private let configuredRoots: [URL]
@@ -1615,6 +1616,16 @@ public final class DreamRunStore {
         DiscardMarker.allowedFiles.contains($0)
       }) else { throw DreamRunError.corruption }
     }
+    let clearedState = try bounded(DreamRunEncoding.State(
+      schemaVersion: 2, generation: marker.generation,
+      generationHash: chain.hash.rawValue, admissionHash: nil, runID: nil))
+    for name in try root.names(isDreamAuthority: true) where name.hasPrefix(Self.stateTemporaryPrefix) {
+      let identifier = String(name.dropFirst(Self.stateTemporaryPrefix.count))
+      guard UUID(uuidString: identifier)?.uuidString.lowercased() == identifier,
+        clearedState.starts(with: try root.read(name, maximum: clearedState.count))
+      else { throw DreamRunError.unsafeState }
+      try root.removeVerifiedFile(name)
+    }
     if state.runID != nil { try save(generation: marker.generation, hash: chain.hash) }
     try admissions.remove(admissionName)
     if try runs.isPresent(marker.runID) {
@@ -2614,7 +2625,9 @@ public final class DreamRunStore {
       !isPromptRelocation
         || (directory === root && DreamRelocationRole.allCases.contains(where: { $0.recordName == name }) && !isReplacing)
     else { throw DreamRunError.limitExceeded }
-    let temporary = ".pending-" + UUID().uuidString.lowercased()
+    let prefix = directory === root && name == "state.json"
+      ? Self.stateTemporaryPrefix : ".pending-"
+    let temporary = prefix + UUID().uuidString.lowercased()
     let file = openat(
       directory.descriptor, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard file >= 0 else { throw DreamRunError.persistenceFailure }

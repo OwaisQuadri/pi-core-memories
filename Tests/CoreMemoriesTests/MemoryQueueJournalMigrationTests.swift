@@ -68,18 +68,24 @@ private func seedJournal(_ queue: MemoryQueue, _ decisions: [(action: String, de
   _ = try seedJournal(queue, [("approve", "journaled")])
   let original = try fixture.main()
   let crashing = try queueFixture(fixture, sources: fixture.store())
+  var isFaultInjected = false
   crashing.configureReview = { review in
     review.persistenceFault = { event in
       if case .beforeWrite(let name) = event, name.hasPrefix("outcome-") {
+        isFaultInjected = true
         throw MemoryError("synthetic crash after publication")
       }
     }
   }
   #expect(throws: (any Error).self) { try crashing.recover(decisionID: "journaled") }
+  #expect(isFaultInjected)
+  let published = try fixture.main()
+  #expect(published != original)
   let reopened = try queueFixture(fixture, sources: fixture.store())
   let receipt = try reopened.recover(decisionID: "journaled")
   #expect(receipt.status == "approved")
   let commit = try #require(receipt.commit)
+  #expect(commit == published)
   #expect(commit == (try fixture.main()))
   #expect(try queueFixture(fixture, sources: fixture.store()).recover(decisionID: "journaled") == receipt)
   #expect(try fixture.main() == commit)

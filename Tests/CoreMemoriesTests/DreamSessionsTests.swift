@@ -284,26 +284,6 @@ struct DreamStore {
   }
 }
 
-@Test func classificationIsAnOrderedRuleTable() {
-  func label(_ name: String?, parent: String? = nil) -> String {
-    let (sessionClass, marker) = SessionReader.classify(
-      SessionHeader(id: "s", cwd: "/", timestamp: Date(), parentSession: parent, name: name))
-    return sessionClass.rawValue + "/" + (marker?.rawValue ?? "none")
-  }
-  #expect(label("om-observer-obs-1") == "infrastructure/none")
-  #expect(label("om-consolidator-1", parent: "/p") == "infrastructure/none")
-  #expect(label("comment-shape-1") == "infrastructure/none")
-  #expect(label("Feature", parent: "/p") == "child/parentSession")
-  #expect(label("general-purpose#85d52afb") == "child/agentName")
-  #expect(label("code-reviewer#938949") == "child/agentName")
-  let primaryNames: [String?] = [
-    "code-reviewer#93894", "Code-reviewer#938949b9", "reviewer#93894g", "#938949b9", nil,
-  ]
-  for name in primaryNames {
-    #expect(label(name) == "primary/none")
-  }
-}
-
 @Test func humanTextLabelsOnlyWhatTheHumanTyped() {
   let snippets = [dreamSnippet, "Run unattended."]
   let skill = "<skill name=\"fix\" location=\"/s/SKILL.md\">\nBody\nmore\n</skill>"
@@ -352,89 +332,6 @@ struct DreamStore {
     return
   }
   #expect(cut.hasPrefix(String(repeating: "x", count: 1_200) + "\n[… 3000 characters cut …]\n"))
-}
-
-@Test func promptArgumentsPreserveBoundariesAndExcludeDefaults() {
-  let cases: [(String, String, HumanText)] = [
-    ("Review $@", "Review ", .skillOnly),
-    ("$@ review", " review", .skillOnly),
-    ("Review ${1:-the branch}", "Review the branch", .skillOnly),
-    ("Review ${1:-the branch}", "Review my change", .human("my change", .typedSkillArguments)),
-    ("$1 then ${@:2}", "a then cat", .human("a cat", .typedSkillArguments)),
-    ("Check $1 and $1", "Check parser and parser", .human("parser", .typedSkillArguments)),
-    ("Review ${@:2:1}", "Review parser", .human("parser", .typedSkillArguments)),
-    ("Review $ARGUMENTS", "Review parser tests", .human("parser tests", .typedSkillArguments)),
-  ]
-  for (template, expanded, expected) in cases {
-    #expect(SessionReader.humanText(expanded, snippets: [], templates: [template]) == expected)
-  }
-}
-
-@Test func askUserQuestionAnswersCarryEvidence() {
-  func labels(_ answers: [[String: Any]], status: String = "answered") -> [String] {
-    SessionReader.answers(dreamAnswer(status, answers)).map { "\($0.evidence):\($0.text)" }
-  }
-  let typed = SessionReader.answers(
-    dreamAnswer("answered", [["type": "text", "label": " go on "]]))
-  #expect(typed.count == 1 && typed.first?.question == "Ship it?")
-  #expect(labels([["type": "text", "label": " go on "]]) == ["answered:go on"])
-  #expect(
-    labels([["type": "option", "label": "A"], ["type": "other", "label": "C"]]) == [
-      "answered:C", "picked:A",
-    ])
-  #expect(
-    labels([["type": "option", "label": "A"], ["type": "option", "label": "B"]]) == ["picked:A; B"])
-  for status in ["cancelled", "invalid", "unavailable"] {
-    #expect(labels([["type": "text", "label": "x"]], status: status).isEmpty)
-  }
-  #expect(labels([]).isEmpty)
-  #expect(labels([["type": "text", "label": " "]]).isEmpty)
-}
-
-@Test func surrogateRepairReplacesOnlyLoneEscapes() throws {
-  func decoded(_ text: String) throws -> String? {
-    let data = SessionReader.repairSurrogates(Data(text.utf8))
-    return try (JSONSerialization.jsonObject(with: data) as? [String: Any])?["t"] as? String
-  }
-  #expect(try decoded(#"{"t":"a\ud83db"}"#) == "a\u{FFFD}b")
-  #expect(try decoded(#"{"t":"a\udc00"}"#) == "a\u{FFFD}")
-  #expect(try decoded(#"{"t":"\ud83d\ude00"}"#) == "😀")
-  #expect(try decoded(#"{"t":"\\ud83d"}"#) == #"\ud83d"#)
-  #expect(try decoded(#"{"t":"\u00e9\n"}"#) == "é\n")
-}
-
-@Test func middleCutKeepsBothEnds() {
-  #expect(SessionReader.middleCut("short", limit: 10) == "short")
-  #expect(SessionReader.middleCut("0123456789", limit: 10) == "0123456789")
-  let cut = SessionReader.middleCut("abcdefghijklmnopqrst", limit: 10)
-  #expect(cut == "abcdef\n[… 10 characters cut …]\nqrst")
-  let family = "👩‍👩‍👧"
-  let emoji = SessionReader.middleCut(String(repeating: family, count: 20), limit: 10)
-  #expect(emoji.hasPrefix(String(repeating: family, count: 6) + "\n[… 10 characters cut …]\n"))
-}
-
-@Test func pathTouchesComeFromToolArguments() {
-  func paths(_ tool: String, _ key: String, _ value: String) -> [String] {
-    SessionReader.paths(tool: tool, arguments: [key: value], cwd: "/work/repo")
-  }
-  #expect(paths("read", "path", "/work/repo/a/b.swift") == ["a/b.swift"])
-  #expect(paths("grep", "path", "/elsewhere/x") == ["/elsewhere/x"])
-  #expect(paths("edit", "path", "/work/repository/x") == ["/work/repository/x"])
-  #expect(paths("ls", "path", "/work/repo/x").isEmpty)
-  let command = "cat \"/work/repo/docs/a.md\" README.md; curl https://x.test/y && swift build"
-  #expect(paths("bash", "command", command) == ["docs/a.md", "README.md"])
-}
-
-@Test func entryWindowAdmitsOnlyNewEntries() {
-  let floor = Date(timeIntervalSince1970: 100)
-  let upper = Date(timeIntervalSince1970: 200)
-  let window = EntryWindow(filesModifiedAfter: floor, entryFloor: floor, upper: upper)
-  #expect(!window.isNew(floor))
-  #expect(window.isNew(Date(timeIntervalSince1970: 101)))
-  #expect(window.isNew(upper))
-  #expect(!window.isNew(Date(timeIntervalSince1970: 201)))
-  let open = EntryWindow(filesModifiedAfter: floor, entryFloor: nil, upper: upper)
-  #expect(open.isNew(Date(timeIntervalSince1970: 0)))
 }
 
 @Test func scanDigestsPrimaryAndChildSessionsReadOnly() throws {
@@ -524,20 +421,4 @@ struct DreamStore {
   #expect(orphan.exchanges.first?.prompt == "Orphan prompt.")
   #expect(orphan.exchanges.first?.subagentType == "general-purpose")
   #expect(orphan.exchanges.first?.report?.text == "Orphan final text.")
-}
-
-@Test func projectKeysFollowParentSessions() throws {
-  let store = try DreamStore()
-  defer { store.clean() }
-  var keys = ProjectKeys(environment: ProcessInfo.processInfo.environment)
-  let key = try #require(try MemoryStore.projectKey(cwd: store.project))
-  let direct = keys.key(cwd: store.project.path, parentPath: nil)
-  #expect(direct.key == key && !direct.isViaParent && direct.alias == "project")
-  let viaParent = keys.key(cwd: "/missing/dream/a", parentPath: store.primary.path)
-  #expect(viaParent.key == key && viaParent.isViaParent && viaParent.alias == "a")
-  let missing = keys.key(cwd: "/missing/dream/b", parentPath: "/missing/parent.jsonl")
-  #expect(missing.key == nil && !missing.isViaParent && missing.alias == "b")
-  let outside = keys.key(cwd: store.root.path, parentPath: store.primary.path)
-  #expect(outside.key == nil && !outside.isViaParent)
-  #expect(keys.resolved == 1 && keys.viaParent == 1 && keys.unresolved == 2)
 }

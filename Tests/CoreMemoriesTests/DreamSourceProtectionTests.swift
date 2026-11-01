@@ -3,6 +3,55 @@ import Testing
 
 @testable import CoreMemories
 
+@Test
+func sourceProtectionChunksOversizedAggregateWithoutDroppingPieces() throws {
+  let pieces = Array(repeating: String(repeating: "x", count: 1_048_576), count: 5)
+  let chunks = try DreamSourceProtection.chunks(pieces)
+  #expect(chunks.map(\.count) == [4, 1])
+  #expect(chunks.flatMap { $0 } == pieces)
+  for chunk in chunks {
+    try DreamSourceProtection.validate(
+      chunk, maximumBytes: DreamSourceProtection.maximumInputBytes)
+  }
+  #expect(try DreamSourceProtection.chunks(Array(repeating: "", count: 1_001)).map(\.count)
+    == [1_000, 1])
+}
+
+@Test
+func sourceProtectionWorkerChecksEveryChunkBeforeModelRequest() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: Array(repeating: "Use green buttons, not blue.", count: 400))
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  try worker.send(workerStart(fixture))
+  let frame = try worker.frame()
+  #expect(frame["type"] as? String == "modelRequest")
+  #expect(worker.protectionCount > 4)
+}
+
+@Test
+func sourceProtectionWorkerBlocksChangedLaterChunkBeforeFreeze() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: Array(repeating: "Use green buttons, not blue.", count: 400))
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  var checks = 0
+  worker.protectionTransform = { pieces in
+    checks += 1
+    return checks == 2 ? pieces.map { $0 + "changed" } : pieces
+  }
+  try worker.send(workerStart(fixture))
+  let frame = try worker.frame()
+  #expect(frame["type"] as? String == "final")
+  #expect(frame["reason"] as? String == "sourceProtection:changed")
+  #expect(worker.protectionCount == 2)
+  try worker.finish()
+  #expect(
+    !(try fixture.snapshot(fixture.state)).keys.contains { $0.hasSuffix("request.json") })
+}
+
 @Test(arguments: [
   "blocked", "wrongPolicy", "wrongID", "wrongInput", "wrongOutput", "wrongInvocation", "cancel",
   "timeout",

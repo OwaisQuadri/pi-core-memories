@@ -1338,21 +1338,44 @@ public final class DreamRunStore {
         bytes: input, runID: runID, inputHash: SourceDigest(bytes: input),
         bindingHash: bindingHash, limits: limits)
       let date = clock()
-      let context = try capture(
-        run: run, admissionLimitations: batch.admissionLimitations, memory: memory, date: date,
-        retainedBatches: retainedBatches, priorDreams: priorDreams, priorViews: admittedViews,
-        excludedSessionIDs: excludedSessionIDs, protect: protect,
-        remainingProtections: remainingProtections)
       let milliseconds = date.timeIntervalSince1970 * 1_000
       guard milliseconds.isFinite, milliseconds >= Double(Int64.min),
         milliseconds < Double(Int64.max)
       else { throw DreamRunError.corruption }
-      let request = DreamRunEncoding.Request(
-        schemaVersion: 3, runID: runID, generation: progress.generation,
-        inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
-        systemPrompt: context.savedSystemPrompt,
-        messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)),
-        renderingVersion: DreamRequestRendering.current.rawValue)
+      func makeRequest(_ context: DreamDecisionContext) throws -> DreamRunEncoding.Request {
+        DreamRunEncoding.Request(
+          schemaVersion: 3, runID: runID, generation: progress.generation,
+          inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+          systemPrompt: context.savedSystemPrompt,
+          messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)),
+          renderingVersion: DreamRequestRendering.current.rawValue)
+      }
+      var context = try capture(
+        run: run,
+        admissionLimitations: batch.admissionLimitations + (retainedBatches.isEmpty ? [] : [
+          "Related retained context was omitted from this request."
+        ]), memory: memory, date: date, retainedBatches: [], priorDreams: priorDreams,
+        priorViews: admittedViews, excludedSessionIDs: excludedSessionIDs, protect: protect)
+      var request = try makeRequest(context)
+      guard try recoveryRequestCount(batch: batch, context: context, request: request)
+        <= DreamSourceProtection.maximumRunRequests
+      else { throw DreamSourceProtectionError.requestLimit }
+      if !retainedBatches.isEmpty && (remainingProtections?() ?? Int.max) > 0 {
+        do {
+          let augmented = try capture(
+            run: run, admissionLimitations: batch.admissionLimitations, memory: memory, date: date,
+            retainedBatches: retainedBatches, priorDreams: priorDreams, priorViews: admittedViews,
+            excludedSessionIDs: excludedSessionIDs, protect: protect)
+          let candidate = try makeRequest(augmented)
+          if try recoveryRequestCount(batch: batch, context: augmented, request: candidate)
+            <= DreamSourceProtection.maximumRunRequests
+          {
+            context = augmented
+            request = candidate
+          }
+        } catch DreamSourceProtectionError.requestLimit {
+        }
+      }
       let requestBytes = try bounded(request)
       let rejected = try rejectedVersion()
       let directory = try runs.child(runID, isCreating: true)
@@ -1670,27 +1693,52 @@ public final class DreamRunStore {
       }), excludedSessionIDs.isDisjoint(with: sealed.context.priorContext?.sessions ?? [])
     else { throw MemoryError("live session excluded from dream intake") }
     guard let protect else { return }
-    try protect(DreamSourceProtection.pieces(sealed.run.batch))
-    for batch in related {
-      guard batch.evidence.allSatisfy({ $0.originalWitness != nil }),
-        !batch.admittedViews.isEmpty
+    for pieces in try protectionPieces(
+      batch: sealed.run.batch, related: related, context: sealed.context,
+      requestPieces: [sealed.request.systemPrompt] + sealed.request.messages.map(\.text))
+    { try protect(pieces) }
+  }
+
+  private func protectionPieces(
+    batch: PreparedSessionBatch, related: [PreparedSessionBatch],
+    context: DreamDecisionContext, requestPieces: [String]
+  ) throws -> [[String]] {
+    var groups = [try DreamSourceProtection.pieces(batch)]
+    for retained in related {
+      guard retained.evidence.allSatisfy({ $0.originalWitness != nil }),
+        !retained.admittedViews.isEmpty
       else { throw MemoryError("retained dream context lacks an admitted source view") }
-      try protect(DreamSourceProtection.pieces(batch))
+      groups.append(try DreamSourceProtection.pieces(retained))
     }
     let historyPieces =
-      DreamSourceProtection.rejectedPredecessors(sealed.context.rejectedPredecessors)
-      + (sealed.context.priorContext?.protectedPieces ?? [])
-    if !historyPieces.isEmpty { try protect(historyPieces) }
-    try protect(
-      DreamSourceProtection.authority(sealed.context.snapshot, owners: sealed.context.owners))
-    try protect([sealed.request.systemPrompt] + sealed.request.messages.map(\.text))
+      DreamSourceProtection.rejectedPredecessors(context.rejectedPredecessors)
+      + (context.priorContext?.protectedPieces ?? [])
+    if !historyPieces.isEmpty { groups.append(historyPieces) }
+    groups.append(try DreamSourceProtection.authority(context.snapshot, owners: context.owners))
+    groups.append(requestPieces)
+    return groups
+  }
+
+  private func recoveryRequestCount(
+    batch: PreparedSessionBatch, context: DreamDecisionContext,
+    request: DreamRunEncoding.Request
+  ) throws -> Int {
+    let related = try (context.connectedEvidence?.relatedBatchBytes ?? []).map {
+      try DreamRunEncoding.retainedBatch(bytes: $0)
+    }
+    return try protectionPieces(
+      batch: batch, related: related, context: context,
+      requestPieces: [request.systemPrompt] + request.messages.map(\.text)
+    ).reduce(0) { count, pieces in
+      try count + DreamSourceProtection.chunks(pieces).count
+    }
   }
 
   private func capture(
     run: FrozenDreamRun, admissionLimitations: [String], memory: MemoryStore, date: Date,
     retainedBatches: [PreparedSessionBatch], priorDreams: PriorDreams,
     priorViews: [String: DreamAdmittedView], excludedSessionIDs: Set<String>,
-    protect: (([String]) throws -> Void)?, remainingProtections: (() -> Int)?
+    protect: (([String]) throws -> Void)?
   ) throws
     -> DreamDecisionContext
   {
@@ -1698,18 +1746,9 @@ public final class DreamRunStore {
       maximumResponseBytes: limits.maximumResponseBytes,
       maximumFrozenBytes: limits.maximumFrozenBytes)
     var limitations = admissionLimitations
-    var relatedBatches = try selectRetainedBatches(
+    let relatedBatches = try selectRetainedBatches(
       current: run.batch, retained: retainedBatches, excludedSessionIDs: excludedSessionIDs,
       limitations: &limitations)
-    if let remainingProtections {
-      let protectionsAfterRelated = 3
-      let suppliedCount = max(0, remainingProtections() - protectionsAfterRelated)
-      if relatedBatches.count > suppliedCount {
-        relatedBatches = Array(relatedBatches.prefix(suppliedCount))
-        limitations.append(
-          "A related retained window exceeded the source-check limit and was not supplied.")
-      }
-    }
     let catalogue =
       try relatedBatches.isEmpty
       ? run.batch.evidence

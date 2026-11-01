@@ -6,6 +6,7 @@ package enum DreamSourceProtectionError: Error, Equatable, Sendable {
 
 package enum DreamSourceProtection {
   package static let maximumPieces = 1_000
+  package static let maximumRunRequests = 16
   package static let maximumPieceBytes = 1_048_576
   package static let maximumInputBytes = 4_194_304
   package static let maximumOutputBytes = 8_388_608
@@ -43,6 +44,25 @@ package enum DreamSourceProtection {
       }
       total += count
     }
+  }
+
+  package static func chunks(_ pieces: [String]) throws -> [[String]] {
+    var chunks: [[String]] = []
+    var chunk: [String] = []
+    var bytes = 0
+    for piece in pieces {
+      let count = piece.utf8.count
+      guard count <= maximumPieceBytes else { throw DreamSourceProtectionError.limitExceeded }
+      if chunk.count == maximumPieces || count > maximumInputBytes - bytes {
+        chunks.append(chunk)
+        chunk = []
+        bytes = 0
+      }
+      chunk.append(piece)
+      bytes += count
+    }
+    if !chunk.isEmpty { chunks.append(chunk) }
+    return chunks.isEmpty ? [[]] : chunks
   }
 
   package static func requireUnchanged(_ original: [String], _ checked: [String]) throws {

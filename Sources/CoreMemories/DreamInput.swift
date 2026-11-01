@@ -56,11 +56,13 @@ public struct SourceDigest: Hashable, Sendable {
     rawValue = value
   }
 
-  init(bytes: Data) {
+  init(bytes: Data) { self.init(digest: SHA256.hash(data: bytes)) }
+
+  init(digest: SHA256.Digest) {
     let digits = Array("0123456789abcdef".utf8)
     var encoded: [UInt8] = []
     encoded.reserveCapacity(64)
-    for byte in SHA256.hash(data: bytes) {
+    for byte in digest {
       encoded.append(digits[Int(byte >> 4)])
       encoded.append(digits[Int(byte & 0x0f)])
     }
@@ -827,6 +829,27 @@ final class PreparationDirectory {
       }
     }
     return data
+  }
+
+  func prefixDigest(_ name: String, byteCount: UInt64) throws -> SourceDigest? {
+    let file = openat(descriptor, name, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW)
+    guard file >= 0 else { return nil }
+    let handle = FileHandle(fileDescriptor: file, closeOnDealloc: true)
+    defer { try? handle.close() }
+    var status = stat()
+    guard fstat(file, &status) == 0, status.st_mode & S_IFMT == S_IFREG, status.st_size >= 0,
+      UInt64(status.st_size) >= byteCount
+    else { return nil }
+    var hasher = SHA256()
+    var remaining = byteCount
+    while remaining > 0 {
+      guard let chunk = try handle.read(upToCount: Int(min(1_048_576, remaining))),
+        !chunk.isEmpty
+      else { return nil }
+      hasher.update(data: chunk)
+      remaining -= UInt64(chunk.count)
+    }
+    return SourceDigest(digest: hasher.finalize())
   }
 }
 

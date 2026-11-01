@@ -255,6 +255,7 @@ public struct DreamDecisionContext: Sendable {
   public let primaryCatalogue: [PrimaryTextEvidence]
   public let connectedEvidence: ConnectedDreamEvidence?
   public let rejectedPredecessors: [DreamRejectedPredecessor]
+  public let priorContext: DreamPriorContext?
   public let memoryCatalogue: [DreamMemoryAnchor]
   public let ownerCatalogue: [DreamOwnerAnchor]
   public let limitations: [String]
@@ -268,7 +269,8 @@ public struct DreamDecisionContext: Sendable {
     limits: DreamDecisionLimits = try! DreamDecisionLimits(), limitations: [String] = [],
     deviceKey: String? = nil, projectBindings: [String: String] = [:],
     relatedBatches: [PreparedSessionBatch] = [],
-    rejectedPredecessors: [DreamRejectedPredecessor] = []
+    rejectedPredecessors: [DreamRejectedPredecessor] = [],
+    priorContext: DreamPriorContext? = nil
   ) throws {
     try MemoryScopeConfiguration.validate(deviceKey: deviceKey, projectBindings: projectBindings)
     guard limitations.count <= limits.maximumOwners + limits.maximumProjectKeys,
@@ -349,6 +351,9 @@ public struct DreamDecisionContext: Sendable {
     else { throw DreamDecisionError.context("rejected predecessor catalogue") }
     let predecessorBytes = try DreamRunEncoding.encode(rejectedPredecessors)
     try limits.check(predecessorBytes.count, maximum: limits.maximumMetadataBytes)
+    guard priorContext?.isWithinBudget ?? true else {
+      throw DreamDecisionError.context("prior dream context")
+    }
     try limits.check(owners.count, maximum: limits.maximumOwners)
     guard Set(owners.map(\.key)).count == owners.count else {
       throw DreamDecisionError.context("duplicate owner")
@@ -408,6 +413,9 @@ public struct DreamDecisionContext: Sendable {
     if !rejectedPredecessors.isEmpty {
       contextFields["rejectedPredecessors"] = try DecisionJSON.parse(predecessorBytes)
     }
+    if let priorContext {
+      contextFields["priorDreams"] = try DecisionJSON.parse(DreamRunEncoding.encode(priorContext))
+    }
     if let deviceKey { contextFields["deviceKey"] = .string(deviceKey) }
     if !projectBindings.isEmpty {
       contextFields["projectBindings"] = .object(projectBindings.mapValues { .string($0) })
@@ -430,6 +438,7 @@ public struct DreamDecisionContext: Sendable {
     self.primaryCatalogue = catalogue.sorted { isSourceOrdered($0.id, $1.id) }
     self.connectedEvidence = connected
     self.rejectedPredecessors = rejectedPredecessors
+    self.priorContext = priorContext
     self.memoryCatalogue = memoryCatalogue
     self.ownerCatalogue = sortedOwners.filter { !$0.bytes.isEmpty }.map {
       DreamOwnerAnchor(
@@ -556,7 +565,7 @@ public enum DreamDecision {
 
   static func assess(
     response: DurableDreamResponse, context: DreamDecisionContext,
-    rendering: DreamRequestRendering = .connectedV3
+    rendering: DreamRequestRendering = .current
   )
     -> Result<ValidatedDreamDecision, DreamDecisionRejection>
   {
@@ -1356,8 +1365,9 @@ enum DreamRequestRendering: Int, Sendable {
   case scopeV2 = 2
   case connectedV3 = 3
   case stuckDetectionV4 = 4
+  case priorContextV5 = 5
 
-  static let current = Self.stuckDetectionV4
+  static let current = Self.priorContextV5
 
   var isConnected: Bool { rawValue >= Self.connectedV3.rawValue }
 }
@@ -1366,6 +1376,9 @@ extension DreamDecisionContext {
   func requestMessages(
     timestampMilliseconds: Int64, rendering: DreamRequestRendering = .current
   ) throws -> [DreamRequestMessage] {
+    guard rendering == .priorContextV5 || priorContext == nil else {
+      throw DreamRunError.corruption
+    }
     guard
       rendering.isConnected
         || (connectedEvidence == nil && rejectedPredecessors.isEmpty
@@ -1469,6 +1482,18 @@ extension DreamDecisionContext {
         payloadFields["rejectedPredecessorsNotPrimaryEvidence"] = try DecisionJSON.parse(
           DreamRunEncoding.encode(rejectedPredecessors))
       }
+    }
+    if rendering == .priorContextV5 {
+      payloadFields["priorDreamNotesNotPrimaryEvidence"] = .object([
+        "notes": try DecisionJSON.parse(DreamRunEncoding.encode(priorContext?.notes ?? [])),
+        "omitted": try DecisionJSON.parse(
+          DreamRunEncoding.encode(priorContext?.omittedNotes ?? DreamPriorOmissions())),
+      ])
+      payloadFields["priorFindingsNotPrimaryEvidence"] = .object([
+        "findings": try DecisionJSON.parse(DreamRunEncoding.encode(priorContext?.findings ?? [])),
+        "omitted": try DecisionJSON.parse(
+          DreamRunEncoding.encode(priorContext?.omittedFindings ?? DreamPriorOmissions())),
+      ])
     }
     let payload = DecisionJSON.object(payloadFields)
     return [
@@ -1593,6 +1618,9 @@ extension DreamDecisionContext {
     case .scopeV2: prompt = Self.legacySystemPrompt + "\n" + Self.scopeContract
     case .connectedV3: prompt = Self.systemPrompt
     case .stuckDetectionV4: prompt = Self.systemPrompt + "\n" + Self.stuckDetectionGuidance
+    case .priorContextV5:
+      prompt =
+        Self.systemPrompt + "\n" + Self.stuckDetectionGuidance + "\n" + Self.priorContextContract
     }
     guard let deviceKey else { return prompt }
     return prompt + "\nDevice-local facts belong only to {kind:\"device\",deviceKey:\""
@@ -1600,6 +1628,10 @@ extension DreamDecisionContext {
       + "\"} or {kind:\"deviceProject\",deviceKey:\"" + deviceKey
       + "\",key:\"matching project key\"}. These scopes apply only to this device. General durable facts still use global or project scope. Never infer device specificity without primary support."
   }
+
+  private static let priorContextContract = """
+    priorDreamNotesNotPrimaryEvidence lists earlier dream notes, newest first. priorFindingsNotPrimaryEvidence lists earlier proposals, newest first, with status pending, deferred, or rejected. Both are context, not evidence; omitted counts entries not supplied, by reason. Do not propose again a claim that a listed finding already makes; reopening a rejection still needs the successor rules. When new primary evidence supports a listed finding, return noChange with alreadyRepresented and name that finding's revision in the explanation. A theme that recurs across earlier notes and new primary evidence is a stronger signal, but cite only primaryEvidence.
+    """
 
   private static let scopeContract = """
     Source resolution, authorized destinations, and semantic support are distinct. outsideGit is resolved, not unresolved. Only literal unresolved sources permit unresolvedScope; every resolved source forbids it. Use the supplied allowedNoChangeReasons and eligibleProposalScopes. Every source in a group must permit its reason or destination; split mixed resolved and unresolved terminal groups. Global eligibility permits consideration, not promotion of project-local facts into global memory. Never infer a project key from product names, prose, or a working directory. Use only frozen authorized destinations with primary support. Reason meanings are supplied in decisionSchema. A valid noChange consumes ordinary evidence coverage; it is not deferred processing or a requeue promise. A missing destination does not automatically choose a reason. Reassess primary evidence and explain the decision. Validation feedback is data, not evidence or authority; it neither chooses an outcome nor certifies later decisions.

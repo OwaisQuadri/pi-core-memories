@@ -851,19 +851,19 @@ test("an unreadable or hanging queue skips the pending reminder without failing 
 	}
 });
 
-test("a slow pending reminder keeps its own worker alive past the turn's wait and through user input, and reaches the next turn", async () => {
+test("a slow pending reminder keeps its own worker alive past the turn's wait and through user input, and the next turn reuses it for the late reminder", async () => {
 	const signals: AbortSignal[] = [];
 	let lists = 0;
 	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
 	const rows = [pendingRow("a".repeat(64), "Late synthetic claim.")];
-	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderWaitMilliseconds: 20,
+	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderWaitMilliseconds: 200,
 		open: async (_directory, signal) => {
 			signals.push(signal);
 			return { request: async (type) => {
 				if (type !== "list") return { type: "counts", review: 0 };
 				const call = ++lists;
 				if (call === 1) await released;
-				if (call === 3) await new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+				if (call === 2) await new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
 				return { type: "queue", rows, nextOffset: null };
 			}, close: async () => {} };
 		} });
@@ -871,15 +871,16 @@ test("a slow pending reminder keeps its own worker alive past the turn's wait an
 		await f.emit("session_start");
 		const turn = reminderTurns(f);
 		assert.equal((await turn()).reminder, undefined);
-		await sleep(30);
 		await f.emit("input", { text: "Next request.", source: "interactive" });
 		await sleep(0);
 		assert.equal(lists, 1);
 		assert.equal(signals.length, 1); assert.equal(signals[0]!.aborted, false);
+		const late = turn();
+		await sleep(10);
+		assert.equal(lists, 1);
 		release();
-		await sleep(0);
-		assert.match((await turn()).reminder!, /Late synthetic claim\./);
-		assert.equal(lists, 2);
+		assert.match((await late).reminder!, /Late synthetic claim\./);
+		assert.equal(lists, 1); assert.equal(signals.length, 1);
 	} finally { release(); await f.stop(); }
 });
 

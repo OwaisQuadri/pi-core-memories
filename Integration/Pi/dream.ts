@@ -465,24 +465,9 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	signal.addEventListener("abort", abort, { once: true });
 	let rejectAbort!: (reason: Error) => void;
 	const cancelled = new Promise<never>((_done, fail) => { rejectAbort = fail; });
-	let isDispatchInvalid = false;
-	controller.signal.addEventListener("abort", () => rejectAbort(isDispatchInvalid ? new DreamCallFailure("Dream model call failed: physical dispatch changed or was invalid") : new Error("Dream call cancelled.")), { once: true });
+	controller.signal.addEventListener("abort", () => rejectAbort(new Error("Dream call cancelled.")), { once: true });
 	void cancelled.catch(() => {});
-	let dispatch: { provider: string; modelID: string; api: string } | undefined;
-	const onDispatch = (physical: { provider: string; modelID: string; api: string }) => {
-		try {
-			const observed = { provider: text(physical.provider, 256), modelID: text(physical.modelID, 256), api: text(physical.api, 256) };
-			if (!["openai", "openai-codex", "anthropic"].includes(observed.provider) || !observed.modelID || !observed.api || observed.api === "pi-virtual") failure();
-			if (model.api !== "pi-virtual" && (observed.provider !== model.provider || observed.modelID !== model.id || observed.api !== model.api)) failure();
-			if (dispatch && (dispatch.provider !== observed.provider || dispatch.modelID !== observed.modelID || dispatch.api !== observed.api)) failure();
-			dispatch = observed;
-		} catch { isDispatchInvalid = true; controller.abort(); modelFailure("physical dispatch changed or was invalid"); }
-	};
-	function isExpectedIdentity(message: AssistantMessage): boolean {
-		return !isDispatchInvalid && dispatch !== undefined && message.provider === dispatch.provider && message.model === dispatch.modelID && message.api === dispatch.api;
-	}
 	try {
-	onDispatch({ provider: model.provider, modelID: model.id, api: model.api });
 	const stream = ctx.modelRegistry.streamSimple(model, context, { signal: controller.signal, reasoning });
 	let terminal: AssistantMessage | undefined;
 	let isDone = false;
@@ -506,7 +491,6 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 		}
 		if (event.type === "done") {
 			if (event.reason !== "stop") incompleteResponse(event.reason);
-			if (!isExpectedIdentity(event.message)) modelFailure("response identity does not match the dispatched model");
 			terminal = event.message; isDone = true;
 		}
 	}
@@ -515,7 +499,6 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 	const result = await Promise.race([stream.result(), cancelled]);
 	function completed(message: AssistantMessage): string {
 		if (message.stopReason !== "stop") incompleteResponse(message.stopReason, message.errorMessage);
-		if (!isExpectedIdentity(message)) modelFailure("response identity does not match the dispatched model");
 		let bytes = 0;
 		const blocks: string[] = [];
 		for (const part of message.content) {

@@ -110,8 +110,6 @@ test("unexpected tool-call events explain rejection without reading tool names o
 });
 
 for (const [change, cause] of [
-	[{ provider: "other" }, "response identity does not match the dispatched model"],
-	[{ model: "other" }, "response identity does not match the dispatched model"],
 	[{ content: [] }, "response contained no text"],
 	[{ content: [{ type: "toolCall", id: "x", name: "write", arguments: {} }] }, "unexpected non-text response content"],
 	[{ content: [{ type: "text", text: "x".repeat(262145) }] }, "response exceeded the 262144-byte text limit"],

@@ -1306,7 +1306,7 @@ public final class DreamRunStore {
         inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
         systemPrompt: context.savedSystemPrompt,
         messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)),
-        renderingVersion: DreamRequestRendering.connectedV3.rawValue)
+        renderingVersion: DreamRequestRendering.current.rawValue)
       let requestBytes = try bounded(request)
       let rejected = try rejectedVersion()
       let directory = try runs.child(runID, isCreating: true)
@@ -1331,7 +1331,7 @@ public final class DreamRunStore {
         admission: admission, admissionHash: SourceDigest(bytes: admissionBytes), run: run,
         context: context,
         request: try request.domain(run: run, context: context, bytes: requestBytes),
-        rendering: .connectedV3, directory: directory)
+        rendering: .current, directory: directory)
       try save(generation: progress.generation, hash: chain.hash, sealed: sealed)
     }
     guard sealed.rendering != .scopeV2 else { throw DreamRunError.unsupportedSchema }

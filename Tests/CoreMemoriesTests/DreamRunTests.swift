@@ -57,6 +57,7 @@ private func transactionMutate(_ file: URL, _ change: (inout [String: Any]) -> V
       selection: fixture.selection, prepare: { try fixture.prepare($0) },
       call: { request in original = request; throw CancellationError() })
     let saved = try #require(original)
+    #expect(saved.systemPrompt.contains(DreamDecisionContext.stuckDetectionGuidance))
     try transactionMutate(fixture.payload("call-started.json")) { $0.removeValue(forKey: "selection") }
     let before = try fixture.snapshot(fixture.state)
     let protected = try fixture.protectedState()

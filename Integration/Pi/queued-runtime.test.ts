@@ -851,7 +851,7 @@ test("an unreadable or hanging queue skips the pending reminder without failing 
 	}
 });
 
-test("a slow pending reminder keeps its own worker alive in the background, holds back queue tools until it ends and reaches the next turn", async () => {
+test("a slow pending reminder keeps its own worker alive past the turn's wait and reaches the next turn", async () => {
 	const signals: AbortSignal[] = [];
 	let lists = 0;
 	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
@@ -871,17 +871,76 @@ test("a slow pending reminder keeps its own worker alive in the background, hold
 		await f.emit("session_start");
 		const turn = reminderTurns(f);
 		assert.equal((await turn()).reminder, undefined);
-		assert.equal(signals.length, 1); assert.equal(signals[0]!.aborted, false);
-		const pending = f.tool.execute("after-reminder", { operation: "pending" }, undefined, undefined, f.ctx);
 		await sleep(30);
-		assert.equal(signals.length, 1); assert.equal(lists, 1);
+		assert.equal(signals.length, 1); assert.equal(signals[0]!.aborted, false);
 		release();
-		await pending;
-		assert.equal(lists, 2); assert.equal(signals[0]!.aborted, false);
+		await sleep(0);
 		assert.match((await turn()).reminder!, /Late synthetic claim\./);
-		assert.equal(lists, 3);
+		assert.equal(lists, 2);
 	} finally { release(); await f.stop(); }
 });
+
+function hangingReminderRuntime(isCloseHeld = false) {
+	const reminder: { signal?: AbortSignal; isClosed: boolean } = { isClosed: false };
+	let releaseClose!: () => void; const closeReleased = new Promise<void>((resolve) => { releaseClose = resolve; });
+	if (!isCloseHeld) releaseClose();
+	let opens = 0;
+	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderWaitMilliseconds: 20,
+		open: async (_directory, signal) => {
+			const isReminder = ++opens === 1;
+			if (isReminder) reminder.signal = signal;
+			return {
+				request: async (type) => {
+					if (isReminder) return new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+					return type === "list" ? { type: "queue", rows: [], nextOffset: null } : { type: "counts", review: 0 };
+				},
+				close: async () => { if (isReminder) { await closeReleased; reminder.isClosed = true; } },
+			};
+		} });
+	return { f, reminder, releaseClose };
+}
+const promptly = <T>(operation: Promise<T>) => Promise.race([operation, sleep(1_000).then(() => assert.fail("The memory tool call waited behind the pending reminder."))]);
+
+test("a memory tool call stops a hanging pending reminder read instead of waiting behind it", async () => {
+	const { f, reminder } = hangingReminderRuntime();
+	try {
+		await f.emit("session_start");
+		assert.equal((await reminderTurns(f)()).reminder, undefined);
+		assert.equal(reminder.signal?.aborted, false);
+		await promptly(f.tool.execute("during-reminder", { operation: "pending" }, undefined, undefined, f.ctx));
+		assert.equal(reminder.signal?.aborted, true); assert.equal(reminder.isClosed, true);
+	} finally { await f.stop(); }
+});
+
+test("user input stops a hanging pending reminder read and its worker", async () => {
+	const { f, reminder } = hangingReminderRuntime();
+	try {
+		await f.emit("session_start");
+		await reminderTurns(f)();
+		await f.emit("input", { text: "Next request.", source: "interactive" });
+		await sleep(0);
+		assert.equal(reminder.signal?.aborted, true); assert.equal(reminder.isClosed, true);
+	} finally { await f.stop(); }
+});
+
+for (const cancellation of ["tool abort", "user input"] as const) {
+	test(`a ${cancellation} ends a memory tool call promptly while the stopped reminder worker is still closing`, async () => {
+		const { f, reminder, releaseClose } = hangingReminderRuntime(true);
+		try {
+			await f.emit("session_start");
+			await reminderTurns(f)();
+			const controller = new AbortController();
+			const call = f.tool.execute("cancelled", { operation: "pending" }, controller.signal, undefined, f.ctx);
+			await sleep(10);
+			assert.equal(reminder.signal?.aborted, true); assert.equal(reminder.isClosed, false);
+			if (cancellation === "tool abort") controller.abort(); else await f.emit("input", { text: "Stop that.", source: "interactive" });
+			await promptly(assert.rejects(call));
+			releaseClose();
+			await sleep(0);
+			assert.equal(reminder.isClosed, true);
+		} finally { releaseClose(); await f.stop(); }
+	});
+}
 
 test("a non-interactive run gets no pending reminder", async () => {
 	const f = reminderRuntime(() => [pendingRow("a".repeat(64), "Synthetic pending claim.")], undefined, "rpc");

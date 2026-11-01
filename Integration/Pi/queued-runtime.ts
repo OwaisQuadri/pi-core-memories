@@ -148,7 +148,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		})().finally(() => { marking = undefined; if (generation === epoch) schedule(); });
 	}
 	function invalidateConversation(): void { foreground?.abort(); generation++; void closeConversation(); }
-	function invalidate(): void { invalidateConversation(); stopBackground(); interruptedCallSelection = undefined; reminderAbort.abort(); reminderAbort = new AbortController(); readyReminder = undefined; }
+	function abortReminderRead(): void { reminderAbort.abort(); reminderAbort = new AbortController(); }
+	function invalidate(): void { invalidateConversation(); stopBackground(); interruptedCallSelection = undefined; abortReminderRead(); readyReminder = undefined; }
 	async function leaveSession(): Promise<void> {
 		const previous = marker; marker = undefined;
 		reportDreamStatus(undefined);
@@ -308,7 +309,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const refreshIdleCounts = () => conversation || background ? Promise.resolve() : refreshCounts(ctx, combined).catch(() => {});
 		foregroundCompletion = (async () => {
 			await conversationClose;
-			await reminderRead?.completion;
+			abortReminderRead();
+			await Promise.race([reminderRead?.completion, combined.aborted ? undefined : new Promise<void>((resolve) => combined.addEventListener("abort", () => resolve(), { once: true }))]);
+			combined.throwIfAborted();
 			const result = await run();
 			if (isCurrent()) await refreshIdleCounts();
 			return result;
@@ -507,7 +510,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			const leaf = ctx.sessionManager.getBranch().at(-1);
 			if (entry && leaf) observedReply = { proposalId: state.proposalId, proposalEntryId: entry.id, previousLeafId: leaf.id, text: event.text, isRunStarted: false };
 		}
-		foreground?.abort(); failures = 0; schedule();
+		foreground?.abort(); abortReminderRead(); failures = 0; schedule();
 	});
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (observedReply) {

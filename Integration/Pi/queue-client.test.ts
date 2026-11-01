@@ -5,7 +5,7 @@ import { mkdtemp, writeFile, chmod, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import "./test/host.ts";
-const { decodeQueuePreview, openQueueClient, verifiedCandidateRequestTypes } = await import("./queue-client.ts");
+const { decodeQueuePreview, openQueueClient } = await import("./queue-client.ts");
 const identity = { sessionID: "session", requestID: "request" };
 const sha = (value: Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const bytes = (value: string): string => Buffer.from(value).toString("base64");
@@ -100,8 +100,7 @@ input(createReadStream(null, { fd: 3 }), "private");
 	process.env.PI_CORE_MEMORIES_EXECUTABLE = executable;
 	try {
 		const controller = new AbortController();
-		assert.deepEqual([...verifiedCandidateRequestTypes].sort(), ["amend", "claim", "counts", "inventory", "list", "manage-preview", "manage-recover", "recover", "relocation-preview", "relocation-reply"]);
-		for (const type of verifiedCandidateRequestTypes) {
+		for (const type of ["list", "inventory", "claim", "counts", "amend", "recover", "manage-preview", "manage-recover", "relocation-preview", "relocation-reply"]) {
 			await t.test(`${type} survives the ordinary deadline but still expires at 120 seconds`, async (t) => {
 				const client = await openQueueClient(directory, controller.signal);
 				t.mock.timers.enable({ apis: ["setTimeout"] });

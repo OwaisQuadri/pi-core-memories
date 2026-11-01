@@ -565,7 +565,7 @@ public enum DreamDecision {
 
   static func assess(
     response: DurableDreamResponse, context: DreamDecisionContext,
-    rendering: DreamRequestRendering = .connectedV3
+    rendering: DreamRequestRendering = .current
   )
     -> Result<ValidatedDreamDecision, DreamDecisionRejection>
   {
@@ -1365,8 +1365,9 @@ enum DreamRequestRendering: Int, Sendable {
   case scopeV2 = 2
   case connectedV3 = 3
   case stuckDetectionV4 = 4
+  case priorContextV5 = 5
 
-  static let current = Self.stuckDetectionV4
+  static let current = Self.priorContextV5
 
   var isConnected: Bool { rawValue >= Self.connectedV3.rawValue }
 }
@@ -1375,6 +1376,9 @@ extension DreamDecisionContext {
   func requestMessages(
     timestampMilliseconds: Int64, rendering: DreamRequestRendering = .current
   ) throws -> [DreamRequestMessage] {
+    guard rendering == .priorContextV5 || priorContext == nil else {
+      throw DreamRunError.corruption
+    }
     guard
       rendering.isConnected
         || (connectedEvidence == nil && rejectedPredecessors.isEmpty
@@ -1478,17 +1482,18 @@ extension DreamDecisionContext {
         payloadFields["rejectedPredecessorsNotPrimaryEvidence"] = try DecisionJSON.parse(
           DreamRunEncoding.encode(rejectedPredecessors))
       }
-      if let priorContext {
-        payloadFields["priorDreamNotesNotPrimaryEvidence"] = .object([
-          "notes": try DecisionJSON.parse(DreamRunEncoding.encode(priorContext.notes)),
-          "omitted": try DecisionJSON.parse(DreamRunEncoding.encode(priorContext.omittedNotes)),
-        ])
-        payloadFields["priorFindingsNotPrimaryEvidence"] = .object([
-          "findings": try DecisionJSON.parse(DreamRunEncoding.encode(priorContext.findings)),
-          "omitted": try DecisionJSON.parse(
-            DreamRunEncoding.encode(priorContext.omittedFindings)),
-        ])
-      }
+    }
+    if rendering == .priorContextV5 {
+      payloadFields["priorDreamNotesNotPrimaryEvidence"] = .object([
+        "notes": try DecisionJSON.parse(DreamRunEncoding.encode(priorContext?.notes ?? [])),
+        "omitted": try DecisionJSON.parse(
+          DreamRunEncoding.encode(priorContext?.omittedNotes ?? DreamPriorOmissions())),
+      ])
+      payloadFields["priorFindingsNotPrimaryEvidence"] = .object([
+        "findings": try DecisionJSON.parse(DreamRunEncoding.encode(priorContext?.findings ?? [])),
+        "omitted": try DecisionJSON.parse(
+          DreamRunEncoding.encode(priorContext?.omittedFindings ?? DreamPriorOmissions())),
+      ])
     }
     let payload = DecisionJSON.object(payloadFields)
     return [
@@ -1613,6 +1618,9 @@ extension DreamDecisionContext {
     case .scopeV2: prompt = Self.legacySystemPrompt + "\n" + Self.scopeContract
     case .connectedV3: prompt = Self.systemPrompt
     case .stuckDetectionV4: prompt = Self.systemPrompt + "\n" + Self.stuckDetectionGuidance
+    case .priorContextV5:
+      prompt =
+        Self.systemPrompt + "\n" + Self.stuckDetectionGuidance + "\n" + Self.priorContextContract
     }
     guard let deviceKey else { return prompt }
     return prompt + "\nDevice-local facts belong only to {kind:\"device\",deviceKey:\""

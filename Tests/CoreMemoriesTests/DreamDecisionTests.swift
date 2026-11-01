@@ -211,6 +211,142 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
   }
 }
 
+@Test func dreamRequestVersionMarkerRefusesMissingUnknownAndInconsistentFormats() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  for (schema, rendering) in [
+    (3, 5), (3, nil), (3, 1), (3, 2), (3, 3), (3, 4), (2, 3), (3, 6), (4, 4),
+  ] as [(Int, Int?)]
+  {
+    let request = DreamRunEncoding.Request(
+      schemaVersion: schema, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      systemPrompt: context.savedSystemPrompt,
+      messages: try context.requestMessages(timestampMilliseconds: 123), renderingVersion: rendering
+    )
+    let bytes = try DreamRunEncoding.encode(request)
+    if schema == 3 && rendering == 5 {
+      let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
+      #expect(
+        try saved.domain(run: fixture.run, context: context, bytes: bytes).requestHash
+          == SourceDigest(bytes: bytes))
+    } else if schema == 3 && [2, 3, 4].contains(rendering) {
+      #expect(throws: DreamRunError.corruption) {
+        try request.domain(run: fixture.run, context: context, bytes: bytes)
+      }
+    } else {
+      #expect(throws: DreamRunError.unsupportedSchema) {
+        try request.domain(run: fixture.run, context: context, bytes: bytes)
+      }
+    }
+  }
+}
+
+@Test(arguments: [DreamRequestRendering.connectedV3, .stuckDetectionV4])
+func dreamRequestSavedV3AndV4StillVerifyWithoutPriorContextSections(
+  rendering: DreamRequestRendering
+) throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  let saved = DreamRunEncoding.Request(
+    schemaVersion: 3, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+    inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+    systemPrompt: context.systemPrompt(rendering: rendering),
+    messages: try context.requestMessages(timestampMilliseconds: 123, rendering: rendering),
+    renderingVersion: rendering.rawValue)
+  let bytes = try DreamRunEncoding.encode(saved)
+  let decoded = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
+  let verified = try decoded.verifiedDomain(run: fixture.run, context: context, bytes: bytes)
+  #expect(verified.rendering == rendering)
+  #expect(verified.request.requestHash == SourceDigest(bytes: bytes))
+  #expect(!saved.systemPrompt.contains("priorDreamNotesNotPrimaryEvidence"))
+  let body = try #require(
+    JSONSerialization.jsonObject(with: Data(saved.messages[0].text.utf8)) as? [String: Any])
+  #expect(body["priorDreamNotesNotPrimaryEvidence"] == nil)
+  #expect(body["priorFindingsNotPrimaryEvidence"] == nil)
+}
+
+@Test func dreamRequestOnlyV5RendersPriorHistoryAfterTheStuckDetectionPrompt() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let plain = try fixture.context()
+  let note = DreamPriorNote(
+    generation: 1, kind: "noChange", reasonCode: "notDurable", explanation: "Earlier note.",
+    sessions: ["one"])
+  let prior = try #require(
+    try DreamPriorContext(
+      newestNotes: [DreamPriorCandidate(item: note, sessions: ["one"], sourcePaths: ["a/b.jsonl"])],
+      olderNoteCount: 0, newestFindings: [], excludedSessionIDs: [], isVerified: { _ in true }))
+  let context = try DreamDecisionContext(
+    run: fixture.run, snapshot: fixture.snapshot,
+    scopes: fixture.run.batch.evidence.map {
+      PinnedEvidenceScope(
+        source: $0.id, projectScope: $0.projectScope,
+        resolution: .outsideGit(isGlobalEligible: true))
+    }, owners: [], addedDate: "2026-01-02", priorContext: prior)
+  for rendering in [DreamRequestRendering.connectedV3, .stuckDetectionV4] {
+    #expect(throws: DreamRunError.corruption) {
+      try context.requestMessages(timestampMilliseconds: 123, rendering: rendering)
+    }
+  }
+  #expect(
+    Data(context.systemPrompt(rendering: .priorContextV5).utf8).starts(
+      with: Data((plain.systemPrompt(rendering: .stuckDetectionV4) + "\n").utf8)))
+  let body = try #require(
+    JSONSerialization.jsonObject(
+      with: Data(try context.requestMessages(timestampMilliseconds: 123)[0].text.utf8))
+      as? [String: Any])
+  let notes = try #require(body["priorDreamNotesNotPrimaryEvidence"] as? [String: Any])
+  #expect((notes["notes"] as? [[String: Any]])?.first?["explanation"] as? String == "Earlier note.")
+}
+
+@Test func dreamRequestMixedHistoricalPromptAndMessageFormatsRemainCorrupt() throws {
+  let fixture = try DecisionFixture()
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  for (prompt, message) in [
+    (DreamRequestRendering.legacyV1, DreamRequestRendering.connectedV3),
+    (.connectedV3, .legacyV1), (.legacyV1, .scopeV2), (.scopeV2, .legacyV1),
+    (.scopeV2, .connectedV3), (.connectedV3, .scopeV2),
+  ] {
+    let request = DreamRunEncoding.Request(
+      schemaVersion: 2, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      systemPrompt: context.systemPrompt(rendering: prompt),
+      messages: try context.requestMessages(timestampMilliseconds: 123, rendering: message))
+    #expect(throws: DreamRunError.corruption) {
+      try request.domain(
+        run: fixture.run, context: context, bytes: DreamRunEncoding.encode(request))
+    }
+  }
+  for (marker, prompt, message) in [
+    (DreamRequestRendering.connectedV3, DreamRequestRendering.stuckDetectionV4,
+      DreamRequestRendering.connectedV3),
+    (.connectedV3, .connectedV3, .priorContextV5),
+    (.stuckDetectionV4, .connectedV3, .stuckDetectionV4),
+    (.stuckDetectionV4, .stuckDetectionV4, .priorContextV5),
+    (.stuckDetectionV4, .priorContextV5, .stuckDetectionV4),
+    (.priorContextV5, .stuckDetectionV4, .priorContextV5),
+    (.priorContextV5, .priorContextV5, .stuckDetectionV4),
+  ] {
+    let request = DreamRunEncoding.Request(
+      schemaVersion: 3, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+      inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+      systemPrompt: context.systemPrompt(rendering: prompt),
+      messages: try context.requestMessages(timestampMilliseconds: 123, rendering: message),
+      renderingVersion: marker.rawValue)
+    #expect(throws: DreamRunError.corruption) {
+      try request.domain(
+        run: fixture.run, context: context, bytes: DreamRunEncoding.encode(request))
+    }
+  }
+}
+
+
+
+
 @Test func dreamDecisionCorrectsBlueToGreenWithExactBytesAndMetadata() throws {
   let fixture = try DecisionFixture(document: decisionBlue)
   defer { fixture.clean() }
@@ -446,7 +582,9 @@ private func decisionUnknownFields(_ value: Any) -> [Any] {
   #expect(context.savedSystemPrompt.contains(guidance))
   #expect(!context.systemPrompt(rendering: .connectedV3).contains(guidance))
   let connected = try context.requestMessages(timestampMilliseconds: 123, rendering: .connectedV3)
-  #expect(try context.requestMessages(timestampMilliseconds: 123) == connected)
+  #expect(
+    try context.requestMessages(timestampMilliseconds: 123, rendering: .stuckDetectionV4)
+      == connected)
   let saved = DreamRunEncoding.Request(
     schemaVersion: 3, runID: fixture.run.runID, generation: fixture.run.progress.generation,
     inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,

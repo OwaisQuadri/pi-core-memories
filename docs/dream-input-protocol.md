@@ -57,11 +57,11 @@ The native model policy permits a single clear persistent intent without repetit
 
 ## Saved request replay
 
-New saved requests use request schema 3 with `renderingVersion:4`. Their input, context, message and baseline response schemas are unchanged. The rendering 4 prompt is the rendering 3 prompt plus one stuck-agent paragraph. It tells the model to find repeated failures, guard refusals, edit/revert loops and repeated corrections. It requires at least 2 cited occurrences. It proposes either agent guidance or an add whose text starts with `Tool fix suggestion: <tool> — <failure> (seen N times)`. The person still approves every proposal.
+New saved requests use request schema 3 with `renderingVersion:5`. Rendering 5 is rendering 4 plus the prior-dream sections and prompt paragraph described in [the native queue](native-queue.md). The rendering 4 prompt is the rendering 3 prompt plus one stuck-agent paragraph. It tells the model to find repeated failures, guard refusals, edit/revert loops and repeated corrections. It requires at least 2 cited occurrences. It proposes either agent guidance or an add whose text starts with `Tool fix suggestion: <tool> — <failure> (seen N times)`. The person still approves every proposal.
 
 Existing unversioned request schema 2 can contain three renderings: the original text-only format, the scope-contract format, or the connected-evidence format. Replay accepts only a complete matching prompt/message pair derived from the frozen context. It compares exact bytes, retains the stored request bytes and digest, and keeps admission and completion-chain verification. It does not regenerate or rewrite saved artifacts.
 
-Request schema 3 with `renderingVersion:2` requires the scope-contract pair. Rendering version 3 requires the connected-evidence pair. Rendering version 4 requires the connected-evidence messages with the stuck-agent prompt. Unknown, missing or inconsistent version markers fail closed.
+Request schema 3 with `renderingVersion:2` requires the scope-contract pair. Rendering version 3 requires the connected-evidence pair. Rendering version 4 requires the connected-evidence messages with the stuck-agent prompt. Rendering version 5 requires the version 4 pair plus the prior-dream sections and paragraph. Unknown, missing or inconsistent version markers fail closed.
 
 The original and scope-contract renderings cannot represent tool evidence, connected windows, rejected predecessors or admitted-source locator mappings. Replay refuses those renderings when the frozen context contains those features. A stored hash alone does not prove that a request was correctly derived from its context.
 

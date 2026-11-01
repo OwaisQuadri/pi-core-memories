@@ -61,6 +61,34 @@ private func seedJournal(_ queue: MemoryQueue, _ decisions: [(action: String, de
   #expect(try fixture.main() == receipt.commit)
 }
 
+@Test func journaledDecisionReplaysAfterCrashBetweenPublicationAndReceipt() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let queue = try detachedQueue(fixture, sources: reviewCompletedSiblings(fixture))
+  _ = try seedJournal(queue, [("approve", "journaled")])
+  let original = try fixture.main()
+  let crashing = try queueFixture(fixture, sources: fixture.store())
+  crashing.configureReview = { review in
+    review.persistenceFault = { event in
+      if case .beforeWrite(let name) = event, name.hasPrefix("outcome-") {
+        throw MemoryError("synthetic crash after publication")
+      }
+    }
+  }
+  #expect(throws: (any Error).self) { try crashing.recover(decisionID: "journaled") }
+  let reopened = try queueFixture(fixture, sources: fixture.store())
+  let receipt = try reopened.recover(decisionID: "journaled")
+  #expect(receipt.status == "approved")
+  let commit = try #require(receipt.commit)
+  #expect(commit == (try fixture.main()))
+  #expect(try queueFixture(fixture, sources: fixture.store()).recover(decisionID: "journaled") == receipt)
+  #expect(try fixture.main() == commit)
+  #expect(
+    try Git(repo: fixture.memory, environment: [:]).text([
+      "rev-list", "--count", "\(original)..\(commit)",
+    ]) == "1")
+}
+
 @Test func changedProposalIsNotAppliedFromTheJournalAndNeedsAFreshDecision() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

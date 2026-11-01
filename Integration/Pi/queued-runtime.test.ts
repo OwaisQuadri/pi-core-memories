@@ -131,6 +131,32 @@ test("the footer combines dream state with the nonzero review count from the nat
 	} finally { release(); await f.stop(); }
 });
 
+test("a long backoff timer shrinks when input resets failures", async (t) => {
+	let runs = 0;
+	const f = runtime(async () => { runs++; throw new Error("fail"); }, "tui", undefined, { idleMilliseconds: 20 });
+	Object.assign(f.ctx.sessionManager, { getSessionFile: () => undefined });
+	async function expectRuns(expected: number): Promise<void> {
+		for (let turn = 0; turn < 100 && runs !== expected; turn++) await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(runs, expected);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	try {
+		await f.emit("session_start");
+		t.mock.timers.tick(20);
+		await expectRuns(1);
+		t.mock.timers.tick(40);
+		await expectRuns(2);
+		t.mock.timers.tick(79);
+		assert.equal(runs, 2, "the third run waits for an 80 ms backoff");
+		await f.emit("input", { source: "interactive", text: "next" });
+		t.mock.timers.tick(19);
+		assert.equal(runs, 2);
+		t.mock.timers.tick(1);
+		await expectRuns(3);
+	} finally { await f.stop(); t.mock.timers.reset(); }
+});
+
 test("live sessions are excluded at start and a session that opens mid-run blocks its evidence", async () => {
 	let excluded: string[] = []; let calls = 0;
 	const f = runtime(async (start, call, signal) => {

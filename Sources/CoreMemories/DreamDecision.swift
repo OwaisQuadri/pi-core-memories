@@ -590,7 +590,7 @@ public enum DreamDecision {
     let decisions: [DecisionJSON]
     do {
       let root = try DecisionJSON.parse(
-        Data(response.response.text.utf8), isNullAllowed: rendering == .connectedV3
+        Data(response.response.text.utf8), isNullAllowed: rendering.isConnected
       ).object(
         keys: ["schemaVersion", "contextHash", "decisions"])
       guard try root["schemaVersion"]!.integer() == 1 else {
@@ -890,11 +890,11 @@ private struct DecisionValidator {
     default: throw DecisionDiagnostic(.unsupportedDecision)
     }
     let isConditional =
-      rendering == .connectedV3
+      rendering.isConnected
       && (kind == "add" || kind == "update") && fields["conditions"] != nil
     var expectedKeys = isConditional ? keys.union(["conditions"]) : keys
     let isSuccessor =
-      rendering == .connectedV3
+      rendering.isConnected
       && (kind == "add" || kind == "update") && fields["successor"] != nil
     if isSuccessor { expectedKeys.insert("successor") }
     let object = try value.object(keys: expectedKeys)
@@ -1355,14 +1355,19 @@ enum DreamRequestRendering: Int, Sendable {
   case legacyV1 = 1
   case scopeV2 = 2
   case connectedV3 = 3
+  case stuckDetectionV4 = 4
+
+  static let current = Self.stuckDetectionV4
+
+  var isConnected: Bool { rawValue >= Self.connectedV3.rawValue }
 }
 
 extension DreamDecisionContext {
   func requestMessages(
-    timestampMilliseconds: Int64, rendering: DreamRequestRendering = .connectedV3
+    timestampMilliseconds: Int64, rendering: DreamRequestRendering = .current
   ) throws -> [DreamRequestMessage] {
     guard
-      rendering == .connectedV3
+      rendering.isConnected
         || (connectedEvidence == nil && rejectedPredecessors.isEmpty
           && primaryCatalogue.allSatisfy {
             $0.kind != .toolCall && $0.kind != .toolResult && $0.originalWitness == nil
@@ -1375,7 +1380,7 @@ extension DreamDecisionContext {
         "timestampReferenceTimeBits": .string(
           String($0.timestamp.timeIntervalSinceReferenceDate.bitPattern)),
       ]
-      if rendering == .connectedV3 {
+      if rendering.isConnected {
         fields["contentDigest"] = .string(SourceDigest(bytes: Data($0.exactText.utf8)).rawValue)
         fields["isToolActivity"] = .boolean($0.kind == .toolCall || $0.kind == .toolResult)
         fields["isCurrentWindow"] = .boolean(
@@ -1457,7 +1462,7 @@ extension DreamDecisionContext {
       "limitations": .array(limitations.map { .string($0) }),
       "validationLimits": try DecisionJSON.parse(DreamRunEncoding.encode(limits)),
     ]
-    if rendering == .connectedV3 {
+    if rendering.isConnected {
       payloadFields["connectedWindowBindings"] = .array(
         (connectedEvidence?.windowBindings ?? []).map { .string($0.rawValue) })
       if !rejectedPredecessors.isEmpty {
@@ -1553,7 +1558,7 @@ extension DreamDecisionContext {
       "kind": literal("update"), "scope": scope, "anchor": anchor, "text": text,
       "sources": sources, "contradictions": contradictions, "reason": text,
     ]
-    if rendering == .connectedV3 {
+    if rendering.isConnected {
       add["conditions"] = conditions
       add["successor"] = successor
       update["conditions"] = conditions
@@ -1579,7 +1584,7 @@ extension DreamDecisionContext {
     ])
   }
 
-  var savedSystemPrompt: String { systemPrompt(rendering: .connectedV3) }
+  var savedSystemPrompt: String { systemPrompt(rendering: .current) }
 
   func systemPrompt(rendering: DreamRequestRendering) -> String {
     let prompt: String
@@ -1587,6 +1592,7 @@ extension DreamDecisionContext {
     case .legacyV1: prompt = Self.legacySystemPrompt
     case .scopeV2: prompt = Self.legacySystemPrompt + "\n" + Self.scopeContract
     case .connectedV3: prompt = Self.systemPrompt
+    case .stuckDetectionV4: prompt = Self.systemPrompt + "\n" + Self.stuckDetectionGuidance
     }
     guard let deviceKey else { return prompt }
     return prompt + "\nDevice-local facts belong only to {kind:\"device\",deviceKey:\""
@@ -1626,5 +1632,9 @@ extension DreamDecisionContext {
     A memory anchor is exactly {scope,documentHash,start,end,before}; use one complete eligible supplied block with exact UTF-8 byte offsets and before text. An update must include that replaced anchor as a memory contradiction. An owner anchor is exactly {key,ownerHash,start,end,before}; use a nonempty UTF-8-boundary slice of supplied owner bytes. Owner notes do not authorize owner edits.
     contradictions is an array of {kind:"primary",source,explanation}, {kind:"memory",anchor,explanation}, or {kind:"owner",anchor,explanation}. Use only exact supplied sources and anchors in eligible matching scopes. Empty contradictions means none supplied, not proof of no conflicts.
     noChange reasonCode is notDurable, alreadyRepresented, insufficientEvidence, or unresolvedScope. Unresolved primary scope permits only unresolvedScope noChange. Empty decisions is valid only for empty primaryEvidence. Do not use selected labels, questions, agent text, approved memory, owners, or limitations as primary support. Do not copy instruction owners into memory when an owner note fits.
+    """
+
+  static let stuckDetectionGuidance = """
+    Stuck agent: look in primaryEvidence, mainly tool activity, for an agent that was stuck, failed repeatedly, or ran in circles. Signs: the same failing command, test, or tool call again; the same guard refusal or edit refusal again; an edit and then its revert; many tool calls with no change of state; the person correcting the agent in the same way more than once. For this pattern only, repetition is necessary: cite at least 2 occurrences of the same failure as sources. One failure is not a pattern. Then find the cause. If the tool worked and the agent used it badly, propose a guidance memory that tells the agent what to do instead. If the tool, script, extension, or program is broken or unclear, propose an add whose text starts with "Tool fix suggestion: <tool> — <failure> (seen N times)", where N is the number of cited occurrences, and then gives the fix for the person to consider. If the cause is not clear, use a noChange note.
     """
 }

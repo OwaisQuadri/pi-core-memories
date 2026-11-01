@@ -715,6 +715,7 @@ extension DreamRunEncoding {
       case (2, nil): return [.connectedV3, .scopeV2, .legacyV1]
       case (3, 2): return [.scopeV2]
       case (3, 3): return [.connectedV3]
+      case (3, 4): return [.stuckDetectionV4]
       default: throw DreamRunError.unsupportedSchema
       }
     }

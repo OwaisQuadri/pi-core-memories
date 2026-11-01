@@ -413,7 +413,9 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
   let fixture = try DecisionFixture()
   defer { fixture.clean() }
   let context = try fixture.context()
-  for (schema, rendering) in [(3, 3), (3, nil), (3, 1), (3, 2), (2, 3), (4, 4)] as [(Int, Int?)] {
+  for (schema, rendering) in [(3, 4), (3, nil), (3, 1), (3, 2), (3, 3), (2, 3), (3, 5), (4, 4)]
+    as [(Int, Int?)]
+  {
     let request = DreamRunEncoding.Request(
       schemaVersion: schema, runID: fixture.run.runID, generation: fixture.run.progress.generation,
       inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
@@ -421,12 +423,12 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
       messages: try context.requestMessages(timestampMilliseconds: 123), renderingVersion: rendering
     )
     let bytes = try DreamRunEncoding.encode(request)
-    if schema == 3 && rendering == 3 {
+    if schema == 3 && rendering == 4 {
       let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
       #expect(
         try saved.domain(run: fixture.run, context: context, bytes: bytes).requestHash
           == SourceDigest(bytes: bytes))
-    } else if schema == 3 && rendering == 2 {
+    } else if schema == 3 && (rendering == 2 || rendering == 3) {
       #expect(throws: DreamRunError.corruption) {
         try request.domain(run: fixture.run, context: context, bytes: bytes)
       }
@@ -1586,4 +1588,29 @@ func dreamDecisionNativeBlockRangesKeepOriginalLineEndings(ending: String) throw
   let result = try DreamDecision.validate(
     response: fixture.response(decisions, context: context), context: context)
   #expect(result.plans[0].sources.count == context.primaryCatalogue.count)
+}
+
+@Test func dreamStuckDetectionPromptAddsGuidanceAndSavedConnectedRequestsStillReplay() throws {
+  let fixture = try DecisionFixture(isToolEvidenceIncluded: true)
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  let guidance = DreamDecisionContext.stuckDetectionGuidance
+  #expect(guidance.contains("guard refusal"))
+  #expect(guidance.contains("at least 2 occurrences"))
+  #expect(guidance.contains("Tool fix suggestion: <tool> \u{2014} <failure> (seen N times)"))
+  #expect(context.savedSystemPrompt.contains(guidance))
+  #expect(!context.systemPrompt(rendering: .connectedV3).contains(guidance))
+  let connected = try context.requestMessages(timestampMilliseconds: 123, rendering: .connectedV3)
+  #expect(try context.requestMessages(timestampMilliseconds: 123) == connected)
+  let saved = DreamRunEncoding.Request(
+    schemaVersion: 3, runID: fixture.run.runID, generation: fixture.run.progress.generation,
+    inputHash: fixture.run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
+    systemPrompt: context.systemPrompt(rendering: .connectedV3), messages: connected,
+    renderingVersion: DreamRequestRendering.connectedV3.rawValue)
+  let bytes = try DreamRunEncoding.encode(saved)
+  let verified = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
+    .verifiedDomain(run: fixture.run, context: context, bytes: bytes)
+  #expect(verified.rendering == .connectedV3)
+  #expect(verified.request.requestHash == SourceDigest(bytes: bytes))
+  #expect(verified.request.systemPrompt == saved.systemPrompt)
 }

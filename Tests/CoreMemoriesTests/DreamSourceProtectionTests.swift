@@ -3,6 +3,20 @@ import Testing
 
 @testable import CoreMemories
 
+@Test
+func sourceProtectionChunksOversizedAggregateWithoutDroppingPieces() throws {
+  let pieces = Array(repeating: String(repeating: "x", count: 1_048_576), count: 5)
+  let chunks = try DreamSourceProtection.chunks(pieces)
+  #expect(chunks.map(\.count) == [4, 1])
+  #expect(chunks.flatMap { $0 } == pieces)
+  for chunk in chunks {
+    try DreamSourceProtection.validate(
+      chunk, maximumBytes: DreamSourceProtection.maximumInputBytes)
+  }
+  #expect(try DreamSourceProtection.chunks(Array(repeating: "", count: 1_001)).map(\.count)
+    == [1_000, 1])
+}
+
 @Test(arguments: [
   "blocked", "wrongPolicy", "wrongID", "wrongInput", "wrongOutput", "wrongInvocation", "cancel",
   "timeout",

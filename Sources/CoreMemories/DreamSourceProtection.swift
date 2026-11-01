@@ -45,6 +45,25 @@ package enum DreamSourceProtection {
     }
   }
 
+  package static func chunks(_ pieces: [String]) throws -> [[String]] {
+    var chunks: [[String]] = []
+    var chunk: [String] = []
+    var bytes = 0
+    for piece in pieces {
+      let count = piece.utf8.count
+      guard count <= maximumPieceBytes else { throw DreamSourceProtectionError.limitExceeded }
+      if chunk.count == maximumPieces || count > maximumInputBytes - bytes {
+        chunks.append(chunk)
+        chunk = []
+        bytes = 0
+      }
+      chunk.append(piece)
+      bytes += count
+    }
+    if !chunk.isEmpty { chunks.append(chunk) }
+    return chunks.isEmpty ? [[]] : chunks
+  }
+
   package static func requireUnchanged(_ original: [String], _ checked: [String]) throws {
     guard original.count == checked.count,
       zip(original, checked).allSatisfy({ Data($0.utf8) == Data($1.utf8) })

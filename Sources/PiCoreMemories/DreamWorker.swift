@@ -320,8 +320,12 @@ private final class WorkerInput: @unchecked Sendable {
   }
 
   func check(_ pieces: [String], invocationID: String) throws -> [String] {
-    try DreamSourceProtection.validate(
-      pieces, maximumBytes: DreamSourceProtection.maximumInputBytes)
+    try DreamSourceProtection.chunks(pieces).flatMap {
+      try checkChunk($0, invocationID: invocationID)
+    }
+  }
+
+  private func checkChunk(_ pieces: [String], invocationID: String) throws -> [String] {
     let id = UUID().uuidString.lowercased()
     let digest = DreamSourceProtection.digest(pieces).rawValue
     condition.lock()

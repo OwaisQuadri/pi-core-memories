@@ -800,7 +800,7 @@ public final class DreamRunStore {
     _ = try roles.sources(configuredRoots)
     var selected: SealedRun?
     var encountered: [PromptRelocationPayload.Coverage.OtherInventory] = []
-    let chain = try loadChain(capture: { sealed, _, _ in
+    let chain = try loadChain(capture: { sealed, _, _, _ in
       let inventory = try self.promptInventory(sealed, role: role, isRequiringOriginalBytes: false)
       encountered.append(.init(runID: sealed.run.runID, templateDigest: inventory.digest))
       if sealed.run.runID == baselineRunID { selected = sealed }
@@ -1194,13 +1194,31 @@ public final class DreamRunStore {
     }
     var admittedViews: [String: DreamAdmittedView] = [:]
     var retainedBatches: [PreparedSessionBatch] = []
-    let chain = try loadChain(capture: { sealed, _, _ in
+    var priorDreams = PriorDreams()
+    let chain = try loadChain(capture: { sealed, _, _, notes in
       for view in sealed.run.batch.admittedViews {
         if let prior = admittedViews[view.path] { try view.requireExtension(of: prior) }
         admittedViews[view.path] = view
       }
       retainedBatches.append(sealed.run.batch)
       if retainedBatches.count > 7 { retainedBatches.removeFirst() }
+      let viewPaths = Set(sealed.run.batch.admittedViews.map(\.path))
+      priorDreams.runViewPaths[sealed.run.inputHash.rawValue] = viewPaths
+      let sourcePaths = Dictionary(
+        sealed.context.primaryCatalogue.map { ($0.id, $0.witness.relativePath.rawValue) },
+        uniquingKeysWith: { first, _ in first })
+      priorDreams.recentNotes += notes.map { note in
+        let sessions = note.sources.map(\.citation.session)
+        let paths = Set(note.sources.compactMap { sourcePaths[$0] })
+        return DreamPriorCandidate(
+          item: DreamPriorNote(
+            generation: sealed.run.progress.generation, kind: note.kind,
+            reasonCode: note.reasonCode, explanation: note.explanation, sessions: sessions),
+          sessions: sessions, sourcePaths: paths.isEmpty ? viewPaths : paths)
+      }
+      priorDreams.recentNotes = Array(
+        priorDreams.recentNotes.suffix(DreamPriorContext.maximumNotes))
+      priorDreams.noteCount += notes.count
     })
     let progress = try chain.record.progress.domain()
     let admissions = try root.child("admissions")
@@ -1295,7 +1313,7 @@ public final class DreamRunStore {
       let date = clock()
       let context = try capture(
         run: run, admissionLimitations: batch.admissionLimitations, memory: memory, date: date,
-        retainedBatches: retainedBatches,
+        retainedBatches: retainedBatches, priorDreams: priorDreams, priorViews: admittedViews,
         excludedSessionIDs: excludedSessionIDs, protect: protect,
         remainingProtections: remainingProtections)
       let milliseconds = date.timeIntervalSince1970 * 1_000
@@ -1473,7 +1491,7 @@ public final class DreamRunStore {
     guard
       sealed.context.rejectedPredecessors.allSatisfy({
         excludedSessionIDs.isDisjoint(with: $0.sourceSessions)
-      })
+      }), excludedSessionIDs.isDisjoint(with: sealed.context.priorContext?.sessions ?? [])
     else { throw MemoryError("live session excluded from dream intake") }
     guard let protect else { return }
     try protect(DreamSourceProtection.pieces(sealed.run.batch))
@@ -1483,9 +1501,10 @@ public final class DreamRunStore {
       else { throw MemoryError("retained dream context lacks an admitted source view") }
       try protect(DreamSourceProtection.pieces(batch))
     }
-    if !sealed.context.rejectedPredecessors.isEmpty {
-      try protect(DreamSourceProtection.rejectedPredecessors(sealed.context.rejectedPredecessors))
-    }
+    let historyPieces =
+      DreamSourceProtection.rejectedPredecessors(sealed.context.rejectedPredecessors)
+      + (sealed.context.priorContext?.protectedPieces ?? [])
+    if !historyPieces.isEmpty { try protect(historyPieces) }
     try protect(
       DreamSourceProtection.authority(sealed.context.snapshot, owners: sealed.context.owners))
     try protect([sealed.request.systemPrompt] + sealed.request.messages.map(\.text))
@@ -1493,7 +1512,8 @@ public final class DreamRunStore {
 
   private func capture(
     run: FrozenDreamRun, admissionLimitations: [String], memory: MemoryStore, date: Date,
-    retainedBatches: [PreparedSessionBatch], excludedSessionIDs: Set<String>,
+    retainedBatches: [PreparedSessionBatch], priorDreams: PriorDreams,
+    priorViews: [String: DreamAdmittedView], excludedSessionIDs: Set<String>,
     protect: (([String]) throws -> Void)?, remainingProtections: (() -> Int)?
   ) throws
     -> DreamDecisionContext
@@ -1763,19 +1783,59 @@ public final class DreamRunStore {
     formatter.timeZone = TimeZone(secondsFromGMT: 0)
     formatter.dateFormat = "yyyy-MM-dd"
     if let protect { try protect(DreamSourceProtection.authority(snapshot, owners: owners)) }
+    let findings = try MemoryQueueAuthority.unapprovedFindings(
+      git: Git(repo: memoryRepository, environment: ProcessInfo.processInfo.environment),
+      repository: memoryRepository, sourceBinding: reviewSourceBinding().rawValue)
     let predecessors = try rejectedPredecessors(
+      findings.filter { $0.disposition == .rejected }.map(\.finding),
       snapshot: snapshot, evidence: catalogue, current: run.batch,
       excludedSessionIDs: excludedSessionIDs, limits: decisionLimits, limitations: &limitations)
-    if let protect, !predecessors.isEmpty {
-      try protect(DreamSourceProtection.rejectedPredecessors(predecessors))
+    let sessionsRoot = try? PreparationDirectory(url: acceptedCanonicalRoot(at: 0))
+    var verifiedPaths: [String: Bool] = [:]
+    let isPathVerified = { (path: String) -> Bool in
+      if let isVerified = verifiedPaths[path] { return isVerified }
+      var isVerified = false
+      let parts = path.split(separator: "/").map(String.init)
+      if parts.count == 2, let view = priorViews[path], let sessionsRoot,
+        let directory = try? PreparationDirectory(
+          url: sessionsRoot.url.appendingPathComponent(parts[0]), parent: sessionsRoot),
+        let digest = try? directory.prefixDigest(parts[1], byteCount: view.originalCompleteBytes)
+      {
+        isVerified = digest.rawValue == view.originalPrefixHash
+      }
+      verifiedPaths[path] = isVerified
+      return isVerified
     }
+    let priorContext = try DreamPriorContext(
+      newestNotes: priorDreams.recentNotes.reversed(),
+      olderNoteCount: priorDreams.noteCount - priorDreams.recentNotes.count,
+      newestFindings: findings.reversed().map { entry in
+        let sources = entry.finding.evidence + entry.finding.contradictions.compactMap(\.evidence)
+        let sessions = sources.map(\.session)
+        let paths = Set(sources.map(\.relativePath))
+        return DreamPriorCandidate(
+          item: DreamOpenFinding(
+            revision: entry.finding.revision, status: entry.disposition.rawValue,
+            path: entry.finding.path,
+            claim: String(decoding: entry.finding.proposed, as: UTF8.self),
+            reason: entry.finding.reason, sessions: sessions),
+          sessions: sessions,
+          sourcePaths: paths.isEmpty
+            ? priorDreams.runViewPaths[entry.finding.inputDigest] ?? [] : paths)
+      }, excludedSessionIDs: excludedSessionIDs,
+      isVerified: { $0.allSatisfy(isPathVerified) })
+    let historyPieces =
+      DreamSourceProtection.rejectedPredecessors(predecessors)
+      + (priorContext?.protectedPieces ?? [])
+    if let protect, !historyPieces.isEmpty { try protect(historyPieces) }
     let context = try DreamDecisionContext(
       run: run, snapshot: snapshot, scopes: scopes, owners: owners,
       addedDate: formatter.string(from: date), limits: decisionLimits,
       limitations: limitations.reduce(into: [String]()) { values, value in
         if !values.contains(value) { values.append(value) }
       }, deviceKey: deviceKey, projectBindings: projectBindings,
-      relatedBatches: relatedBatches, rejectedPredecessors: predecessors)
+      relatedBatches: relatedBatches, rejectedPredecessors: predecessors,
+      priorContext: priorContext)
     guard context.canonicalBytes.count <= limits.maximumFrozenBytes else {
       throw DreamRunError.limitExceeded
     }
@@ -1836,13 +1896,10 @@ public final class DreamRunStore {
   }
 
   private func rejectedPredecessors(
-    snapshot: ApprovedDecisionSnapshot, evidence: [PrimaryTextEvidence],
-    current: PreparedSessionBatch,
+    _ findings: [MemoryQueueFinding], snapshot: ApprovedDecisionSnapshot,
+    evidence: [PrimaryTextEvidence], current: PreparedSessionBatch,
     excludedSessionIDs: Set<String>, limits: DreamDecisionLimits, limitations: inout [String]
   ) throws -> [DreamRejectedPredecessor] {
-    let findings = try MemoryQueueAuthority.rejectedFindings(
-      git: Git(repo: memoryRepository, environment: ProcessInfo.processInfo.environment),
-      repository: memoryRepository, sourceBinding: reviewSourceBinding().rawValue)
     let paths = Set(snapshot.documents.map(\.path))
     let sessions = Set(evidence.map { $0.id.citation.session })
     let projects = Set(evidence.compactMap(\.projectScope))
@@ -1908,6 +1965,12 @@ public final class DreamRunStore {
     return catalogue
   }
 
+  private struct PriorDreams {
+    var recentNotes: [DreamPriorCandidate<DreamPriorNote>] = []
+    var noteCount = 0
+    var runViewPaths: [String: Set<String>] = [:]
+  }
+
   private struct OwnerRecordKey: Hashable {
     let path: SourceRelativePath
     let range: Range<UInt64>
@@ -1970,7 +2033,9 @@ public final class DreamRunStore {
 
   private func loadChain(
     completed: ((VerifiedDreamReviewCandidates) throws -> Void)? = nil,
-    capture: ((SealedRun, DreamRunEncoding.Generation, SourceDigest) throws -> Void)? = nil
+    capture: (
+      (SealedRun, DreamRunEncoding.Generation, SourceDigest, [DreamDecisionNote]) throws -> Void
+    )? = nil
   ) throws -> SuccessfulChain {
     let generations = try root.child("generations")
     let installed = Set(try generations.names().filter { !$0.hasPrefix(".pending-") })
@@ -2025,7 +2090,7 @@ public final class DreamRunStore {
           SourceDigest(bytes: completionBytes).rawValue == completionHash,
           progress == (try completion.progress.domain())
         else { throw DreamRunError.corruption }
-        try capture?(sealed, record, SourceDigest(bytes: bytes))
+        try capture?(sealed, record, SourceDigest(bytes: bytes), outcome.notes)
         if let completed {
           let memory = try MemoryStore(repo: memoryRepository)
           let reports = try zip(outcome.plans, receipts).map { plan, receipt in

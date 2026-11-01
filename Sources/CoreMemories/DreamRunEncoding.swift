@@ -995,6 +995,7 @@ extension DreamRunEncoding {
   private struct ContextPayload: Decodable {
     let relatedBatches: [Data]?
     let rejectedPredecessors: [DreamRejectedPredecessor]?
+    let priorDreams: DreamPriorContext?
     let deviceKey: String?
     let projectBindings: [String: String]?
     let schemaVersion: Int
@@ -1160,7 +1161,8 @@ extension DreamRunEncoding {
         limits: limits, limitations: payload.limitations, deviceKey: payload.deviceKey,
         projectBindings: payload.projectBindings ?? [:],
         relatedBatches: try (payload.relatedBatches ?? []).map { try retainedBatch(bytes: $0) },
-        rejectedPredecessors: payload.rejectedPredecessors ?? [])
+        rejectedPredecessors: payload.rejectedPredecessors ?? [],
+        priorContext: payload.priorDreams)
       guard context.canonicalBytes == bytes else { throw DreamRunError.corruption }
       return context
     } catch let error as DreamRunError { throw error } catch { throw DreamRunError.corruption }

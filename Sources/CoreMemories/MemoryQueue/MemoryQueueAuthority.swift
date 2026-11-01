@@ -54,8 +54,8 @@ enum MemoryQueueAuthority {
     } ?? []
   }
 
-  static func rejectedFindings(git: Git, repository: URL, sourceBinding: String) throws
-    -> [MemoryQueueFinding]
+  static func unapprovedFindings(git: Git, repository: URL, sourceBinding: String) throws
+    -> [(finding: MemoryQueueFinding, disposition: MemoryReviewDisposition)]
   {
     try withBoundReview(git: git, repository: repository, sourceBinding: sourceBinding) {
       reviewRoot, queue, review in
@@ -69,19 +69,22 @@ enum MemoryQueueAuthority {
         Set(ledger.findings.map(\.revision)).count == ledger.findings.count,
         ledger.findings.allSatisfy({ $0.revision == $0.candidateID })
       else { throw MemoryError("queue binding conflict") }
-      return try ledger.findings.filter { finding in
-        let name = "rejected-\(finding.revision).json"
+      return try ledger.findings.compactMap { finding in
         guard MemoryDocument.isMatch(#"\A[0-9a-f]{64}\z"#, finding.revision) else {
           throw DreamRunError.corruption
         }
-        guard try reviewRoot.isPresent(name) else { return false }
-        let selection = try MemoryReviewEncoding.decode(
-          ReviewSelection.self,
-          bytes: reviewRoot.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
-        guard selection.candidateID == finding.revision, selection.disposition == .rejected else {
-          throw DreamRunError.corruption
+        guard !(try reviewRoot.isPresent("outcome-\(finding.revision).json")) else { return nil }
+        for disposition in [MemoryReviewDisposition.rejected, .deferred] {
+          let name = "\(disposition.rawValue)-\(finding.revision).json"
+          guard try reviewRoot.isPresent(name) else { continue }
+          let selection = try MemoryReviewEncoding.decode(
+            ReviewSelection.self,
+            bytes: reviewRoot.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
+          guard selection.candidateID == finding.revision, selection.disposition == disposition
+          else { throw DreamRunError.corruption }
+          return (finding, disposition)
         }
-        return true
+        return (finding, .pending)
       }
     } ?? []
   }

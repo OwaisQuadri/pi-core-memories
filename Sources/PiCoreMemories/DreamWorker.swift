@@ -605,6 +605,38 @@ private enum WorkerOutput {
   }
 }
 
+func dreamWorkerFailureName(_ error: any Error) -> String {
+  let typeName = String(describing: type(of: error))
+  if let error = error as? DreamRunError {
+    let caseName =
+      switch error {
+      case .busy: "busy"
+      case .unsafeState: "unsafeState"
+      case .unsupportedSchema: "unsupportedSchema"
+      case .corruption: "corruption"
+      case .missingPayload: "missingPayload"
+      case .staleGeneration: "staleGeneration"
+      case .limitExceeded: "limitExceeded"
+      case .persistenceFailure: "persistenceFailure"
+      case .invalidSelection: "invalidSelection"
+      case .invalidBase: "invalidBase"
+      case .invalidResponse: "invalidResponse"
+      case .replacementUnavailable: "replacementUnavailable"
+      case .nativeReviewLimitation: "nativeReviewLimitation"
+      }
+    return typeName + "." + caseName
+  }
+  guard !(error is CustomReflectable) else { return typeName }
+  let mirror = Mirror(reflecting: error)
+  guard mirror.displayStyle == .enum else { return typeName }
+  if let caseName = mirror.children.first?.label { return typeName + "." + caseName }
+  let errorType = type(of: error)
+  guard !(errorType is CustomStringConvertible.Type),
+    !(errorType is CustomDebugStringConvertible.Type), !(errorType is TextOutputStreamable.Type)
+  else { return typeName }
+  return typeName + "." + String(describing: error)
+}
+
 func executeDreamWorker(arguments: [String]) -> Int32 {
   signal(SIGPIPE, SIG_IGN)
   let input = WorkerInput()
@@ -701,21 +733,25 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
   } catch {
     if let invocationID, !isFinalAttempted {
       do {
+        let reason =
+          input.isProtocolFailure
+          ? "protocolFailure"
+          : ((error as? WorkerError) == .cancelled
+            ? "cancelled"
+            : (error as? DreamSourceProtectionError).map {
+              "sourceProtection:" + String(describing: $0)
+            } ?? "workerFailure")
+        let isBusy = (error as? DreamRunError) == .busy
         try WorkerOutput.final(
-          invocationID, nil,
-          reason: input.isProtocolFailure
-            ? "protocolFailure"
-            : ((error as? WorkerError) == .cancelled
-              ? "cancelled"
-              : (error as? DreamSourceProtectionError).map {
-                "sourceProtection:" + String(describing: $0)
-              } ?? "workerFailure"),
+          invocationID, nil, reason: reason,
           detail: [
             "no snippet bodies in --snippets", "no prompt templates in --prompts",
             "unsafe dream state",
           ].contains(
-            String(describing: error)) ? String(describing: error) : nil,
-          isBusy: (error as? DreamRunError) == .busy)
+            String(describing: error))
+            ? String(describing: error)
+            : (reason == "workerFailure" && !isBusy ? dreamWorkerFailureName(error) : nil),
+          isBusy: isBusy)
         return 0
       } catch {}
     }

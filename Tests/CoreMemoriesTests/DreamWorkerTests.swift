@@ -3,6 +3,7 @@ import Foundation
 import Testing
 
 @testable import CoreMemories
+@testable import PiCoreMemories
 
 final class DreamWorkerProcess {
   let process = Process()
@@ -305,4 +306,38 @@ func dreamWorkerCompletesOneGenerationAndRepeatMakesNoRequest(isProposal: Bool) 
   #expect(final["status"] as? String == "completed")
   #expect(final["generation"] as? String == "1")
   try recovery.finish()
+}
+
+private enum PrivateMirrorError: Error, CustomReflectable {
+  case failure(String)
+
+  var customMirror: Mirror {
+    Mirror(self, children: ["private-folder-name": "private-folder-name"], displayStyle: .enum)
+  }
+}
+
+@Test func dreamWorkerFailureDetailNamesErrorWithoutAssociatedValues() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let privateName = "private-folder-name"
+  try FileManager.default.createSymbolicLink(
+    at: fixture.sessions.appendingPathComponent(privateName), withDestinationURL: fixture.root)
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  try worker.send(workerStart(fixture))
+  let final = try worker.frame()
+  #expect(final["status"] as? String == "blocked")
+  #expect(final["reason"] as? String == "workerFailure")
+  #expect(final["detail"] as? String == "MemoryError")
+  try worker.finish()
+  #expect(dreamWorkerFailureName(DreamRunError.corruption) == "DreamRunError.corruption")
+  #expect(
+    dreamWorkerFailureName(DreamRunError.nativeReviewLimitation(privateName))
+      == "DreamRunError.nativeReviewLimitation")
+  #expect(
+    dreamWorkerFailureName(DreamDecisionError.context(fixture.root.path))
+      == "DreamDecisionError.context")
+  #expect(dreamWorkerFailureName(DreamDecisionError.schema) == "DreamDecisionError.schema")
+  #expect(dreamWorkerFailureName(PrivateMirrorError.failure(privateName)) == "PrivateMirrorError")
 }

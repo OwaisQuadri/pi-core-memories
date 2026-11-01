@@ -455,68 +455,16 @@ export async function callDreamModel(request: DreamRequest, ctx: Pick<ExtensionC
 			: "";
 		return modelFailure((causes[reason] ?? "unknown stop reason") + diagnostic);
 	}
-	if (signal.aborted) throw new Error("Dream call cancelled.");
 	if (!isSameSelection(request.selection, selection) || model.provider !== selection.provider || model.id !== selection.modelID) modelFailure("model selection does not match the request");
 	if (model.api === "pi-virtual" || !ctx.modelRegistry.isUsingOAuth(model) || ctx.modelRegistry.getProvider(model.provider)?.auth.oauth?.isSubscription !== true) modelFailure("the selected model is not using a subscription sign-in; nothing was dispatched");
 	const context: Context = { systemPrompt: request.systemPrompt, messages: request.messages.map((message) => ({ role: message.role, content: message.text, timestamp: message.timestampMilliseconds })) };
 	const reasoning = selection.thinkingLevel === "off" ? undefined : selection.thinkingLevel as "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-	const controller = new AbortController();
-	const abort = () => controller.abort();
-	signal.addEventListener("abort", abort, { once: true });
-	let rejectAbort!: (reason: Error) => void;
-	const cancelled = new Promise<never>((_done, fail) => { rejectAbort = fail; });
-	controller.signal.addEventListener("abort", () => rejectAbort(new Error("Dream call cancelled.")), { once: true });
-	void cancelled.catch(() => {});
-	try {
-	const stream = ctx.modelRegistry.streamSimple(model, context, { signal: controller.signal, reasoning });
-	let terminal: AssistantMessage | undefined;
-	let isDone = false;
-	const iterator = stream[Symbol.asyncIterator]();
-	while (true) {
-		const next = await Promise.race([iterator.next(), cancelled]);
-		if (next.done) break;
-		const event = next.value;
-		if (signal.aborted) throw new Error("Dream call cancelled.");
-		if (isDone) modelFailure("stream continued after its terminal event");
-		if (event.type.startsWith("toolcall")) modelFailure("unexpected tool call");
-		if (event.type === "error") incompleteResponse(event.reason, event.error.errorMessage);
-		if ("partial" in event) {
-			let bytes = 0;
-			for (const part of event.partial.content) {
-				if (part.type === "thinking") continue;
-				if (part.type !== "text") modelFailure("unexpected non-text response content");
-				bytes += Buffer.byteLength(part.text);
-				if (bytes > maximumTextBytes) modelFailure(`response exceeded the ${maximumTextBytes}-byte text limit`);
-			}
-		}
-		if (event.type === "done") {
-			if (event.reason !== "stop") incompleteResponse(event.reason);
-			terminal = event.message; isDone = true;
-		}
-	}
-	if (signal.aborted) throw new Error("Dream call cancelled.");
-	if (!isDone || !terminal) modelFailure("stream ended without a terminal response");
-	const result = await Promise.race([stream.result(), cancelled]);
-	function completed(message: AssistantMessage): string {
-		if (message.stopReason !== "stop") incompleteResponse(message.stopReason, message.errorMessage);
-		let bytes = 0;
-		const blocks: string[] = [];
-		for (const part of message.content) {
-			if (part.type === "thinking") continue;
-			if (part.type !== "text") modelFailure("unexpected non-text response content");
-			if (!isWellFormedText(part.text)) modelFailure("response text contains invalid Unicode");
-			bytes += Buffer.byteLength(part.text);
-			if (bytes > maximumTextBytes) modelFailure(`response exceeded the ${maximumTextBytes}-byte text limit`);
-			blocks.push(part.text);
-		}
-		if (!bytes) modelFailure("response contained no text");
-		return blocks.join("");
-	}
-	const resultText = completed(result);
-	if (completed(terminal) !== resultText) modelFailure("terminal and final response text do not match");
-	if (signal.aborted) throw new Error("Dream call cancelled.");
-	return resultText;
-	} finally { signal.removeEventListener("abort", abort); controller.abort(); }
+	const message = await ctx.modelRegistry.streamSimple(model, context, { signal, reasoning }).result();
+	if (message.stopReason !== "stop") incompleteResponse(message.stopReason, message.errorMessage);
+	const reply = message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("");
+	if (!reply) modelFailure("response contained no text");
+	if (Buffer.byteLength(reply) > maximumTextBytes) modelFailure(`response exceeded the ${maximumTextBytes}-byte text limit`);
+	return reply;
 }
 
 function absolutePath(value: unknown): string {

@@ -9,78 +9,19 @@ package enum DreamSourceProtection {
   package static let maximumPieceBytes = 1_048_576
   package static let maximumInputBytes = 4_194_304
   package static let maximumOutputBytes = 8_388_608
-  static let maximumSplitRecordBytes = 2 * maximumPieceBytes
   static let maximumContextBytes = maximumPieceBytes
-  static let splitBoundaryBytes = 4_096
-
-  struct SplitText {
-    let parts: [String]
-    let boundaries: [String]
-
-    var pieces: [String] { parts + boundaries }
-  }
-
-  static func split(_ text: String) -> SplitText {
-    let bytes = Array(text.utf8)
-    guard bytes.count > maximumPieceBytes else { return SplitText(parts: [text], boundaries: []) }
-    func aligned(_ offset: Int, isForward: Bool) -> Int {
-      var offset = offset
-      while offset > 0, offset < bytes.count, bytes[offset] & 0xC0 == 0x80 {
-        offset += isForward ? 1 : -1
-      }
-      return offset
-    }
-    let count = (bytes.count + maximumPieceBytes - 5) / (maximumPieceBytes - 4)
-    let cuts = (1..<count).map { aligned(bytes.count * $0 / count, isForward: true) }
-    let edges = [0] + cuts + [bytes.count]
-    let windows = cuts.map {
-      aligned(max(0, $0 - splitBoundaryBytes), isForward: false)..<aligned(
-        min(bytes.count, $0 + splitBoundaryBytes), isForward: true)
-    }
-    return SplitText(
-      parts: zip(edges, edges.dropFirst()).map {
-        String(decoding: bytes[$0..<$1], as: UTF8.self)
-      },
-      boundaries: windows.map { String(decoding: bytes[$0], as: UTF8.self) })
-  }
-
-  static func isJoinChecked(left: String, right: String, boundary: String) -> Bool {
-    let left = Array(left.utf8)
-    let right = Array(right.utf8)
-    let boundary = Array(boundary.utf8)
-    return (0...boundary.count).contains { split in
-      split <= left.count && boundary.count - split <= right.count
-        && left.suffix(split).elementsEqual(boundary.prefix(split))
-        && right.prefix(boundary.count - split).elementsEqual(boundary.suffix(
-          boundary.count - split))
-    }
-  }
 
   static func checkedRecords(
     _ records: [(bytes: Data, stub: Data)], admit: ([String]) throws -> [String]
   ) throws -> [(bytes: Data, isStub: Bool)] {
-    let requests = try records.map { record in
-      let split = split(try text(record.bytes))
-      return (split: split, stub: split.boundaries.isEmpty ? [] : [try text(record.stub)])
+    let requests = records.map { record in
+      (bytes: record.bytes.count > maximumPieceBytes ? record.stub : record.bytes,
+        isStub: record.bytes.count > maximumPieceBytes)
     }
-    let pending = requests.flatMap { $0.split.pieces + $0.stub }
+    let pending = try requests.map { try text($0.bytes) }
     let checked = pending.isEmpty ? [] : try admit(pending)
     guard checked.count == pending.count else { throw DreamSourceProtectionError.invalidReply }
-    var offset = 0
-    func take(_ count: Int) -> ArraySlice<String> {
-      defer { offset += count }
-      return checked[offset..<offset + count]
-    }
-    return requests.map { request in
-      let parts = Array(take(request.split.parts.count))
-      let boundaries = Array(take(request.split.boundaries.count))
-      let stub = take(request.stub.count)
-      let isJoined = boundaries.indices.allSatisfy {
-        isJoinChecked(left: parts[$0], right: parts[$0 + 1], boundary: boundaries[$0])
-      }
-      guard !isJoined, let stub = stub.first else { return (Data(parts.joined().utf8), false) }
-      return (Data(stub.utf8), true)
-    }
+    return zip(checked, requests).map { (Data($0.0.utf8), $0.1.isStub) }
   }
 
   package static func digest(_ pieces: [String]) -> SourceDigest {
@@ -164,9 +105,10 @@ package enum DreamSourceProtection {
   }
 
   static func pieces(_ view: DreamAdmittedView) throws -> [String] {
-    try view.records.flatMap {
-      split(try text(view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd))))
-        .pieces
+    try view.records.map {
+      let bytes = view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd))
+      guard bytes.count <= maximumPieceBytes else { throw DreamSourceProtectionError.limitExceeded }
+      return try text(bytes)
     }
   }
 

@@ -1326,16 +1326,11 @@ private struct AdmissionCandidate {
 
 private struct AdmissionCounts {
   var imageRecords = 0
-  var partRecords = 0
   var oversizedRecords = 0
-  var splitRedactedRecords = 0
 
   mutating func add(_ candidate: AdmissionCandidate, isStub: Bool) {
     if candidate.isImageRemoved && !isStub { imageRecords += 1 }
     if candidate.isOversized { oversizedRecords += 1 }
-    if candidate.bytes.count > DreamSourceProtection.maximumPieceBytes {
-      if isStub { splitRedactedRecords += 1 } else { partRecords += 1 }
-    }
   }
 
   var limitations: [String] {
@@ -1345,19 +1340,9 @@ private struct AdmissionCounts {
         "Image data was removed from \(imageRecords) source records before source checks; their text was kept."
       )
     }
-    if partRecords > 0 {
-      limitations.append(
-        "\(partRecords) source records larger than \(DreamSourceProtection.maximumPieceBytes) bytes were checked in parts."
-      )
-    }
     if oversizedRecords > 0 {
       limitations.append(
-        "\(oversizedRecords) source records larger than \(DreamSourceProtection.maximumSplitRecordBytes) bytes were omitted; only their identity was kept."
-      )
-    }
-    if splitRedactedRecords > 0 {
-      limitations.append(
-        "\(splitRedactedRecords) source records had a redaction at a split point and were omitted; only their identity was kept."
+        "\(oversizedRecords) source records larger than \(DreamSourceProtection.maximumPieceBytes) bytes were omitted; only their identity was kept."
       )
     }
     return limitations
@@ -1375,7 +1360,7 @@ extension CapturedSession {
         bytes: stub, stub: stub, isOmitted: true, isImageRemoved: false, isOversized: false)
     }
     let stripped = try DreamAdmittedView.withoutImageData(record.bytes, object: record.object)
-    guard stripped.count <= DreamSourceProtection.maximumSplitRecordBytes else {
+    guard stripped.count <= DreamSourceProtection.maximumPieceBytes else {
       return AdmissionCandidate(
         bytes: stub, stub: stub, isOmitted: true, isImageRemoved: false, isOversized: true)
     }

@@ -384,7 +384,7 @@ private func admittedWindows(
   #expect(isUserWindowChecked)
 }
 
-@Test func admittedWindowsCheckLargeRecordsInPartsAndOmitOnlyRecordsOverTheSplitLimit() throws {
+@Test func admittedWindowsOmitRecordsOverTheWholeCheckLimit() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   try fixture.populate(texts: ["Use green buttons."])
@@ -429,25 +429,22 @@ private func admittedWindows(
     relations.first {
       $0.record.originalEnd - $0.record.originalStart == UInt64(parted.utf8.count)
     })
-  #expect(!joined.record.isOmitted)
-  #expect(
-    joined.piece
-      == Data(parted.replacingOccurrences(of: "SYNTHETIC_SECRET", with: "[x]").utf8))
+  #expect(joined.record.isOmitted)
+  #expect(joined.piece == (try DreamAdmittedView.omitted(Data(parted.utf8))))
   #expect(
     relations.contains {
       $0.record.isOmitted
         && $0.record.originalEnd - $0.record.originalStart
-          > UInt64(DreamSourceProtection.maximumSplitRecordBytes)
+          > UInt64(DreamSourceProtection.maximumPieceBytes)
     })
   #expect(
     limitations == [
-      "1 source records larger than 1048576 bytes were checked in parts.",
-      "1 source records larger than 2097152 bytes were omitted; only their identity was kept.",
+      "2 source records larger than 1048576 bytes were omitted; only their identity was kept."
     ])
   #expect(evidence.contains("Prefer dark mode."))
 }
 
-@Test func admittedWindowsOmitARecordWhoseSecretCrossesASplitPoint() throws {
+@Test func admittedWindowsNeverAdmitAnOversizedSecretFragment() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   try fixture.populate(texts: ["Use green buttons."])
@@ -481,11 +478,38 @@ private func admittedWindows(
   #expect(isOmitted)
   #expect(
     limitations == [
-      "1 source records had a redaction at a split point and were omitted; only their identity was kept."
+      "1 source records larger than 1048576 bytes were omitted; only their identity was kept."
     ])
 }
 
-@Test func admittedWindowsDropUnchangedViewsThatNoLongerFitTheSourceCheck() throws {
+@Test func admittedWorkerNeverFreezesAnOversizedCrossingSecretOrUncheckedText() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: ["Use green buttons."])
+  let secret = "LONG_SECRET_" + String(repeating: "s", count: 10_000)
+  let thinking = String(repeating: "x", count: 745_000) + secret
+    + String(repeating: "x", count: 745_000)
+  try fixture.append(try assistantThinking("a1", thinking))
+  try fixture.append(dreamUser("u2", nil, dreamOld, "Prefer dark mode.") + "\n")
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  worker.protectionTransform = { $0.map { $0.replacingOccurrences(of: secret, with: "[x]") } }
+  try worker.send(workerStart(fixture))
+  let request = try worker.frame()
+  try #require(request["type"] as? String == "modelRequest")
+  let frozen = try fixture.snapshot(fixture.state.appendingPathComponent("runs"))
+  let input = try #require(frozen.first { $0.key.hasSuffix("input.json") }?.value.bytes)
+  let text = String(decoding: input, as: UTF8.self)
+  #expect(text.contains("Prefer dark mode."))
+  #expect(!text.contains(secret))
+  #expect(!text.contains(String(repeating: "x", count: 128)))
+  #expect(!String(describing: request).contains(secret))
+  try worker.send(workerReply(request, category: "cancelled"))
+  #expect(try worker.frame()["status"] as? String == "pending")
+  try worker.finish()
+}
+
+@Test func admittedWindowsKeepBothViewsWhenOversizedRecordsAreOmitted() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   let folder = fixture.source.deletingLastPathComponent()
@@ -537,6 +561,6 @@ private func admittedWindows(
     progress = try DreamProgress(
       generation: progress.generation + 1, positions: batch.positionsAfter)
   }
-  #expect(isDropSeen)
+  #expect(!isDropSeen)
   #expect(Set(evidence).isSuperset(of: ["Prefer one mode.", "Prefer two mode."]))
 }

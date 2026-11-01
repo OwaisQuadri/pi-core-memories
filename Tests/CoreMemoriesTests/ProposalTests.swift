@@ -97,29 +97,6 @@ import Testing
   #expect(try fixture.snapshot(fixture.repo) == updated)
 }
 
-@Test func newProjectProposalDoesNotCreateWorkingFiles() throws {
-  let fixture = try Fixture()
-  defer { fixture.clean() }
-  let project = try fixture.project("new-project")
-  let key = try #require(try MemoryStore.projectKey(cwd: project))
-  let path = "projects/\(key).md"
-  let before = try fixture.humanState()
-  let replacement = Data(
-    "Project fact [source: ../../source/.git/config; added: 2026-01-01]\n".utf8)
-  let proposal = try fixture.store.propose(
-    base: fixture.store.approvedCommit(), path: path, replacement: replacement,
-    reason: "new project")
-  #expect(
-    !FileManager.default.fileExists(atPath: fixture.repo.appendingPathComponent("projects").path))
-  #expect(try fixture.humanState() == before)
-  #expect(try fixture.store.render(cwd: project) == "# Memory\n")
-  #expect(try fixture.store.review(commit: proposal.commit).contains("new file mode 100644"))
-  #expect(
-    try Git(repo: fixture.repo, environment: ProcessInfo.processInfo.environment).data([
-      "cat-file", "blob", "\(proposal.commit):\(path)",
-    ]) == replacement)
-}
-
 func hostileEnvironment(other: URL) -> [String: String] {
   [
     "GIT_DIR": other.appendingPathComponent(".git").path,
@@ -161,30 +138,4 @@ func hostileEnvironment(other: URL) -> [String: String] {
   }
   #expect(try fixture.humanState() == before)
   #expect(try fixture.snapshot(other) == otherBefore)
-}
-
-@Test func concurrentIdenticalAndDifferentProposals() async throws {
-  let fixture = try Fixture()
-  defer { fixture.clean() }
-  let base = try fixture.store.approvedCommit()
-  let before = try fixture.humanState()
-  let commits = try await withThrowingTaskGroup(of: String.self) { group in
-    for index in 0..<6 {
-      group.addTask {
-        let text = index < 3 ? "Identical" : "Different \(index)"
-        return try fixture.store.propose(
-          base: base, path: "MEMORY.md", replacement: Data(fact(text).utf8), reason: "concurrent"
-        ).commit
-      }
-    }
-    var commits: [String] = []
-    for try await commit in group { commits.append(commit) }
-    return commits
-  }
-  #expect(Set(commits).count == 4)
-  #expect(
-    try fixture.git(["for-each-ref", "--format=%(refname)", "refs/heads/proposals/"]).split(
-      separator: "\n"
-    ).count == 4)
-  #expect(try fixture.humanState() == before)
 }

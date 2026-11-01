@@ -76,6 +76,81 @@ async function until(condition: () => boolean | Promise<boolean>, failure: strin
 }
 const archivedRequest = (start: DreamStart, session = "archived"): DreamRequest => ({ version: 1, type: "modelRequest", invocationID: start.invocationID, requestID: "request", runID: "run", generation: "1", inputHash: "a".repeat(64), contextHash: "b".repeat(64), requestHash: "c".repeat(64), selection: start.selection, systemPrompt: "Synthetic status test", messages: [{ role: "user", text: JSON.stringify({ primaryEvidence: [{ source: { session, entry: "entry", part: 0 } }] }), timestampMilliseconds: 0 }] });
 
+test("manual dream recovery binds the selected model and archived run before one model call", async () => {
+	const runID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+	const requestHash = "a".repeat(64);
+	const selection = { provider: "openai-codex", modelID: "selected", thinkingLevel: "high" };
+	let runs = 0;
+	let calls = 0;
+	const f = runtime(async (start, call, signal) => {
+		runs++;
+		assert.equal(start.resume, "replaceInvalidResponse");
+		assert.deepEqual(start.recoveryTarget, { runID, requestHash });
+		assert.deepEqual(start.excludedSessionIDs, ["another-live-session", "session"]);
+		const request = { ...archivedRequest(start), runID, requestID: `${runID}:${"b".repeat(64)}`, requestHash: "b".repeat(64) };
+		await call(request, signal);
+		return { version: 1, type: "final", invocationID: start.invocationID, status: "completed", generation: "1", runID, base: "c".repeat(40), proposals: [], notes: [], isBacklog: false, isRecovered: true, reason: null, detail: null, unfinishedTails: 0 };
+	}, "tui", undefined, { idleMilliseconds: 60_000, call: async () => { calls++; return "{}"; } });
+	try {
+		await f.emit("session_start");
+		const tool = f.tools.get("memory_dream_recover"); assert.ok(tool);
+		await assert.rejects(tool.execute("wrong-model", { operation: "present", runID, requestHash, selection: { ...selection, modelID: "different" } }, undefined, undefined, f.ctx), /selected model changed/i);
+		assert.equal(runs, 0);
+		const shown = await tool.execute("exact-target", { operation: "present", runID, requestHash, selection }, undefined, undefined, f.ctx);
+		assert.match(JSON.stringify(shown.details), /proposal-queued/);
+		assert.match(String(f.messages.at(-1)?.content), /Reply yes in the next ordinary message/);
+		assert.equal(runs, 0); assert.equal(calls, 0);
+		const early = await tool.execute("early", { operation: "reply" }, undefined, undefined, f.ctx);
+		assert.match(JSON.stringify(early.details), /no-live-conversation-reply/);
+		assert.equal(runs, 0);
+		await f.emit("input", { text: "yes", source: "interactive" });
+		await f.emit("before_agent_start", { messageType: "user", prompt: "yes" });
+		const message = { role: "user", content: "yes", timestamp: 1 };
+		await f.emit("message_start", { message });
+		f.entries.push({ type: "message", id: "recovery-user", message });
+		const result = await tool.execute("later-original-reply", { operation: "reply" }, undefined, undefined, f.ctx);
+		assert.match(JSON.stringify(result.details), /"status":"completed"/);
+		assert.equal(runs, 1); assert.equal(calls, 1);
+		const replay = await tool.execute("replay", { operation: "reply" }, undefined, undefined, f.ctx);
+		assert.match(JSON.stringify(replay.details), /no-live-recovery-proposal/);
+		assert.equal(calls, 1);
+	} finally { await f.stop(); }
+});
+
+test("dream recovery cannot use deferred, transformed, or abandoned replies", async () => {
+	const runID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+	const requestHash = "a".repeat(64);
+	const selection = { provider: "openai-codex", modelID: "selected", thinkingLevel: "high" };
+	const f = runtime(async () => assert.fail("Recovery must not start without a later original reply."), "tui", undefined, { idleMilliseconds: 60_000 });
+	try {
+		await f.emit("session_start");
+		const tool = f.tools.get("memory_dream_recover"); assert.ok(tool);
+		const present = () => tool.execute("present", { operation: "present", runID, requestHash, selection }, undefined, undefined, f.ctx);
+		const reply = () => tool.execute("reply", { operation: "reply" }, undefined, undefined, f.ctx);
+		f.deferDelivery(); await present();
+		await f.emit("input", { text: "yes", source: "interactive" });
+		f.deliver();
+		assert.match(JSON.stringify((await reply()).details), /no-live-conversation-reply/);
+		await f.emit("input", { text: "yes", source: "rpc" });
+		assert.match(JSON.stringify((await reply()).details), /no-live-conversation-reply/);
+		await f.emit("input", { text: "yes", source: "interactive", streamingBehavior: "followUp" });
+		assert.match(JSON.stringify((await reply()).details), /no-live-conversation-reply/);
+		await f.emit("input", { text: "yes", source: "interactive" });
+		await f.emit("before_agent_start", { messageType: "user", prompt: "transformed" });
+		assert.match(JSON.stringify((await reply()).details), /no-live-conversation-reply/);
+		await f.emit("input", { text: "no", source: "interactive" });
+		await f.emit("before_agent_start", { messageType: "user", prompt: "no" });
+		const message = { role: "user", content: "no", timestamp: 2 };
+		await f.emit("message_start", { message });
+		f.entries.push({ type: "message", id: "no-recovery-user", message });
+		assert.match(JSON.stringify((await reply()).details), /not-started/);
+		assert.match(JSON.stringify((await reply()).details), /no-live-recovery-proposal/);
+		await present();
+		await f.emit("session_before_tree");
+		assert.match(JSON.stringify((await reply()).details), /no-live-recovery-proposal/);
+	} finally { await f.stop(); }
+});
+
 test("dreaming keeps running while this window works and reports the blocked reason without details", async () => {
 	let enter!: () => void; const entered = new Promise<void>((resolve) => { enter = resolve; });
 	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });

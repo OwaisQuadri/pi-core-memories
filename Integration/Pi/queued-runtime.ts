@@ -36,6 +36,16 @@ export function assertArchivedRequest(request: DreamRequest, sessionID: string |
 	}
 }
 
+type PresentedState = {
+	proposalId: string;
+	presentedForRequest: string;
+	preview: { details: string };
+};
+type DreamRecoveryState = PresentedState & {
+	runID: string;
+	requestHash: string;
+	selection: DreamSelection;
+};
 type MemoryConversationState = {
 	client: QueueConnection;
 	controller: AbortController;
@@ -92,6 +102,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	let interruptedCallSelection: DreamSelection | undefined;
 	let generation = 0;
 	let conversation: MemoryConversationState | undefined;
+	let recovery: DreamRecoveryState | undefined;
 	let observedReply: MemoryReplyInput | undefined;
 	let conversationClose = Promise.resolve();
 	const answeredRevisions = new Set<string>();
@@ -106,6 +117,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		if (previous) { previous.controller.abort(); conversationClose = previous.client.close(); }
 		return conversationClose;
 	}
+	function closeRecovery(): void { recovery = undefined; observedReply = undefined; }
 	function reportDreamStatus(value: string | undefined): void {
 		if (value !== undefined && !isAlive) return;
 		dreamStatus = value;
@@ -147,7 +159,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			} catch {}
 		})().finally(() => { marking = undefined; if (generation === epoch) schedule(); });
 	}
-	function invalidateConversation(): void { foreground?.abort(); generation++; void closeConversation(); }
+	function invalidateConversation(): void { foreground?.abort(); generation++; closeRecovery(); void closeConversation(); }
 	function abortReminderRead(): void { reminderAbort.abort(); reminderAbort = new AbortController(); }
 	function invalidate(): void { invalidateConversation(); stopBackground(); interruptedCallSelection = undefined; abortReminderRead(); readyReminder = undefined; }
 	async function leaveSession(): Promise<void> {
@@ -157,7 +169,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	}
 	function schedule(): void {
 		const isMarkerMissing = !marker && !!context?.sessionManager.getSessionFile();
-		const isBlocked = !isAlive || !context || isMarkerMissing || !!foreground || !!conversation || failures >= 3;
+		const isBlocked = !isAlive || !context || isMarkerMissing || !!foreground || !!conversation || !!recovery || failures >= 3;
 		if (isBlocked) { clearTimeout(timer); timer = undefined; }
 		if (!isAlive || !context) return;
 		if (isMarkerMissing) { reportDreamStatus(markerError); retryMark(); return; }
@@ -248,7 +260,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		})();
 		await backgroundCompletion;
 	}
-	function conversationEntry(state: MemoryConversationState, ctx: ExtensionContext): SessionEntry | undefined {
+	function conversationEntry(state: PresentedState, ctx: ExtensionContext): SessionEntry | undefined {
 		let match: SessionEntry | undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom_message" || entry.customType !== "pi-core-memories:proposal" || entry.display !== true || entry.content !== state.preview.details || !entry.details || typeof entry.details !== "object" || !("proposalId" in entry.details) || entry.details.proposalId !== state.proposalId) continue;
@@ -257,7 +269,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		}
 		return match;
 	}
-	function takeConversationReply(state: MemoryConversationState, ctx: ExtensionContext, requestID: string): MemoryReplyInput | undefined {
+	function takeConversationReply(state: PresentedState, ctx: ExtensionContext, requestID: string): MemoryReplyInput | undefined {
 		const reply = observedReply; observedReply = undefined;
 		if (!reply || !reply.isRunStarted || !reply.message || reply.proposalId !== state.proposalId || requestID === state.presentedForRequest || conversationEntry(state, ctx)?.id !== reply.proposalEntryId) return;
 		const branch = ctx.sessionManager.getBranch();
@@ -504,7 +516,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	});
 	pi.on("input", (event, ctx) => {
 		const previous = observedReply; observedReply = undefined;
-		const state = conversation;
+		const state = conversation ?? recovery;
 		if (!previous && state && event.source === "interactive" && !event.streamingBehavior && !event.images?.length && ctx.isIdle() && !ctx.hasPendingMessages() && Buffer.byteLength(event.text) <= 16_384) {
 			const entry = conversationEntry(state, ctx);
 			const leaf = ctx.sessionManager.getBranch().at(-1);
@@ -518,7 +530,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			else observedReply.isRunStarted = true;
 		}
 		unanchoredReminder = undefined;
-		if (!isAlive || event.messageType !== "user" || conversation) return;
+		if (!isAlive || event.messageType !== "user" || conversation || recovery) return;
 		const completion = reminderRead && !reminderRead.signal.aborted ? reminderRead.completion : startReminderRead(ctx);
 		let wait: ReturnType<typeof setTimeout> | undefined;
 		await Promise.race([completion, new Promise<void>((resolve) => { wait = setTimeout(resolve, deps.reminderWaitMilliseconds); })]);
@@ -533,18 +545,20 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	});
 	pi.on("agent_end", async (_event, ctx) => {
 		context = ctx;
-		if (conversation) {
+		if (conversation || recovery) {
 			let requestID: string | undefined;
 			try { requestID = memoryRequestIdentity(ctx).requestID; } catch {}
-			if (requestID !== conversation.presentedForRequest) await closeConversation();
+			if (conversation && requestID !== conversation.presentedForRequest) await closeConversation();
+			if (recovery && requestID !== recovery.presentedForRequest) closeRecovery();
 		}
 		schedule();
 	});
 	pi.on("tool_call", async (event, ctx) => {
-		if (!conversation || event.toolName === conversation.owner) return;
+		if (event.toolName === conversation?.owner || event.toolName === "memory_dream_recover") return;
 		let requestID: string | undefined;
 		try { requestID = memoryRequestIdentity(ctx).requestID; } catch {}
-		if (requestID !== conversation.presentedForRequest) await closeConversation();
+		if (conversation && requestID !== conversation.presentedForRequest) await closeConversation();
+		if (recovery && requestID !== recovery.presentedForRequest) closeRecovery();
 		schedule();
 	});
 	pi.on("model_select", (_event, ctx) => { invalidate(); context = ctx; failures = 0; reportDreamStatus("dreaming: idle"); schedule(); });
@@ -558,7 +572,91 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	pi.on("session_compact_failed", (_event, ctx) => { context = ctx; schedule(); });
 	const stop = async () => { isAlive = false; invalidate(); await leaveSession(); await Promise.allSettled([backgroundCompletion, foregroundCompletion, conversationClose, reminderRead?.completion]); };
 	pi.on("session_shutdown", stop);
+	async function recoverDream(runID: string, requestHash: string, approvedSelection: DreamSelection, signal: AbortSignal | undefined, ctx: ExtensionToolContext): Promise<unknown> {
+		if (ctx.mode !== "tui" || !ctx.hasUI || !isAlive || !marker || foreground || conversation || background) throw new Error("Dream recovery needs one idle interactive owner.");
+		const identity = memoryRequestIdentity(ctx);
+		const sessionID = ctx.sessionManager.getSessionId();
+		const model = ctx.model;
+		if (!model || !["openai", "openai-codex", "anthropic"].includes(model.provider)) throw new Error("Selected model cannot run dreaming.");
+		const selection: DreamSelection = { provider: model.provider, modelID: model.id, thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel() };
+		if (!isDeepStrictEqual(selection, approvedSelection)) throw new Error("The selected model changed after recovery approval.");
+		const batchTextBytes = dreamBatchTextBytes(model.contextWindow);
+		if (batchTextBytes === null) throw new Error("Selected context window cannot run dreaming.");
+		const current = new AbortController(); foreground = current;
+		const combined = AbortSignal.any(signal ? [signal, current.signal] : [current.signal]);
+		const epoch = generation;
+		const isCurrent = () => {
+			try { return isAlive && !combined.aborted && foreground === current && generation === epoch && memoryRequestIdentity(ctx).requestID === identity.requestID && isDeepStrictEqual({ provider: ctx.model?.provider, modelID: ctx.model?.id, thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel() }, selection); }
+			catch { return false; }
+		};
+		clearTimeout(timer); timer = undefined;
+		foregroundCompletion = (async () => {
+		try {
+			const excludedSessionIDs = [...new Set([sessionID, ...await deps.live(deps.liveDirectory)])].sort();
+			const roots = await deps.roots(getAgentDir(), ctx.cwd);
+			const scope = await deps.scope(combined);
+			if (!isCurrent()) throw new Error("Dream recovery owner changed before dispatch.");
+			const start: DreamStart = { version: 1, type: "start", invocationID: randomUUID(), roots, selection, resume: "replaceInvalidResponse", recoveryTarget: { runID, requestHash }, batchTextBytes, ...scope, excludedSessionIDs };
+			const report = await deps.run(start, async (request, workerSignal) => {
+				if (!isCurrent() || workerSignal.aborted || request.runID !== runID) throw new Error("Dream recovery target or owner changed.");
+				assertArchivedRequest(request, [...new Set([sessionID, ...await deps.live(deps.liveDirectory)])]);
+				if (!isCurrent() || workerSignal.aborted) throw new Error("Dream recovery was cancelled.");
+				return deps.call(request, ctx, model, selection, workerSignal);
+			}, combined, () => {}, (value: unknown, workerSignal: AbortSignal) => deps.protect(pi, start.invocationID, value, workerSignal));
+			if (!isCurrent()) throw new Error("Dream recovery owner changed before completion.");
+			if (report.runID !== runID) return { status: "blocked", reason: "targetChanged" };
+			failures = report.status === "completed" ? 0 : 3;
+			const reason = report.reason && /^[A-Za-z0-9:._-]{1,80}$/.test(report.reason) ? report.reason : "unknown";
+			reportDreamStatus(report.status === "completed" ? "dreaming: idle"
+				: report.status === "blocked" ? `dreaming: error(code: blocked, reason: ${reason}, message: "Native dream worker blocked the run")`
+				: `dreaming: error(code: pending, reason: ${reason}, message: "Native dream worker kept the run pending")`);
+			return { status: report.status, runID: report.runID, reason: report.reason, detail: report.detail, proposalCount: report.proposals.length };
+		} finally { if (foreground === current) foreground = undefined; schedule(); }
+		})();
+		return await foregroundCompletion;
+	}
 	registerMemoryManagement(pi, (owner, request, signal, ctx) => perform(owner, "manage", { request }, signal, ctx));
+	pi.registerTool({
+		name: "memory_dream_recover", label: "Dream recovery", executionMode: "sequential",
+		description: "Present the exact saved invalid dream and selected model in ordinary chat before any replacement call. Use reply only after a later original interactive user reply to that display. The user must answer yes to approve one model call. Do not supply approval text in tool parameters. A pending or transformed reply cannot start recovery. Native checks the saved run and baseline request hash again before the call. This is not approval for any memory write.",
+		parameters: Type.Object({
+			operation: Type.Union([Type.Literal("present"), Type.Literal("reply"), Type.Literal("cancel")]),
+			runID: Type.Optional(Type.String({ pattern: "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$" })),
+			requestHash: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
+			selection: Type.Optional(Type.Object({ provider: Type.String({ maxLength: 256 }), modelID: Type.String({ maxLength: 256 }), thinkingLevel: Type.String({ maxLength: 256 }) }, { additionalProperties: false })),
+		}, { additionalProperties: false }),
+		async execute(_id, params, signal, _update, ctx) {
+			let result: unknown;
+			if (params.operation === "cancel") { closeRecovery(); result = { status: "not-started" }; }
+			else if (params.operation === "present") {
+				if (ctx.mode !== "tui" || !ctx.hasUI || !isAlive || !marker || foreground || conversation || background) throw new Error("Dream recovery needs one idle interactive owner.");
+				if (!params.runID || !params.requestHash || !params.selection) throw new Error("Dream recovery needs the exact saved run and selected model.");
+				const model = ctx.model;
+				if (!model || !isDeepStrictEqual({ provider: model.provider, modelID: model.id, thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel() }, params.selection)) throw new Error("Selected model changed before recovery presentation.");
+				const identity = memoryRequestIdentity(ctx);
+				closeRecovery();
+				const proposalId = randomUUID();
+				const details = `Dream recovery request\nRun: ${params.runID}\nBaseline request hash: ${params.requestHash}\nModel: ${escapeDreamDisplay(`${params.selection.provider}/${params.selection.modelID}, thinking ${params.selection.thinkingLevel}`)}\nA replacement keeps the original rejected reply. Reply yes in the next ordinary message to approve one model call. Any other reply cancels. Native checks the target again before the call.`;
+				recovery = { runID: params.runID, requestHash: params.requestHash, selection: params.selection, proposalId, presentedForRequest: identity.requestID, preview: { details } };
+				try { pi.sendMessage({ customType: "pi-core-memories:proposal", content: details, display: true, details: { proposalId } }, { triggerTurn: false }); }
+				catch (error) { closeRecovery(); throw error; }
+				schedule(); result = { status: "proposal-queued" };
+			} else {
+				const state = recovery;
+				if (!state) result = { status: "no-live-recovery-proposal" };
+				else {
+					const reply = takeConversationReply(state, ctx, memoryRequestIdentity(ctx).requestID);
+					if (!reply) result = { status: "no-live-conversation-reply" };
+					else {
+						const isApproved = reply.text.trim().toLowerCase() === "yes";
+						closeRecovery();
+						result = isApproved ? await recoverDream(state.runID, state.requestHash, state.selection, signal, ctx) : { status: "not-started" };
+					}
+				}
+			}
+			return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+		},
+	});
 	pi.registerTool({
 		name: "memory_queue", label: "Memory queue", executionMode: "sequential",
 		description: "Inspect pending findings, migration inventory and approved memories during ordinary conversation. Present only a relevant exact native proposal. Use reply after the user's later ordinary memory-specific response. The extension must match its observed interactive input to the exact durable user message after the complete proposal was appended; never supply approval text or a boolean in tool arguments. Queued, transformed, image-bearing or unmatched replies need a fresh ordinary response. Clarify ambiguous replies in chat. Use amend to replace wording in the live queued finding: preserve its source annotations and show the new exact native proposal. Amendment only prepares an unapproved draft; it needs a later approval. Cancel releases without saving. This tool opens no dialog or command workflow. Only a checked approved receipt proves a save; checkout preparation does not. Recovery checks an existing decision and never replays consent. relocate-snippets previews only an authenticated exact original snippet inventory from a named authoritative capture at a canonical replacement directory. Never guess replacement evidence. It requires a later explicit snippet-relocation approval, not memory approval; reply uses the same original-user boundary. A relocated receipt changes only future source intake, not memories or history.",

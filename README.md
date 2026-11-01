@@ -133,8 +133,10 @@ another command, review mode, or host change.
   detail is either empty or fixed text from the worker or the extension, never
   source text.
 - `dreaming: error(code: pending, reason: R, message: "...")` reports a run that
-  the native worker kept pending, for example `invalidDecision` or `staleUnpublishedPlans` (saved proposals waiting for
-  saved-suggestion recovery). Like a blocked run, it stops dispatch until your
+  the native worker kept pending, for example `invalidDecision`,
+  `recoveryApprovalRequired` (an approved replacement call was interrupted),
+  or `staleUnpublishedPlans` (saved proposals waiting for saved-suggestion
+  recovery). Like a blocked run, it stops dispatch until your
   next input or a model or thinking level change. A `cancelled` run, and a
   `droppedBatch` run whose batch was dropped because approved memory or
   rejected findings changed before it was published, go back to `idle` and run
@@ -143,6 +145,19 @@ another command, review mode, or host change.
 This is a session-local status, not an aggregate of other workers. Errors stay
 visible until an eligible reset. Shutdown clears the status. Completed request,
 response and native run records remain the evidence for successful dreaming.
+
+An `invalidDecision` run stays pending until you approve a separate model call.
+The `memory_dream_recover` tool first displays the saved run ID, baseline request
+hash, and selected model in this conversation. It requires your later original
+interactive reply of `yes` to that display before it calls the model once. The
+model must match the rejected call's recorded selection. A tool argument, queued
+message, or earlier reply cannot approve the call. If the replacement call is
+interrupted, automatic retry does not call the model again; a new display and
+reply are required. For a saved version 5 request, it appends a version 6 model
+call with the missing scope fields.
+It retains the original request and rejected reply. The worker checks the target
+again before it can call the model. The replacement still must pass native
+validation. It does not approve a memory.
 
 ## Subscription-only model calls
 

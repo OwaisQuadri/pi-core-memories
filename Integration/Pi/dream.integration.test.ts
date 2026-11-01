@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -72,6 +73,27 @@ test("real worker publishes exact refs and notes once, saved retry and no-new us
 		assert.equal(next.status, "noNewRecords"); assert.equal(next.generation, "1");
 		assert.deepEqual(await readFile(f.sessionFile), sourceBefore); assert.equal(f.cli("render", "--repo", f.repo, "--cwd", f.root), approvedBefore);
 	}
+});
+
+test("manual replacement refuses another saved run or request before any model call", async (t) => {
+	const f = await fixture(t);
+	const invalid = await dream.runDreamWorker(f.start, async (request) => {
+		const response = JSON.parse(decision(request)) as { decisions: { reasonCode: string }[] };
+		response.decisions[0]!.reasonCode = "unresolvedScope";
+		return JSON.stringify(response);
+	}, new AbortController().signal);
+	assert.equal(invalid.status, "pending"); assert.equal(invalid.reason, "invalidDecision");
+	const directory = join(f.roots.state, "runs", invalid.runID!);
+	const original = await readFile(join(directory, "response.json"));
+	const requestHash = createHash("sha256").update(await readFile(join(directory, "request.json"))).digest("hex");
+	let calls = 0;
+	const wrong = await dream.runDreamWorker({ ...f.start, resume: "replaceInvalidResponse", recoveryTarget: { runID: invalid.runID!, requestHash: "0".repeat(64) } }, async () => { calls++; assert.fail("wrong request must not call"); }, new AbortController().signal);
+	assert.equal(wrong.status, "blocked"); assert.equal(calls, 0);
+	assert.deepEqual(await readFile(join(directory, "response.json")), original);
+	const recovered = await dream.runDreamWorker({ ...f.start, resume: "replaceInvalidResponse", recoveryTarget: { runID: invalid.runID!, requestHash } }, async (request) => { calls++; return decision(request); }, new AbortController().signal);
+	assert.equal(recovered.status, "completed"); assert.equal(calls, 1);
+	assert.deepEqual(await readFile(join(directory, "response.json")), original);
+	assert.deepEqual(await readFile(join(directory, "rejected-1.json")), original);
 });
 
 test("interrupted call stays pending, explicit retry uses exact saved input after source deletion", async (t) => {

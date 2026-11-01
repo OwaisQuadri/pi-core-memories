@@ -134,7 +134,7 @@ package struct DreamInspection: Codable, Sendable {
       var diagnostic: String?
       if let response = attempt.response {
         switch DreamDecision.assess(
-          response: response, context: context, rendering: verifiedRequest.rendering)
+          response: response, context: context, rendering: attempt.rendering)
         {
         case .success(let result):
           suggestionCount = result.plans.count

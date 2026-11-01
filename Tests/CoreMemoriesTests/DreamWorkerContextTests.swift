@@ -225,6 +225,26 @@ func dreamWorkerRejectedCatalogueRegisteredSecretBlocksFreshAndReplay(isReplay: 
   try retry.finish()
 }
 
+@Test func dreamPriorContextCountsOlderLiveNotesBeforeBudgetOmissions() throws {
+  let history = (0..<42).map { index in
+    DreamPriorCandidate(
+      item: DreamPriorNote(
+        generation: 1, kind: "noChange", reasonCode: "notDurable",
+        explanation: "Note \(index).", sessions: ["s\(index)"]),
+      sessions: ["s\(index)"], sourcePaths: ["--fixture--/s\(index).jsonl"])
+  }
+  let context = try #require(
+    try DreamPriorContext(
+      newestNotes: Array(history.suffix(DreamPriorContext.maximumNotes)), olderNoteCount: 2,
+      olderLiveNoteCount: 1, newestFindings: [], excludedSessionIDs: ["s0"],
+      isVerified: { !$0.contains("--fixture--/s2.jsonl") }))
+  #expect(context.notes.count == 39)
+  #expect(context.notes.first?.explanation == "Note 3.")
+  #expect(context.omittedNotes == DreamPriorOmissions(
+    overBudget: 1, liveSession: 1, unverifiedSource: 1))
+  #expect(context.isWithinBudget)
+}
+
 @Test func dreamPriorContextKeepsNewestWithinCapsAndCountsOmissions() throws {
   let notes = (0..<50).map { index in
     DreamPriorCandidate(

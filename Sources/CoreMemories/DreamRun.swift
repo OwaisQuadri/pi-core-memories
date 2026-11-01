@@ -1216,6 +1216,10 @@ public final class DreamRunStore {
             reasonCode: note.reasonCode, explanation: note.explanation, sessions: sessions),
           sessions: sessions, sourcePaths: paths.isEmpty ? viewPaths : paths)
       }
+      let excess = max(0, priorDreams.recentNotes.count - DreamPriorContext.maximumNotes)
+      priorDreams.olderLiveNoteCount += priorDreams.recentNotes.prefix(excess).filter {
+        !excludedSessionIDs.isDisjoint(with: $0.sessions)
+      }.count
       priorDreams.recentNotes = Array(
         priorDreams.recentNotes.suffix(DreamPriorContext.maximumNotes))
       priorDreams.noteCount += notes.count
@@ -1809,6 +1813,7 @@ public final class DreamRunStore {
     let priorContext = try DreamPriorContext(
       newestNotes: priorDreams.recentNotes.reversed(),
       olderNoteCount: priorDreams.noteCount - priorDreams.recentNotes.count,
+      olderLiveNoteCount: priorDreams.olderLiveNoteCount,
       newestFindings: findings.reversed().map { entry in
         let sources = entry.finding.evidence + entry.finding.contradictions.compactMap(\.evidence)
         let sessions = sources.map(\.session)
@@ -1968,6 +1973,7 @@ public final class DreamRunStore {
   private struct PriorDreams {
     var recentNotes: [DreamPriorCandidate<DreamPriorNote>] = []
     var noteCount = 0
+    var olderLiveNoteCount = 0
     var runViewPaths: [String: Set<String>] = [:]
   }
 

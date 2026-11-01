@@ -68,10 +68,12 @@ public struct DreamPriorContext: Codable, Equatable, Sendable {
 
   init?(
     newestNotes: [DreamPriorCandidate<DreamPriorNote>], olderNoteCount: Int,
-    newestFindings: [DreamPriorCandidate<DreamOpenFinding>], excludedSessionIDs: Set<String>,
+    olderLiveNoteCount: Int = 0, newestFindings: [DreamPriorCandidate<DreamOpenFinding>],
+    excludedSessionIDs: Set<String>,
     isVerified: (Set<String>) throws -> Bool
   ) throws {
-    var omittedNotes = DreamPriorOmissions(overBudget: olderNoteCount)
+    var omittedNotes = DreamPriorOmissions(
+      overBudget: olderNoteCount - olderLiveNoteCount, liveSession: olderLiveNoteCount)
     var omittedFindings = DreamPriorOmissions()
     let notes = try Self.select(
       newestNotes, maximumCount: Self.maximumNotes, maximumBytes: Self.maximumNoteBytes,

@@ -204,3 +204,122 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
   let saved = try #require(inspected.runs.first { $0.id == rejected.runID })
   #expect(saved.attempts.map(\.status) == ["Rejected reply", "Reply valid"])
 }
+
+@Test func discardingExactInvalidV5ReplyStartsFreshV6Run() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let pending = try transactionPending(
+    fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) }) {
+      request in
+      let source = (try transactionObject(request)["primaryEvidence"] as! [[String: Any]])[0]["source"]!
+      return try transactionResponse(request, decisions: [[
+        "kind": "noChange", "sources": [source], "reasonCode": "unresolvedScope",
+        "explanation": "Synthetic invalid scope decision.",
+      ]])
+    }, reason: .invalidDecision)
+  try freezeV5Request(fixture)
+  let original = try Data(contentsOf: fixture.payload("request.json"))
+  let target = try DreamRecoveryTarget(
+    runID: pending.runID, requestHash: SourceDigest(bytes: original).rawValue)
+  let unchanged = try fixture.snapshot(fixture.state)
+  #expect(throws: DreamRunError.replacementUnavailable) {
+    try fixture.store().run(
+      selection: fixture.selection, resume: .discardInvalidResponse,
+      recoveryTarget: DreamRecoveryTarget(
+        runID: pending.runID, requestHash: String(repeating: "0", count: 64)),
+      prepare: transactionUncalledPrepare, call: transactionUncalled)
+  }
+  #expect(try fixture.snapshot(fixture.state) == unchanged)
+  var fresh: DreamModelRequest?
+  let completed = try transactionCompleted(
+    fixture.store().run(
+      selection: fixture.selection, resume: .discardInvalidResponse,
+      recoveryTarget: target, prepare: { try fixture.prepare($0) },
+      call: { request in fresh = request; return try transactionNotes(request) }))
+  #expect(completed.runID != pending.runID)
+  let request = try #require(fresh)
+  let payload = try transactionObject(request)
+  let scopes = try #require(payload["scopes"] as? [[String: Any]])
+  #expect(scopes.allSatisfy { $0["allowedNoChangeReasons"] is [String] })
+  #expect(scopes.allSatisfy { $0["eligibleProposalScopes"] is [[String: Any]] })
+  #expect(!FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("runs/\(pending.runID)").path))
+  #expect(!FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("discard-invalid.json").path))
+  #expect(try DreamInspection.read(stateRoot: fixture.state).runs.map(\.id) == [completed.runID])
+  #expect(throws: DreamRunError.replacementUnavailable) {
+    try fixture.store().run(
+      selection: fixture.selection, resume: .discardInvalidResponse,
+      recoveryTarget: target, prepare: transactionUncalledPrepare, call: transactionUncalled)
+  }
+}
+
+@Test func discardRefusesUnknownFilesBeforeChangingState() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let pending = try transactionPending(
+    fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) }) {
+      request in
+      let source = (try transactionObject(request)["primaryEvidence"] as! [[String: Any]])[0]["source"]!
+      return try transactionResponse(request, decisions: [[
+        "kind": "noChange", "sources": [source], "reasonCode": "unresolvedScope",
+        "explanation": "Synthetic invalid scope decision.",
+      ]])
+    }, reason: .invalidDecision)
+  try freezeV5Request(fixture)
+  let target = try DreamRecoveryTarget(
+    runID: pending.runID,
+    requestHash: SourceDigest(bytes: Data(contentsOf: fixture.payload("request.json"))).rawValue)
+  let unknown = fixture.state.appendingPathComponent("runs/\(pending.runID)/other-data.json")
+  try Data("do not remove".utf8).write(to: unknown)
+  let unchanged = try fixture.snapshot(fixture.state)
+  #expect(throws: DreamRunError.unsafeState) {
+    try fixture.store().run(
+      selection: fixture.selection, resume: .discardInvalidResponse,
+      recoveryTarget: target, prepare: transactionUncalledPrepare, call: transactionUncalled)
+  }
+  #expect(try fixture.snapshot(fixture.state) == unchanged)
+  #expect(!FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("discard-invalid.json").path))
+}
+
+@Test func interruptedDiscardFinishesBeforeFreshRun() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let pending = try transactionPending(
+    fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) }) {
+      request in
+      let source = (try transactionObject(request)["primaryEvidence"] as! [[String: Any]])[0]["source"]!
+      return try transactionResponse(request, decisions: [[
+        "kind": "noChange", "sources": [source], "reasonCode": "unresolvedScope",
+        "explanation": "Synthetic invalid scope decision.",
+      ]])
+    }, reason: .invalidDecision)
+  try freezeV5Request(fixture)
+  let target = try DreamRecoveryTarget(
+    runID: pending.runID,
+    requestHash: SourceDigest(bytes: Data(contentsOf: fixture.payload("request.json"))).rawValue)
+  let store = try fixture.store()
+  store.persistenceFault = {
+    if $0 == .afterDirectorySync("state.json") { throw POSIXError(.EIO) }
+  }
+  #expect(throws: DreamRunError.persistenceFailure) {
+    try store.run(
+      selection: fixture.selection, resume: .discardInvalidResponse,
+      recoveryTarget: target, prepare: transactionUncalledPrepare, call: transactionUncalled)
+  }
+  #expect(FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("discard-invalid.json").path))
+  let completed = try transactionCompleted(
+    fixture.store().run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: transactionNotes))
+  #expect(completed.runID != pending.runID)
+  #expect(!FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("runs/\(pending.runID)").path))
+  #expect(!FileManager.default.fileExists(
+    atPath: fixture.state.appendingPathComponent("discard-invalid.json").path))
+}

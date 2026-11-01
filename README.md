@@ -159,6 +159,16 @@ It retains the original request and rejected reply. The worker checks the target
 again before it can call the model. The replacement still must pass native
 validation. It does not approve a memory.
 
+For a saved version 5 run with an invalid reply, `memory_dream_recover` also
+supports `present-discard`. It displays the exact run, request hash, and model.
+After your later original `yes` reply, the native worker locks its state and
+checks the target again. It deletes only that unfinished run and its admission,
+keeps the completed generations, and starts a new version 6 run from the same
+progress. The deleted request and reply cannot be restored. The new run can
+return `noNewRecords` if source records are no longer available. No memory is
+approved. Never remove a run folder by hand: the state and admission also
+refer to it.
+
 ## Subscription-only model calls
 
 Dreaming uses the selected provider, model, and thinking level. It must not fall

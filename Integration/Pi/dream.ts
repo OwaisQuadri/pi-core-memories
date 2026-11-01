@@ -21,7 +21,7 @@ export type DreamRoots = { state: string; sessions: string; memory: string; snip
 export type DreamScopeOptions = { deviceKey?: string; projectBindings?: Record<string, string> };
 export type DreamStart = { version: 1; type: "start"; invocationID: string; roots: DreamRoots; selection: DreamSelection; batchTextBytes: number; excludedSessionIDs?: string[] } & DreamScopeOptions & (
 	| { resume: "inspectOrContinue" | "retryInterruptedCall"; recoveryTarget?: never }
-	| { resume: "replaceInvalidResponse"; recoveryTarget: { runID: string; requestHash: string } }
+	| { resume: "replaceInvalidResponse" | "discardInvalidResponse"; recoveryTarget: { runID: string; requestHash: string } }
 );
 export type DreamRequest = { version: 1; type: "modelRequest"; invocationID: string; requestID: string; runID: string; generation: string; inputHash: string; contextHash: string; requestHash: string; selection: DreamSelection; systemPrompt: string; messages: { role: "system" | "user"; text: string; timestampMilliseconds: number }[] };
 type DreamSource = { sessionID: string; entryID: string; partIndex: number };

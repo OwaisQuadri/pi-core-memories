@@ -287,6 +287,8 @@ extension SessionReader {
     var tracked = Dictionary(uniqueKeysWithValues: progress.positions.map { ($0.relativePath, $0) })
     var captured: [CapturedSession] = []
     var views: [DreamAdmittedView] = []
+    var unchangedViewPaths: Set<String> = []
+    var admissionCounts = AdmissionCounts()
     var originalData: [SourceRelativePath: Data] = [:]
     var isUnadmittedBacklog = false
     var identities: Set<SessionIdentifier> = []
@@ -392,9 +394,12 @@ extension SessionReader {
           try protect?([path.rawValue])
         } else if prior == nil {
           continue
+        } else {
+          unchangedViewPaths.insert(path.rawValue)
         }
         let view = try session.admitting(
-          prior: prior, cursor: tracked[path]?.completeBytes ?? 0, admit: admit)
+          prior: prior, cursor: tracked[path]?.completeBytes ?? 0, counts: &admissionCounts,
+          admit: admit)
         isUnadmittedBacklog = isUnadmittedBacklog || view.originalCompleteBytes < UInt64(complete)
         views.append(view)
         originalData[path] = data
@@ -529,11 +534,7 @@ extension SessionReader {
     }
     backlog(
       DreamBacklog(backlogBytes: backlogBytes, undreamtBytes: undreamtBytes, nextBytes: nextBytes))
-    return PreparedSessionBatch(
-      predecessorGeneration: progress.generation,
-      readerSchemaVersion: Self.preparationSchemaVersion,
-      strippingInputHash: stripping.hash,
-      positionsAfter: try positions.values.map { position in
+    let positionsAfter = try positions.values.map { position in
         guard let view = views.first(where: { $0.path == position.relativePath.rawValue }),
           let data = originalData[position.relativePath]
         else { return position }
@@ -542,23 +543,50 @@ extension SessionReader {
           relativePath: position.relativePath, sessionID: position.sessionID,
           completeBytes: offset, prefixHash: SourceDigest(bytes: data.prefix(Int(offset))),
           classificationHash: position.classificationHash)
-      }.sorted { $0.relativePath.rawValue < $1.relativePath.rawValue },
-      exactSourceRecords: records, evidence: evidence, selections: selections,
-      unfinishedTails: tails, isBacklog: isBacklog || isUnadmittedBacklog,
-      provenance: PreparationProvenance(
-        isToolEvidenceIncluded: isIncludingTools, admittedViews: views, stripping: stripping.inputs,
-        sessions: captured.filter { session in
-          records.contains { $0.witness.relativePath == session.path }
-        }.map { session in
-          PreparationClassificationWitness(
-            path: session.path,
-            records: session.records.filter {
-              ["session", "session_info"].contains($0.object["type"] as? String ?? "")
-            }.map {
-              PreparationClassificationRecord(
-                witness: $0.witness(path: session.path), bytes: $0.bytes)
-            })
-        }))
+    }.sorted { $0.relativePath.rawValue < $1.relativePath.rawValue }
+    let classification = captured.filter { session in
+      records.contains { $0.witness.relativePath == session.path }
+    }.map { session in
+      PreparationClassificationWitness(
+        path: session.path,
+        records: session.records.filter {
+          ["session", "session_info"].contains($0.object["type"] as? String ?? "")
+        }.map {
+          PreparationClassificationRecord(
+            witness: $0.witness(path: session.path), bytes: $0.bytes)
+        })
+    }
+    func batch(_ admittedViews: [DreamAdmittedView]) -> PreparedSessionBatch {
+      PreparedSessionBatch(
+        predecessorGeneration: progress.generation,
+        readerSchemaVersion: Self.preparationSchemaVersion,
+        strippingInputHash: stripping.hash, positionsAfter: positionsAfter,
+        exactSourceRecords: records, evidence: evidence, selections: selections,
+        unfinishedTails: tails, isBacklog: isBacklog || isUnadmittedBacklog,
+        provenance: PreparationProvenance(
+          isToolEvidenceIncluded: isIncludingTools, admittedViews: admittedViews,
+          admissionLimitations: admissionCounts.limitations, stripping: stripping.inputs,
+          sessions: classification))
+    }
+    guard !unchangedViewPaths.isEmpty else { return batch(views) }
+    let checked = try DreamSourceProtection.pieces(
+      batch(views.filter { !unchangedViewPaths.contains($0.path) }))
+    var pieceCount = checked.count
+    var byteCount = checked.reduce(0) { $0 + $1.utf8.count }
+    var droppedPaths: Set<String> = []
+    for view in views where unchangedViewPaths.contains(view.path) {
+      let pieces = try DreamSourceProtection.pieces(view)
+      let bytes = pieces.reduce(0) { $0 + $1.utf8.count }
+      guard pieceCount + pieces.count <= DreamSourceProtection.maximumPieces,
+        byteCount + bytes <= DreamSourceProtection.maximumInputBytes
+      else {
+        droppedPaths.insert(view.path)
+        continue
+      }
+      pieceCount += pieces.count
+      byteCount += bytes
+    }
+    return batch(views.filter { !droppedPaths.contains($0.path) })
   }
 
   private func preparationStrippingInputs(
@@ -1142,6 +1170,7 @@ struct PreparationClassificationWitness: Sendable {
 struct PreparationProvenance: Sendable {
   var isToolEvidenceIncluded: Bool = false
   var admittedViews: [DreamAdmittedView] = []
+  var admissionLimitations: [String] = []
   let stripping: [PreparationStrippingInput]
   let sessions: [PreparationClassificationWitness]
 }
@@ -1287,9 +1316,62 @@ extension SessionReader {
   }
 }
 
+private struct AdmissionCandidate {
+  let bytes: Data
+  let stub: Data
+  let isOmitted: Bool
+  let isImageRemoved: Bool
+  let isOversized: Bool
+}
+
+private struct AdmissionCounts {
+  var imageRecords = 0
+  var oversizedRecords = 0
+
+  mutating func add(_ candidate: AdmissionCandidate, isStub: Bool) {
+    if candidate.isImageRemoved && !isStub { imageRecords += 1 }
+    if candidate.isOversized { oversizedRecords += 1 }
+  }
+
+  var limitations: [String] {
+    var limitations: [String] = []
+    if imageRecords > 0 {
+      limitations.append(
+        "Image data was removed from \(imageRecords) source records before source checks; their text was kept."
+      )
+    }
+    if oversizedRecords > 0 {
+      limitations.append(
+        "\(oversizedRecords) source records larger than \(DreamSourceProtection.maximumPieceBytes) bytes were omitted; only their identity was kept."
+      )
+    }
+    return limitations
+  }
+}
+
 extension CapturedSession {
+  fileprivate func admissionCandidate(_ index: Int, omissions: Set<Int>) throws
+    -> AdmissionCandidate
+  {
+    let record = records[index]
+    let stub = try DreamAdmittedView.omitted(record.bytes)
+    guard !omissions.contains(index) else {
+      return AdmissionCandidate(
+        bytes: stub, stub: stub, isOmitted: true, isImageRemoved: false, isOversized: false)
+    }
+    let stripped = try DreamAdmittedView.withoutImageData(record.bytes, object: record.object)
+    guard stripped.count <= DreamSourceProtection.maximumPieceBytes else {
+      return AdmissionCandidate(
+        bytes: stub, stub: stub, isOmitted: true, isImageRemoved: false, isOversized: true)
+    }
+    return AdmissionCandidate(
+      bytes: stripped, stub: stub, isOmitted: false, isImageRemoved: stripped != record.bytes,
+      isOversized: false)
+  }
+
   fileprivate func admitting(
-    prior: DreamAdmittedView?, cursor: UInt64, admit: ([String]) throws -> [String]
+    prior: DreamAdmittedView?, cursor: UInt64, counts: inout AdmissionCounts,
+    admit: ([String]) throws -> [String]
   ) throws
     -> DreamAdmittedView
   {
@@ -1307,27 +1389,26 @@ extension CapturedSession {
       return prior
     }
     if prior?.window != nil || records.count > 128 || bytes.count > 524_288 {
-      return try admittingWindow(prior: prior, cursor: cursor, admit: admit)
+      return try admittingWindow(prior: prior, cursor: cursor, counts: &counts, admit: admit)
     }
     let omissions = try DreamSourceProtection.omittedReadResults(records.map(\.object))
     let oldCount = prior?.records.count ?? 0
     guard records.count <= DreamSourceProtection.maximumPieces, oldCount <= records.count else {
       throw DreamSourceProtectionError.limitExceeded
     }
-    let pending = try records.enumerated().dropFirst(oldCount).map { index, record in
-      try DreamSourceProtection.text(
-        omissions.contains(index) ? DreamAdmittedView.omitted(record.bytes) : record.bytes)
+    let candidates = try records.indices.dropFirst(oldCount).map {
+      try admissionCandidate($0, omissions: omissions)
     }
-    let checked = pending.isEmpty ? [] : try admit(pending)
-    guard checked.count == pending.count else { throw DreamSourceProtectionError.invalidReply }
+    let checked = try DreamSourceProtection.checkedRecords(
+      candidates.map { ($0.bytes, $0.stub) }, admit: admit)
     var admitted = prior?.bytes ?? Data()
     var relations = prior?.records ?? []
     for (offset, record) in records.dropFirst(oldCount).enumerated() {
-      let index = oldCount + offset
-      let original =
-        omissions.contains(index) ? try DreamAdmittedView.omitted(record.bytes) : record.bytes
-      let safe = Data(checked[offset].utf8)
-      let identity = try DreamAdmittedView.identity(original)
+      let safe = checked[offset].bytes
+      let isStub = checked[offset].isStub
+      counts.add(candidates[offset], isStub: isStub)
+      let identity = try DreamAdmittedView.identity(
+        isStub ? candidates[offset].stub : candidates[offset].bytes)
       guard safe.last == 10, !safe.dropLast().contains(10),
         try DreamAdmittedView.identity(safe) == identity
       else { throw DreamSourceProtectionError.invalidReply }
@@ -1344,7 +1425,7 @@ extension CapturedSession {
             .rawValue,
           admittedStart: start, admittedEnd: UInt64(admitted.count),
           admittedHash: SourceDigest(bytes: safe).rawValue,
-          identityHash: identity, isOmitted: omissions.contains(index)))
+          identityHash: identity, isOmitted: candidates[offset].isOmitted || isStub))
     }
     let complete = records.last!.range.upperBound
     let view = try DreamAdmittedView(
@@ -1361,17 +1442,25 @@ extension CapturedSession {
 
 extension CapturedSession {
   fileprivate func admittingWindow(
-    prior: DreamAdmittedView?, cursor: UInt64, admit: ([String]) throws -> [String]
+    prior: DreamAdmittedView?, cursor: UInt64, counts: inout AdmissionCounts,
+    admit: ([String]) throws -> [String]
   ) throws -> DreamAdmittedView {
     let omissions = try DreamSourceProtection.omittedReadResults(records.map(\.object))
+    var candidates: [Int: AdmissionCandidate] = [:]
+    func candidate(_ index: Int) throws -> AdmissionCandidate {
+      if let value = candidates[index] { return value }
+      let value = try admissionCandidate(index, omissions: omissions)
+      candidates[index] = value
+      return value
+    }
     var selected: [Int] = []
-    var rawBytes = 0
-    for (index, record) in records.enumerated() where record.range.upperBound > cursor {
-      if selected.count >= 128 || (!selected.isEmpty && rawBytes + record.bytes.count > 524_288) {
-        break
-      }
+    var selectedBytes = 0
+    for index in records.indices where records[index].range.upperBound > cursor {
+      guard selected.count < 128 else { break }
+      let size = try candidate(index).bytes.count
+      if !selected.isEmpty && selectedBytes + size > 524_288 { break }
       selected.append(index)
-      rawBytes += record.bytes.count
+      selectedBytes += size
     }
     guard let last = selected.last else { throw DreamSourceProtectionError.invalidReply }
     let complete = records[last].range.upperBound
@@ -1382,17 +1471,23 @@ extension CapturedSession {
           && !selectedSet.contains($0))
     }
     guard classification.count <= 64 else { throw DreamSourceProtectionError.limitExceeded }
-    let context = records.indices.filter { index in
-      records[index].range.upperBound <= cursor && !classification.contains(index)
-        && prior?.records.contains(where: { $0.originalStart == records[index].range.lowerBound })
-          == true
-    }.suffix(64)
+    var context: [Int] = []
+    var contextBytes: UInt64 = 0
+    for index in records.indices.reversed() where context.count < 64 {
+      guard records[index].range.upperBound <= cursor, !classification.contains(index),
+        let cached = prior?.records.first(where: {
+          $0.originalStart == records[index].range.lowerBound
+        })
+      else { continue }
+      contextBytes += cached.admittedEnd - cached.admittedStart
+      guard contextBytes <= UInt64(DreamSourceProtection.maximumContextBytes) else { break }
+      context.insert(index, at: 0)
+    }
     let prefix = classification + context
     let windowRecords = selected.filter { !classification.contains($0) }
     let ordered = prefix + windowRecords
-    var safeByIndex: [Int: Data] = [:]
+    var safeByIndex: [Int: (bytes: Data, isStub: Bool)] = [:]
     var pendingIndices: [Int] = []
-    var pending: [String] = []
     for index in ordered {
       let raw = records[index]
       if let prior,
@@ -1401,29 +1496,32 @@ extension CapturedSession {
             && $0.originalHash == SourceDigest(bytes: raw.bytes).rawValue
         })
       {
-        safeByIndex[index] = prior.bytes.subdata(
-          in: Int(cached.admittedStart)..<Int(cached.admittedEnd))
+        safeByIndex[index] = (
+          prior.bytes.subdata(in: Int(cached.admittedStart)..<Int(cached.admittedEnd)),
+          cached.isOmitted
+        )
       } else {
         pendingIndices.append(index)
-        pending.append(
-          try DreamSourceProtection.text(
-            omissions.contains(index) ? DreamAdmittedView.omitted(raw.bytes) : raw.bytes))
       }
     }
-    let checked = pending.isEmpty ? [] : try admit(pending)
-    guard checked.count == pendingIndices.count else {
-      throw DreamSourceProtectionError.invalidReply
+    let checked = try DreamSourceProtection.checkedRecords(
+      try pendingIndices.map { (try candidate($0).bytes, try candidate($0).stub) }, admit: admit)
+    for (index, safe) in zip(pendingIndices, checked) { safeByIndex[index] = safe }
+    for index in windowRecords {
+      counts.add(try candidate(index), isStub: safeByIndex[index]?.isStub == true)
     }
-    for (index, text) in zip(pendingIndices, checked) { safeByIndex[index] = Data(text.utf8) }
     var admitted = Data()
     var relations: [DreamAdmittedView.Record] = []
     var admittedStart: UInt64 = 0
     for (offset, index) in ordered.enumerated() {
       if offset == prefix.count { admittedStart = UInt64(admitted.count) }
       let raw = records[index]
-      let original =
-        omissions.contains(index) ? try DreamAdmittedView.omitted(raw.bytes) : raw.bytes
-      guard let safe = safeByIndex[index], safe.last == 10, !safe.dropLast().contains(10),
+      let candidate = try candidate(index)
+      guard let checked = safeByIndex[index] else { throw DreamSourceProtectionError.invalidReply }
+      let safe = checked.bytes
+      let isOmitted = candidate.isOmitted || checked.isStub
+      let original = isOmitted ? candidate.stub : candidate.bytes
+      guard safe.last == 10, !safe.dropLast().contains(10),
         try DreamAdmittedView.identity(safe) == DreamAdmittedView.identity(original)
       else { throw DreamSourceProtectionError.invalidReply }
       let start = UInt64(admitted.count)
@@ -1435,8 +1533,7 @@ extension CapturedSession {
           originalPrefixHash: SourceDigest(bytes: bytes.prefix(Int(raw.range.upperBound))).rawValue,
           admittedStart: start, admittedEnd: UInt64(admitted.count),
           admittedHash: SourceDigest(bytes: safe).rawValue,
-          identityHash: try DreamAdmittedView.identity(original),
-          isOmitted: omissions.contains(index)))
+          identityHash: try DreamAdmittedView.identity(original), isOmitted: isOmitted))
     }
     if windowRecords.isEmpty { admittedStart = 0 }
     let view = try DreamAdmittedView(

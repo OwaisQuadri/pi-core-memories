@@ -1294,7 +1294,8 @@ public final class DreamRunStore {
         bindingHash: bindingHash, limits: limits)
       let date = clock()
       let context = try capture(
-        run: run, memory: memory, date: date, retainedBatches: retainedBatches,
+        run: run, admissionLimitations: batch.admissionLimitations, memory: memory, date: date,
+        retainedBatches: retainedBatches,
         excludedSessionIDs: excludedSessionIDs, protect: protect,
         remainingProtections: remainingProtections)
       let milliseconds = date.timeIntervalSince1970 * 1_000
@@ -1491,7 +1492,7 @@ public final class DreamRunStore {
   }
 
   private func capture(
-    run: FrozenDreamRun, memory: MemoryStore, date: Date,
+    run: FrozenDreamRun, admissionLimitations: [String], memory: MemoryStore, date: Date,
     retainedBatches: [PreparedSessionBatch], excludedSessionIDs: Set<String>,
     protect: (([String]) throws -> Void)?, remainingProtections: (() -> Int)?
   ) throws
@@ -1500,7 +1501,7 @@ public final class DreamRunStore {
     let decisionLimits = try DreamDecisionLimits(
       maximumResponseBytes: limits.maximumResponseBytes,
       maximumFrozenBytes: limits.maximumFrozenBytes)
-    var limitations: [String] = []
+    var limitations = admissionLimitations
     var relatedBatches = try selectRetainedBatches(
       current: run.batch, retained: retainedBatches, excludedSessionIDs: excludedSessionIDs,
       limitations: &limitations)

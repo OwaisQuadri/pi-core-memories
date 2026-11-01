@@ -193,25 +193,45 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
   }
 
   static func omitted(_ bytes: Data) throws -> Data {
-    guard var object = try SessionReader.decodeRecord(bytes) as? [String: Any],
-      var message = object["message"] as? [String: Any], message["role"] as? String == "toolResult"
-    else { throw DreamSourceProtectionError.blocked }
-    message = [
-      "role": "toolResult", "toolCallId": message["toolCallId"] ?? "",
-      "toolName": message["toolName"] ?? "", "isError": message["isError"] ?? false, "content": [],
-    ]
+    guard let object = try SessionReader.decodeRecord(bytes) as? [String: Any] else {
+      throw DreamSourceProtectionError.blocked
+    }
     var stub: [String: Any] = [
       "type": object["type"] ?? "", "id": object["id"] ?? "",
-      "timestamp": object["timestamp"] ?? "", "message": message,
+      "timestamp": object["timestamp"] ?? "",
     ]
     stub["parentId"] = object["parentId"]
-    object = stub
-    return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) + Data([10])
+    if let message = object["message"] as? [String: Any] {
+      stub["message"] =
+        message["role"] as? String == "toolResult"
+        ? [
+          "role": "toolResult", "toolCallId": message["toolCallId"] ?? "",
+          "toolName": message["toolName"] ?? "", "isError": message["isError"] ?? false,
+          "content": [],
+        ] : ["role": message["role"] ?? "", "content": []]
+    } else {
+      for key in ["cwd", "parentSession", "name"] { stub[key] = object[key] }
+    }
+    return try JSONSerialization.data(withJSONObject: stub, options: [.sortedKeys]) + Data([10])
+  }
+
+  static func withoutImageData(_ bytes: Data, object: [String: Any]) throws -> Data {
+    guard var message = object["message"] as? [String: Any],
+      let content = message["content"] as? [[String: Any]],
+      content.contains(where: { $0["type"] as? String == "image" && $0.count > 1 })
+    else { return bytes }
+    message["content"] = content.map { $0["type"] as? String == "image" ? ["type": "image"] : $0 }
+    var stripped = object
+    stripped["message"] = message
+    return try JSONSerialization.data(
+      withJSONObject: stripped, options: [.sortedKeys, .withoutEscapingSlashes]) + Data([10])
   }
 }
 
 extension PreparedSessionBatch {
   var admittedViews: [DreamAdmittedView] { provenance?.admittedViews ?? [] }
+
+  var admissionLimitations: [String] { provenance?.admissionLimitations ?? [] }
 
   func admittedProgress(_ progress: DreamProgress) throws -> DreamProgress {
     try DreamProgress(

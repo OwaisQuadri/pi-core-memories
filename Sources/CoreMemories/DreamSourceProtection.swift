@@ -9,6 +9,20 @@ package enum DreamSourceProtection {
   package static let maximumPieceBytes = 1_048_576
   package static let maximumInputBytes = 4_194_304
   package static let maximumOutputBytes = 8_388_608
+  static let maximumContextBytes = maximumPieceBytes
+
+  static func checkedRecords(
+    _ records: [(bytes: Data, stub: Data)], admit: ([String]) throws -> [String]
+  ) throws -> [(bytes: Data, isStub: Bool)] {
+    let requests = records.map { record in
+      (bytes: record.bytes.count > maximumPieceBytes ? record.stub : record.bytes,
+        isStub: record.bytes.count > maximumPieceBytes)
+    }
+    let pending = try requests.map { try text($0.bytes) }
+    let checked = pending.isEmpty ? [] : try admit(pending)
+    guard checked.count == pending.count else { throw DreamSourceProtectionError.invalidReply }
+    return zip(checked, requests).map { (Data($0.0.utf8), $0.1.isStub) }
+  }
 
   package static func digest(_ pieces: [String]) -> SourceDigest {
     var bytes = Data()
@@ -90,6 +104,14 @@ package enum DreamSourceProtection {
     return text
   }
 
+  static func pieces(_ view: DreamAdmittedView) throws -> [String] {
+    try view.records.map {
+      let bytes = view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd))
+      guard bytes.count <= maximumPieceBytes else { throw DreamSourceProtectionError.limitExceeded }
+      return try text(bytes)
+    }
+  }
+
   static func pieces(_ batch: PreparedSessionBatch) throws -> [String] {
     if batch.admittedViews.isEmpty {
       try requireAdmissibleReadProvenance(
@@ -98,11 +120,7 @@ package enum DreamSourceProtection {
           return try JSONSerialization.jsonObject(with: bytes) as? [String: Any]
         })
     }
-    var pieces: [String] = try batch.admittedViews.flatMap { view in
-      try view.records.map {
-        try text(view.bytes.subdata(in: Int($0.admittedStart)..<Int($0.admittedEnd)))
-      }
-    }
+    var pieces: [String] = try batch.admittedViews.flatMap { try Self.pieces($0) }
     for position in batch.positionsAfter { pieces.append(position.relativePath.rawValue) }
     for record in batch.exactSourceRecords {
       if let bytes = record.bytes { pieces.append(try text(bytes)) }

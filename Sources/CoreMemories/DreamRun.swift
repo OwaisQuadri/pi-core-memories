@@ -178,6 +178,17 @@ public enum DreamResumeAction: Sendable {
   case inspectOrContinue, retryInterruptedCall, replaceInvalidResponse
 }
 
+public struct DreamRecoveryTarget: Sendable {
+  public let runID: String
+  public let requestHash: SourceDigest
+
+  public init(runID: String, requestHash: String) throws {
+    guard DreamRunEncoding.isRunID(runID) else { throw DreamRunError.replacementUnavailable }
+    self.runID = runID
+    self.requestHash = try SourceDigest(requestHash)
+  }
+}
+
 public enum DreamRunError: Error, Equatable, Sendable, CustomStringConvertible {
   case busy, unsafeState, unsupportedSchema, corruption, missingPayload, staleGeneration
   case limitExceeded, persistenceFailure, invalidSelection, invalidBase, invalidResponse
@@ -1032,18 +1043,21 @@ public final class DreamRunStore {
 
   public func run(
     selection: DreamSelectedCall, resume: DreamResumeAction = .inspectOrContinue,
+    recoveryTarget: DreamRecoveryTarget? = nil,
     prepare: (DreamProgress) throws -> PreparedSessionBatch,
     call: (DreamModelRequest) throws -> DreamCompletedResponse,
     observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void = { _, _, _, _ in }
   ) throws -> DreamTransactionResult {
     try performRun(
-      selection: selection, resume: resume, sourceRoles: nil, excludedSessionIDs: [],
+      selection: selection, resume: resume, recoveryTarget: recoveryTarget,
+      sourceRoles: nil, excludedSessionIDs: [],
       prepare: { progress, _ in try prepare(progress) }, protect: nil, remainingProtections: nil,
       call: call, observe: observe)
   }
 
   package func run(
     selection: DreamSelectedCall, resume: DreamResumeAction = .inspectOrContinue,
+    recoveryTarget: DreamRecoveryTarget? = nil,
     sourceRoles: DreamSourceRoles, excludedSessionIDs: Set<String> = [],
     protect: @escaping ([String]) throws -> Void,
     remainingProtections: (() -> Int)? = nil,
@@ -1052,8 +1066,8 @@ public final class DreamRunStore {
     observe: (DreamProgress, PreparedSessionBatch, Bool, Double?) throws -> Void = { _, _, _, _ in }
   ) throws -> DreamTransactionResult {
     try performRun(
-      selection: selection, resume: resume, sourceRoles: sourceRoles,
-      excludedSessionIDs: excludedSessionIDs,
+      selection: selection, resume: resume, recoveryTarget: recoveryTarget,
+      sourceRoles: sourceRoles, excludedSessionIDs: excludedSessionIDs,
       prepare: { progress, sources in
         guard let sources else { throw DreamRunError.unsafeState }
         return try prepare(progress, sources)
@@ -1062,7 +1076,8 @@ public final class DreamRunStore {
   }
 
   private func performRun(
-    selection: DreamSelectedCall, resume: DreamResumeAction, sourceRoles: DreamSourceRoles?,
+    selection: DreamSelectedCall, resume: DreamResumeAction,
+    recoveryTarget: DreamRecoveryTarget?, sourceRoles: DreamSourceRoles?,
     excludedSessionIDs: Set<String>,
     prepare: (DreamProgress, DreamFreshSources?) throws -> PreparedSessionBatch,
     protect: (([String]) throws -> Void)?, remainingProtections: (() -> Int)?,
@@ -1104,7 +1119,8 @@ public final class DreamRunStore {
     var observedInputBytes = 0
     var lockFailure: (any Error)?
     let result = try runLocked(
-      selection: selection, resume: resume, isLockCreated: ownership.isCreated,
+      selection: selection, resume: resume, recoveryTarget: recoveryTarget,
+      isLockCreated: ownership.isCreated,
       sourceRoles: sourceRoles, excludedSessionIDs: excludedSessionIDs,
       prepare: prepare, protect: protect, remainingProtections: remainingProtections,
       call: { request in
@@ -1166,7 +1182,8 @@ public final class DreamRunStore {
   }
 
   private func runLocked(
-    selection: DreamSelectedCall, resume: DreamResumeAction, isLockCreated: Bool,
+    selection: DreamSelectedCall, resume: DreamResumeAction,
+    recoveryTarget: DreamRecoveryTarget?, isLockCreated: Bool,
     sourceRoles: DreamSourceRoles?, excludedSessionIDs: Set<String>,
     prepare: (DreamProgress, DreamFreshSources?) throws -> PreparedSessionBatch,
     protect: (([String]) throws -> Void)?, remainingProtections: (() -> Int)?,
@@ -1254,7 +1271,7 @@ public final class DreamRunStore {
         name == "\(generation).json", generation <= progress.generation
       else { throw DreamRunError.corruption }
     }
-    if resume == .replaceInvalidResponse,
+    if (resume == .replaceInvalidResponse || recoveryTarget != nil),
       !(try admissions.isPresent("\(progress.generation).json"))
     {
       throw DreamRunError.replacementUnavailable
@@ -1359,6 +1376,12 @@ public final class DreamRunStore {
         rendering: .current, directory: directory)
       try save(generation: progress.generation, hash: chain.hash, sealed: sealed)
     }
+    if let recoveryTarget {
+      guard resume == .replaceInvalidResponse,
+        sealed.run.runID == recoveryTarget.runID,
+        sealed.request.requestHash == recoveryTarget.requestHash
+      else { throw DreamRunError.replacementUnavailable }
+    }
     guard sealed.rendering != .scopeV2 else { throw DreamRunError.unsupportedSchema }
     if isRecovered {
       try checkProtection(sealed, excludedSessionIDs: excludedSessionIDs, protect: protect)
@@ -1388,6 +1411,16 @@ public final class DreamRunStore {
         guard attempt.number < ResponseAttempt.maximumReplacements else {
           throw DreamRunError.limitExceeded
         }
+        let previous = try verifiedAttempt(sealed, attempt: attempt)
+        guard let response = previous.response else { throw DreamRunError.missingPayload }
+        let feedback: DreamReplacementFeedback?
+        if sealed.rendering == .priorContextV5 {
+          guard case .failure(let rejection) = DreamDecision.assess(
+            response: response, context: sealed.context, rendering: previous.rendering)
+          else { throw DreamRunError.corruption }
+          feedback = DreamReplacementFeedback(
+            failure: rejection.failure, rendering: previous.rendering)
+        } else { feedback = nil }
         let next = ResponseAttempt(number: attempt.number + 1)
         let rejected = try sealed.directory.read(
           attempt.responseName, maximum: maximumResponseEnvelopeBytes)
@@ -1395,9 +1428,17 @@ public final class DreamRunStore {
           rejected, name: next.archiveName, directory: sealed.directory, isReplacing: false)
         try install(
           DreamRunEncoding.ReplacementIntent(
-            schemaVersion: 2, admissionHash: sealed.admissionHash.rawValue,
+            schemaVersion: feedback == nil ? 2 : 4,
+            admissionHash: sealed.admissionHash.rawValue,
             requestHash: sealed.request.requestHash.rawValue,
-            rejectedResponseHash: SourceDigest(bytes: rejected).rawValue),
+            rejectedResponseHash: SourceDigest(bytes: rejected).rawValue,
+            attemptNumber: feedback == nil ? nil : next.number,
+            rejectedAttemptNumber: feedback == nil ? nil : attempt.number,
+            rejectedCallIntentHash: feedback == nil ? nil : previous.callIntentHash?.rawValue,
+            feedback: feedback, feedbackHash: try feedback.map {
+              SourceDigest(bytes: try $0.bytes()).rawValue
+            },
+            targetRenderingVersion: feedback == nil ? nil : DreamRequestRendering.scopeContractV6.rawValue),
           name: next.intentName, directory: sealed.directory)
         attempt = next
         isReplacementStarted = true
@@ -1430,17 +1471,22 @@ public final class DreamRunStore {
           try persist(bytes, name: name, directory: sealed.directory, isReplacing: false)
         }
       }
+      let prepared = try verifiedAttempt(sealed, attempt: attempt)
+      let request = try attemptReader(sealed).request(
+        attempt: attempt, replacement: prepared.replacement,
+        replacementHash: prepared.replacementHash, selection: selection)
+      let isEffective = prepared.replacement?.schemaVersion == 4
       let intent = DreamRunEncoding.Intent(
-        schemaVersion: 2, admissionHash: sealed.admissionHash.rawValue,
-        requestHash: sealed.request.requestHash.rawValue,
-        selection: selection == sealed.run.selection ? nil : DreamRunEncoding.Selection(selection))
+        schemaVersion: isEffective ? 3 : 2, admissionHash: sealed.admissionHash.rawValue,
+        requestHash: request.requestHash.rawValue,
+        selection: isEffective || selection != sealed.run.selection
+          ? DreamRunEncoding.Selection(selection) : nil,
+        baselineRequestHash: isEffective ? sealed.request.requestHash.rawValue : nil,
+        replacementIntentHash: isEffective ? prepared.replacementHash?.rawValue : nil,
+        attemptNumber: isEffective ? attempt.number : nil)
+      let intentBytes = try bounded(intent)
       try persist(
-        bounded(intent), name: attempt.callName, directory: sealed.directory, isReplacing: true)
-      let request = DreamModelRequest(
-        runID: sealed.request.runID, generation: sealed.request.generation,
-        inputHash: sealed.request.inputHash, contextHash: sealed.request.contextHash,
-        requestHash: sealed.request.requestHash, selection: selection,
-        systemPrompt: sealed.request.systemPrompt, messages: sealed.request.messages)
+        intentBytes, name: attempt.callName, directory: sealed.directory, isReplacing: true)
       let response: DreamCompletedResponse
       do { response = try call(request) } catch is CancellationError {
         return pending(sealed, reason: .cancelled)
@@ -1450,11 +1496,12 @@ public final class DreamRunStore {
         throw DreamRunError.limitExceeded
       }
       let envelope = DreamRunEncoding.BoundResponse(
-        schemaVersion: 2, admissionHash: sealed.admissionHash.rawValue,
+        schemaVersion: isEffective ? 3 : 2, admissionHash: sealed.admissionHash.rawValue,
         runID: sealed.run.runID, generation: sealed.run.progress.generation,
         inputHash: sealed.run.inputHash.rawValue, contextHash: sealed.context.contextHash.rawValue,
-        requestHash: sealed.request.requestHash.rawValue,
-        selection: DreamRunEncoding.Selection(selection), text: response.text)
+        requestHash: request.requestHash.rawValue,
+        selection: DreamRunEncoding.Selection(selection), text: response.text,
+        callIntentHash: isEffective ? SourceDigest(bytes: intentBytes).rawValue : nil)
       try install(envelope, name: attempt.responseName, directory: sealed.directory)
     }
     if try isMemoryChanged(sealed) { return try dropBatch(sealed, chain: chain) }
@@ -2226,12 +2273,11 @@ public final class DreamRunStore {
       else { throw DreamRunError.corruption }
       validated = nil
     } else {
-      guard let durable = try verifiedAttempt(sealed, attempt: attempt).response else {
-        throw DreamRunError.missingPayload
-      }
+      let saved = try verifiedAttempt(sealed, attempt: attempt)
+      guard let durable = saved.response else { throw DreamRunError.missingPayload }
       responseHash = durable.responseHash
       switch DreamDecision.assess(
-        response: durable, context: sealed.context, rendering: sealed.rendering)
+        response: durable, context: sealed.context, rendering: saved.rendering)
       {
       case .success(let result): validated = result
       case .failure(let rejection): throw rejection.error

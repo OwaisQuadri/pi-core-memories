@@ -149,6 +149,7 @@ private struct WorkerStart {
   let globalAgents: URL?
   let selection: DreamSelectedCall
   let resume: DreamResumeAction
+  let recoveryTarget: DreamRecoveryTarget?
   let batchTextBytes: Int
   let deviceKey: String?
   let projectBindings: [String: String]
@@ -156,7 +157,7 @@ private struct WorkerStart {
 
   init(_ object: [String: Any]) throws {
     let optional = Set(object.keys).intersection([
-      "deviceKey", "projectBindings", "excludedSessionIDs",
+      "deviceKey", "projectBindings", "excludedSessionIDs", "recoveryTarget",
     ])
     try WorkerJSON.fields(
       object,
@@ -223,6 +224,18 @@ private struct WorkerStart {
     case "retryInterruptedCall": resume = .retryInterruptedCall
     case "replaceInvalidResponse": resume = .replaceInvalidResponse
     default: throw WorkerError.protocolFailure
+    }
+    if resume == .replaceInvalidResponse {
+      guard let raw = object["recoveryTarget"] as? [String: Any] else {
+        throw WorkerError.protocolFailure
+      }
+      try WorkerJSON.fields(raw, ["runID", "requestHash"])
+      recoveryTarget = try DreamRecoveryTarget(
+        runID: WorkerJSON.identifier(raw, "runID"),
+        requestHash: WorkerJSON.text(raw, "requestHash", maximum: 64))
+    } else {
+      guard object["recoveryTarget"] == nil else { throw WorkerError.protocolFailure }
+      recoveryTarget = nil
     }
   }
 }
@@ -656,7 +669,7 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
     var coverageFrame: [String: Any]?
     var backlog: DreamBacklog?
     let result = try store.run(
-      selection: start.selection, resume: start.resume,
+      selection: start.selection, resume: start.resume, recoveryTarget: start.recoveryTarget,
       sourceRoles: DreamSourceRoles(
         isSnippetsPresent: start.snippets != nil, isPromptsPresent: start.prompts != nil),
       excludedSessionIDs: start.excludedSessionIDs,

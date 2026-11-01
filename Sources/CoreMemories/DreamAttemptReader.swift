@@ -20,6 +20,7 @@ struct VerifiedDreamAttempt {
   let callIntentHash: SourceDigest?
   let selection: DreamSelectedCall?
   let response: DurableDreamResponse?
+  let rendering: DreamRequestRendering
 }
 
 struct DreamAttemptReader {
@@ -40,22 +41,31 @@ struct DreamAttemptReader {
     replacementHash: SourceDigest?, selection: DreamSelectedCall
   ) throws -> DreamModelRequest {
     var messages = baseline.messages
+    var systemPrompt = baseline.systemPrompt
     var hash = baseline.requestHash
-    if let replacement, replacement.schemaVersion == 3 {
-      guard let feedback = replacement.feedback, let replacementHash else {
-        throw DreamRunError.corruption
+    if let replacement, replacement.schemaVersion == 3 || replacement.schemaVersion == 4 {
+      guard let replacementHash else { throw DreamRunError.corruption }
+      if replacement.schemaVersion == 3 {
+        guard let feedback = replacement.feedback else { throw DreamRunError.corruption }
+        messages.append(
+          DreamRequestMessage(
+            role: .user, text: String(decoding: try feedback.bytes(), as: UTF8.self),
+            timestampMilliseconds: messages[0].timestampMilliseconds))
+      } else {
+        guard rendering == .priorContextV5,
+          replacement.targetRenderingVersion == DreamRequestRendering.scopeContractV6.rawValue
+        else { throw DreamRunError.corruption }
+        systemPrompt = context.systemPrompt(rendering: .scopeContractV6)
+        messages = try context.requestMessages(
+          timestampMilliseconds: messages[0].timestampMilliseconds, rendering: .scopeContractV6)
       }
-      messages.append(
-        DreamRequestMessage(
-          role: .user, text: String(decoding: try feedback.bytes(), as: UTF8.self),
-          timestampMilliseconds: messages[0].timestampMilliseconds))
       let bytes = try DreamRunEncoding.encode(
         DreamRunEncoding.EffectiveCall(
           runID: run.runID, generation: run.progress.generation,
           inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
           admissionHash: admissionHash.rawValue, baselineRequestHash: baseline.requestHash.rawValue,
           replacementIntentHash: replacementHash.rawValue, attemptNumber: attempt.number,
-          selection: DreamRunEncoding.Selection(selection), systemPrompt: baseline.systemPrompt,
+          selection: DreamRunEncoding.Selection(selection), systemPrompt: systemPrompt,
           messages: messages))
       guard bytes.count <= limits.maximumFrozenBytes else { throw DreamRunError.limitExceeded }
       hash = SourceDigest(bytes: bytes)
@@ -63,7 +73,7 @@ struct DreamAttemptReader {
     return DreamModelRequest(
       runID: baseline.runID, generation: baseline.generation,
       inputHash: baseline.inputHash, contextHash: baseline.contextHash, requestHash: hash,
-      selection: selection, systemPrompt: baseline.systemPrompt, messages: messages)
+      selection: selection, systemPrompt: systemPrompt, messages: messages)
   }
 
   func verify(visit: (VerifiedDreamAttempt) throws -> Void = { _ in }) throws
@@ -104,19 +114,24 @@ struct DreamAttemptReader {
       else { throw DreamRunError.corruption }
       guard
         case .failure(let rejection) = DreamDecision.assess(
-          response: rejectedResponse, context: context, rendering: rendering)
+          response: rejectedResponse, context: context, rendering: previous.rendering)
       else { throw DreamRunError.corruption }
       switch intent.schemaVersion {
       case 2:
         guard intent.attemptNumber == nil, intent.rejectedAttemptNumber == nil,
-          intent.rejectedCallIntentHash == nil, intent.feedback == nil, intent.feedbackHash == nil
+          intent.rejectedCallIntentHash == nil, intent.feedback == nil, intent.feedbackHash == nil,
+          intent.targetRenderingVersion == nil
         else { throw DreamRunError.corruption }
-      case 3:
-        let feedback = DreamReplacementFeedback(failure: rejection.failure, rendering: rendering)
+      case 3, 4:
+        let feedback = DreamReplacementFeedback(
+          failure: rejection.failure, rendering: previous.rendering)
         guard intent.attemptNumber == number, intent.rejectedAttemptNumber == number - 1,
           intent.rejectedCallIntentHash == previous.callIntentHash?.rawValue,
           intent.feedback == feedback,
-          intent.feedbackHash == SourceDigest(bytes: try feedback.bytes()).rawValue
+          intent.feedbackHash == SourceDigest(bytes: try feedback.bytes()).rawValue,
+          intent.targetRenderingVersion
+            == (intent.schemaVersion == 4 ? DreamRequestRendering.scopeContractV6.rawValue : nil),
+          intent.schemaVersion != 4 || rendering == .priorContextV5
         else { throw DreamRunError.corruption }
       default: throw DreamRunError.unsupportedSchema
       }
@@ -131,16 +146,19 @@ struct DreamAttemptReader {
     attempt: DreamResponseAttempt, replacement: DreamRunEncoding.ReplacementIntent? = nil,
     replacementHash: SourceDigest? = nil
   ) throws -> VerifiedDreamAttempt {
+    let effectiveRendering: DreamRequestRendering =
+      replacement?.schemaVersion == 4 ? .scopeContractV6 : rendering
     guard try directory.isPresent(attempt.callName) else {
       guard !(try directory.isPresent(attempt.responseName)) else { throw DreamRunError.corruption }
       return VerifiedDreamAttempt(
         attempt: attempt, replacement: replacement,
-        replacementHash: replacementHash, callIntentHash: nil, selection: nil, response: nil)
+        replacementHash: replacementHash, callIntentHash: nil, selection: nil, response: nil,
+        rendering: effectiveRendering)
     }
     let callBytes = try directory.read(
       attempt.callName, maximum: DreamRunEncoding.maximumMetadataBytes)
     let call = try DreamRunEncoding.decode(DreamRunEncoding.Intent.self, bytes: callBytes)
-    let isFeedback = replacement?.schemaVersion == 3
+    let isEffective = replacement?.schemaVersion == 3 || replacement?.schemaVersion == 4
     let selection: DreamSelectedCall
     do { selection = try call.selection?.domain() ?? run.selection } catch {
       throw DreamRunError.corruption
@@ -151,7 +169,7 @@ struct DreamAttemptReader {
     guard callBytes == (try DreamRunEncoding.encode(call)),
       call.admissionHash == admissionHash.rawValue, call.requestHash == request.requestHash.rawValue
     else { throw DreamRunError.corruption }
-    if isFeedback {
+    if isEffective {
       guard call.schemaVersion == 3, call.selection != nil,
         call.baselineRequestHash == baseline.requestHash.rawValue,
         call.replacementIntentHash == replacementHash?.rawValue,
@@ -167,8 +185,8 @@ struct DreamAttemptReader {
     if try directory.isPresent(attempt.responseName) {
       let bytes = try directory.read(attempt.responseName, maximum: maximumResponseEnvelopeBytes)
       let bound = try DreamRunEncoding.decode(DreamRunEncoding.BoundResponse.self, bytes: bytes)
-      guard bound.schemaVersion == (isFeedback ? 3 : 2),
-        bound.callIntentHash == (isFeedback ? callHash.rawValue : nil)
+      guard bound.schemaVersion == (isEffective ? 3 : 2),
+        bound.callIntentHash == (isEffective ? callHash.rawValue : nil)
       else { throw DreamRunError.corruption }
       response = try bound.domain(
         run: run, context: context, request: request,
@@ -178,6 +196,6 @@ struct DreamAttemptReader {
     return VerifiedDreamAttempt(
       attempt: attempt, replacement: replacement,
       replacementHash: replacementHash, callIntentHash: callHash, selection: selection,
-      response: response)
+      response: response, rendering: effectiveRendering)
   }
 }

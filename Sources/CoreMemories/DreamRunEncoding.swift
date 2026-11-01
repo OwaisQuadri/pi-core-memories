@@ -51,6 +51,7 @@ enum DreamRunEncoding {
           || ((type == Completion.self || type == Request.self || type == Intent.self
             || type == ReplacementIntent.self || type == BoundResponse.self)
             && schema.schemaVersion == 3)
+          || (type == ReplacementIntent.self && schema.schemaVersion == 4)
           || (type == RecoveryCheckpoint.self && schema.schemaVersion == 1)
       else { throw DreamRunError.unsupportedSchema }
       let value = try decoder.decode(type, from: bytes)
@@ -62,7 +63,8 @@ enum DreamRunEncoding {
         }
         if let intent = value as? ReplacementIntent {
           guard intent.attemptNumber == nil, intent.rejectedAttemptNumber == nil,
-            intent.rejectedCallIntentHash == nil, intent.feedback == nil, intent.feedbackHash == nil
+            intent.rejectedCallIntentHash == nil, intent.feedback == nil, intent.feedbackHash == nil,
+            intent.targetRenderingVersion == nil
           else { throw DreamRunError.corruption }
         }
         if let response = value as? BoundResponse {
@@ -772,6 +774,7 @@ extension DreamRunEncoding {
     var rejectedCallIntentHash: String?
     var feedback: DreamReplacementFeedback?
     var feedbackHash: String?
+    var targetRenderingVersion: Int?
   }
 
   struct EffectiveCall: Encodable {

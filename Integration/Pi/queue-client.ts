@@ -16,7 +16,8 @@ const dreamWriterLockWaitLimitMilliseconds = 300_000;
 const decisionLedgerWaitAndSetupMilliseconds = 30_000;
 const decisionReplyTimeoutMilliseconds = dreamWriterLockWaitLimitMilliseconds + decisionLedgerWaitAndSetupMilliseconds;
 const verifiedCandidatesTimeoutMilliseconds = 120_000;
-const requestTimeoutMilliseconds = new Map([["inventory", verifiedCandidatesTimeoutMilliseconds], ["list", verifiedCandidatesTimeoutMilliseconds], ["reply", decisionReplyTimeoutMilliseconds], ["manage-reply", decisionReplyTimeoutMilliseconds]]);
+export const verifiedCandidateRequestTypes = ["list", "inventory", "claim", "counts", "amend", "recover", "manage-preview", "manage-recover", "relocation-preview", "relocation-reply"];
+const requestTimeoutMilliseconds = new Map([...verifiedCandidateRequestTypes.map((type) => [type, verifiedCandidatesTimeoutMilliseconds] as const), ["reply", decisionReplyTimeoutMilliseconds], ["manage-reply", decisionReplyTimeoutMilliseconds]]);
 function invalid(): never { throw new Error("Native memory response could not be verified. Nothing was approved."); }
 export function queueObject(value: unknown): QueueObject {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return invalid();

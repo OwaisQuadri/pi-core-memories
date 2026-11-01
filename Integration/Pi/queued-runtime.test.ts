@@ -377,7 +377,7 @@ test("a native queue refusal never retries another context", async () => {
 	try {
 		await f.emit("session_start");
 		await assert.rejects(f.tool.execute("refused", { operation: "pending" }, undefined, undefined, f.ctx), /Native queue unavailable/);
-		assert.equal(f.opened.length, 2); assert.equal(f.opened[0]?.length, 2);
+		assert.equal(f.opened.length, 1); assert.equal(f.opened[0]?.length, 2);
 		assert.equal(f.closed.length, 0); assert.equal(f.marks.length, 1);
 	} finally { await f.stop(); }
 });
@@ -389,8 +389,20 @@ test("ordinary conversation keeps the shared queue and the live session marker",
 		assert.doesNotMatch(JSON.stringify(f.tool.parameters), /"review"|"manage"/);
 		assert.deepEqual([...f.tools.keys()].sort(), ["memory_add", "memory_delete", "memory_get", "memory_list", "memory_queue", "memory_update"]);
 		await f.tool.execute("default", { operation: "pending" }, undefined, undefined, f.ctx);
-		assert.equal(f.opened.length, 3); assert.equal(f.opened[0]?.length, 2);
-		assert.equal(f.marks.length, 1); assert.equal(f.closed.length, 3);
+		assert.equal(f.opened.length, 2); assert.equal(f.opened[0]?.length, 2);
+		assert.equal(f.marks.length, 1); assert.equal(f.closed.length, 2);
+	} finally { await f.stop(); }
+});
+
+test("pending and present run the verified queue work once, with at most one count refresh after it", async () => {
+	const f = conversationalRuntime();
+	try {
+		await f.emit("session_start");
+		await f.call("memory_queue", { operation: "pending" });
+		assert.deepEqual(f.frames.map((frame) => frame.type), ["list", "counts"]);
+		f.frames.length = 0;
+		await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
+		assert.deepEqual(f.frames.map((frame) => frame.type), ["claim"]);
 	} finally { await f.stop(); }
 });
 
@@ -829,7 +841,7 @@ test("the pending reminder stays under 16 KB and counts the findings it leaves o
 });
 
 test("an unreadable or hanging queue skips the pending reminder without failing the turn", async () => {
-	const hanging = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderTimeoutMilliseconds: 20,
+	const hanging = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderWaitMilliseconds: 20,
 		open: async (_directory, signal) => ({ request: (type) => type === "list" ? new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) : Promise.resolve({ type: "released" }), close: async () => {} }) });
 	for (const f of [runtime(async () => ({ status: "pending" }) as DreamReport, "tui", new Error("Native queue unavailable."), { idleMilliseconds: 60_000 }), reminderRuntime(() => [], new Error("Native memory service stopped.")), hanging]) {
 		try {
@@ -837,6 +849,38 @@ test("an unreadable or hanging queue skips the pending reminder without failing 
 			assert.equal((await reminderTurns(f)()).reminder, undefined);
 		} finally { await f.stop(); }
 	}
+});
+
+test("a slow pending reminder keeps its own worker alive in the background, holds back queue tools until it ends and reaches the next turn", async () => {
+	const signals: AbortSignal[] = [];
+	let lists = 0;
+	let release!: () => void; const released = new Promise<void>((resolve) => { release = resolve; });
+	const rows = [pendingRow("a".repeat(64), "Late synthetic claim.")];
+	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderWaitMilliseconds: 20,
+		open: async (_directory, signal) => {
+			signals.push(signal);
+			return { request: async (type) => {
+				if (type !== "list") return { type: "counts", review: 0 };
+				const call = ++lists;
+				if (call === 1) await released;
+				if (call === 3) await new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+				return { type: "queue", rows, nextOffset: null };
+			}, close: async () => {} };
+		} });
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		assert.equal((await turn()).reminder, undefined);
+		assert.equal(signals.length, 1); assert.equal(signals[0]!.aborted, false);
+		const pending = f.tool.execute("after-reminder", { operation: "pending" }, undefined, undefined, f.ctx);
+		await sleep(30);
+		assert.equal(signals.length, 1); assert.equal(lists, 1);
+		release();
+		await pending;
+		assert.equal(lists, 2); assert.equal(signals[0]!.aborted, false);
+		assert.match((await turn()).reminder!, /Late synthetic claim\./);
+		assert.equal(lists, 3);
+	} finally { release(); await f.stop(); }
 });
 
 test("a non-interactive run gets no pending reminder", async () => {

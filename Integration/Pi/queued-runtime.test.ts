@@ -71,6 +71,9 @@ function runtime(run: typeof runDreamWorker, mode = "tui", openFailure?: Error, 
 		get tool() { assert.ok(registeredTool); return registeredTool; },
 		emit: async (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx) };
 }
+async function until(condition: () => boolean | Promise<boolean>, failure: string): Promise<void> {
+	for (const deadline = Date.now() + 5_000; !(await condition()); await sleep(1)) if (Date.now() > deadline) assert.fail(failure);
+}
 const archivedRequest = (start: DreamStart, session = "archived"): DreamRequest => ({ version: 1, type: "modelRequest", invocationID: start.invocationID, requestID: "request", runID: "run", generation: "1", inputHash: "a".repeat(64), contextHash: "b".repeat(64), requestHash: "c".repeat(64), selection: start.selection, systemPrompt: "Synthetic status test", messages: [{ role: "user", text: JSON.stringify({ primaryEvidence: [{ source: { session, entry: "entry", part: 0 } }] }), timestampMilliseconds: 0 }] });
 
 test("dreaming keeps running while this window works and reports the blocked reason without details", async () => {
@@ -94,10 +97,10 @@ test("dreaming keeps running while this window works and reports the blocked rea
 		await f.emit("input", { source: "interactive", text: "keep working" }); await f.emit("before_agent_start"); await f.emit("tool_execution_start");
 		assert.equal(workerSignal!.aborted, false);
 		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active");
-		release(); await sleep(30);
+		const path = join(stateDirectory, "last-dream-blocked.json");
+		release(); await until(() => stat(path).then(() => true, () => false), "No blocked report");
 		assert.equal(runs, 2);
 		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: blocked, reason: sourceProtection:invalidReply, message: "Native dream worker blocked the run")');
-		const path = join(stateDirectory, "last-dream-blocked.json");
 		assert.equal((await stat(path)).mode & 0o777, 0o600);
 		const { time, ...recorded } = JSON.parse(await readFile(path, "utf8"));
 		assert.ok(!Number.isNaN(Date.parse(time)));
@@ -109,7 +112,7 @@ test("dreaming keeps running while this window works and reports the blocked rea
 for (const mode of ["print", "rpc"]) {
 	test(`a ${mode} session with a session file writes a live marker but never dreams`, async () => {
 		const f = runtime(async () => assert.fail("Non-interactive sessions must not dream"), mode);
-		try { await f.emit("session_start"); await sleep(30); assert.deepEqual(f.marks, ["session"]); }
+		try { await f.emit("session_start"); await until(() => f.marks.length > 0, "No live marker"); assert.deepEqual(f.marks, ["session"]); }
 		finally { await f.stop(); }
 		assert.deepEqual(f.unmarks, ["session"]);
 	});
@@ -122,10 +125,9 @@ test("the footer combines dream state with the nonzero review count from the nat
 		open: async () => ({ request: async (type: string) => { seen.push(f.statuses.get("pi-core-memories:dream")!); assert.equal(type, "counts"); return { type: "counts", review: 2 }; }, close: async () => {} }) as unknown as Awaited<ReturnType<typeof openQueueClient>>,
 	});
 	try {
-		await f.emit("session_start"); await sleep(30);
+		await f.emit("session_start");
+		await until(() => f.statuses.get("pi-core-memories:dream") === "dreaming: active \u00b7 2 to review", "No review count in the footer");
 		assert.equal(seen[0], "dreaming: active");
-		assert.equal(f.statuses.get("pi-core-memories:dream"), "dreaming: active \u00b7 2 to review");
-		release(); await sleep(5);
 	} finally { release(); await f.stop(); }
 });
 
@@ -138,7 +140,8 @@ test("live sessions are excluded at start and a session that opens mid-run block
 		return { status: "noNewRecords" } as DreamReport;
 	}, "tui", undefined, { call: async () => { calls++; return "{}"; } });
 	try {
-		await f.emit("session_start"); await sleep(30);
+		await f.emit("session_start");
+		await until(() => /error\(code: workerFailure,/.test(f.statuses.get("pi-core-memories:dream") ?? ""), "No worker failure");
 		assert.deepEqual(excluded.slice(0, 2), ["another-live-session", "session"]);
 		assert.equal(calls, 0);
 		assert.match(f.statuses.get("pi-core-memories:dream")!, /error\(code: workerFailure,/);
@@ -161,7 +164,8 @@ test("an interrupted call after a restart is retried under its recorded selectio
 	}, "tui", undefined, { call: async () => { calls++; return "{}"; } });
 	const footer = footerHistory(f.ctx);
 	try {
-		await f.emit("session_start"); await sleep(60);
+		await f.emit("session_start");
+		await until(() => calls === 1 && f.statuses.get("pi-core-memories:dream") === "dreaming: idle", "No retried call");
 		assert.deepEqual(starts.slice(0, 2).map((start) => start.resume), ["inspectOrContinue", "retryInterruptedCall"]);
 		assert.deepEqual(starts[1]!.selection, starts[0]!.selection);
 		assert.equal(calls, 1);
@@ -179,11 +183,13 @@ test("an interrupted call is never retried under another selection and shows its
 	});
 	const footer = footerHistory(f.ctx);
 	try {
-		await f.emit("session_start"); await sleep(40);
+		await f.emit("session_start");
+		await until(() => f.statuses.get("pi-core-memories:dream")?.startsWith("dreaming: error(code: interruptedCall,") ?? false, "No interrupted call status");
 		assert.deepEqual(starts.map((start) => start.resume), ["inspectOrContinue"]);
 		assert.equal(f.statuses.get("pi-core-memories:dream"), 'dreaming: error(code: interruptedCall, message: "Interrupted dream needs the model it started with: anthropic/recorded, thinking low")');
 		Object.assign(f.ctx, { model: { provider: "anthropic", id: "recorded", contextWindow: 262_144 }, thinkingLevel: "low" });
-		await f.emit("model_select"); await sleep(40);
+		await f.emit("model_select");
+		await until(() => starts.length >= 3, "No retry under the recorded selection");
 		assert.deepEqual(starts.slice(0, 3).map((start) => start.resume), ["inspectOrContinue", "inspectOrContinue", "retryInterruptedCall"]);
 		assert.deepEqual(starts[2]!.selection, recorded);
 		assert.ok(!footer.includes("dreaming: paused"));
@@ -452,8 +458,8 @@ for (const cancellation of ["tool abort", "user input"] as const) {
 			await reminderTurns(f)();
 			const controller = new AbortController();
 			const call = f.tool.execute("cancelled", { operation: "pending" }, controller.signal, undefined, f.ctx);
-			await sleep(10);
-			assert.equal(reminder.signal?.aborted, true); assert.equal(reminder.isClosed, false);
+			await until(() => reminder.signal?.aborted === true, "The reminder read was not stopped");
+			assert.equal(reminder.isClosed, false);
 			if (cancellation === "tool abort") controller.abort(); else await f.emit("input", { text: "Stop that.", source: "interactive" });
 			await promptly(assert.rejects(call));
 			releaseClose();

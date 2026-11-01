@@ -1366,8 +1366,9 @@ enum DreamRequestRendering: Int, Sendable {
   case connectedV3 = 3
   case stuckDetectionV4 = 4
   case priorContextV5 = 5
+  case scopeContractV6 = 6
 
-  static let current = Self.priorContextV5
+  static let current = Self.scopeContractV6
 
   var isConnected: Bool { rawValue >= Self.connectedV3.rawValue }
 }
@@ -1376,7 +1377,7 @@ extension DreamDecisionContext {
   func requestMessages(
     timestampMilliseconds: Int64, rendering: DreamRequestRendering = .current
   ) throws -> [DreamRequestMessage] {
-    guard rendering == .priorContextV5 || priorContext == nil else {
+    guard rendering == .priorContextV5 || rendering == .scopeContractV6 || priorContext == nil else {
       throw DreamRunError.corruption
     }
     guard
@@ -1459,7 +1460,7 @@ extension DreamDecisionContext {
             "sourceWorkingDirectory": .string(mapping.projectScope ?? ""),
             "isWorkingDirectoryPresent": .integer(mapping.projectScope == nil ? 0 : 1),
           ]
-          if rendering == .scopeV2 {
+          if rendering == .scopeV2 || rendering == .scopeContractV6 {
             fields["allowedNoChangeReasons"] = .array(
               DreamNoChangeReason.allowed(for: mapping.resolution).map { .string($0.rawValue) })
             fields["eligibleProposalScopes"] = .array(
@@ -1483,7 +1484,7 @@ extension DreamDecisionContext {
           DreamRunEncoding.encode(rejectedPredecessors))
       }
     }
-    if rendering == .priorContextV5 {
+    if rendering == .priorContextV5 || rendering == .scopeContractV6 {
       payloadFields["priorDreamNotesNotPrimaryEvidence"] = .object([
         "notes": try DecisionJSON.parse(DreamRunEncoding.encode(priorContext?.notes ?? [])),
         "omitted": try DecisionJSON.parse(
@@ -1547,7 +1548,7 @@ extension DreamDecisionContext {
       ]))
     let sources = array(source, isNonempty: true)
     let reasonSchema: DecisionJSON
-    if rendering != .scopeV2 {
+    if rendering != .scopeV2 && rendering != .scopeContractV6 {
       reasonSchema = .object([
         "enum": .array(
           ["notDurable", "alreadyRepresented", "insufficientEvidence", "unresolvedScope"].map {
@@ -1618,7 +1619,7 @@ extension DreamDecisionContext {
     case .scopeV2: prompt = Self.legacySystemPrompt + "\n" + Self.scopeContract
     case .connectedV3: prompt = Self.systemPrompt
     case .stuckDetectionV4: prompt = Self.systemPrompt + "\n" + Self.stuckDetectionGuidance
-    case .priorContextV5:
+    case .priorContextV5, .scopeContractV6:
       prompt =
         Self.systemPrompt + "\n" + Self.stuckDetectionGuidance + "\n" + Self.priorContextContract
     }

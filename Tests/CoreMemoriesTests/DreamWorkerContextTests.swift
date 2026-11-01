@@ -225,7 +225,69 @@ func dreamWorkerRejectedCatalogueRegisteredSecretBlocksFreshAndReplay(isReplay: 
   try retry.finish()
 }
 
-@Test func dreamPriorContextCountsOlderLiveNotesBeforeBudgetOmissions() throws {
+@Test func dreamWorkerFiltersLiveNotesBeforeRetainingNewestForty() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let oldRoot = fixture.root.appendingPathComponent("old")
+  try FileManager.default.createDirectory(at: oldRoot, withIntermediateDirectories: true)
+  try fixture.populate(texts: ["Old live source."], cwd: oldRoot.path)
+  for index in 0..<42 {
+    let session = index == 0 ? "one" : String(format: "s%02d", index)
+    if index > 0 {
+      let sessionRoot = fixture.root.appendingPathComponent(session)
+      try FileManager.default.createDirectory(at: sessionRoot, withIntermediateDirectories: true)
+      try fixture.write(
+        dreamHeader(session, cwd: sessionRoot.path, name: nil) + "\n"
+          + dreamUser("u", nil, dreamOld, "Source \(session).") + "\n",
+        file: fixture.sessions.appendingPathComponent("--fixture--/\(session).jsonl"))
+    }
+    let worker = try DreamWorkerProcess()
+    defer { worker.clean() }
+    try worker.send(workerStart(fixture))
+    let request = try worker.frame()
+    let primary = try #require(workerContext(request)["primaryEvidence"] as? [[String: Any]])
+    let source = try #require(primary.first?["source"] as? [String: Any])
+    #expect(primary.count == 1)
+    #expect(source["session"] as? String == session)
+    let explanation = session == "one" ? "LIVE_OLD_NOTE_TEXT"
+      : session == "s40" ? "LIVE_NEW_NOTE_TEXT" : "Note \(session)."
+    let response = try JSONSerialization.data(
+      withJSONObject: [
+        "schemaVersion": 1, "contextHash": request["contextHash"]!,
+        "decisions": [[
+          "kind": "noChange", "sources": [source], "reasonCode": "notDurable",
+          "explanation": explanation,
+        ]],
+      ], options: [.sortedKeys, .withoutEscapingSlashes])
+    try worker.send(workerReply(request, text: String(decoding: response, as: UTF8.self)))
+    #expect(try worker.frame()["status"] as? String == "completed")
+    try worker.finish()
+  }
+  try workerContextSession(fixture, text: "Current source.")
+  let second = try DreamWorkerProcess()
+  defer { second.clean() }
+  var start = workerStart(fixture)
+  start["excludedSessionIDs"] = ["one", "s40"]
+  try second.send(start)
+  let request = try second.frame()
+  let context = try workerContext(request)
+  let prior = try #require(context["priorDreamNotesNotPrimaryEvidence"] as? [String: Any])
+  let notes = try #require(prior["notes"] as? [[String: Any]])
+  #expect(notes.count == 40)
+  #expect(notes.first?["explanation"] as? String == "Note s41.")
+  #expect(notes.last?["explanation"] as? String == "Note s01.")
+  #expect((prior["omitted"] as? [String: Any])?["overBudget"] as? Int == 0)
+  #expect((prior["omitted"] as? [String: Any])?["liveSession"] as? Int == 2)
+  #expect((prior["omitted"] as? [String: Any])?["unverifiedSource"] as? Int == 0)
+  let saved = try Data(contentsOf: fixture.payload("request.json", generation: 42))
+  #expect(!String(decoding: saved, as: UTF8.self).contains("LIVE_OLD_NOTE_TEXT"))
+  #expect(!String(decoding: saved, as: UTF8.self).contains("LIVE_NEW_NOTE_TEXT"))
+  try second.send(workerReply(request, text: workerDecision(request)))
+  #expect(try second.frame()["status"] as? String == "completed")
+  try second.finish()
+}
+
+@Test func dreamPriorContextCountsOlderAndNewestLiveNotesBeforeBudgetOmissions() throws {
   let history = (0..<42).map { index in
     DreamPriorCandidate(
       item: DreamPriorNote(
@@ -235,13 +297,15 @@ func dreamWorkerRejectedCatalogueRegisteredSecretBlocksFreshAndReplay(isReplay: 
   }
   let context = try #require(
     try DreamPriorContext(
-      newestNotes: Array(history.suffix(DreamPriorContext.maximumNotes)), olderNoteCount: 2,
-      olderLiveNoteCount: 1, newestFindings: [], excludedSessionIDs: ["s0"],
+      newestNotes: history.filter { $0.sessions != ["s0"] && $0.sessions != ["s40"] },
+      olderNoteCount: 2, olderLiveNoteCount: 2, newestFindings: [],
+      excludedSessionIDs: ["s0", "s40"],
       isVerified: { !$0.contains("--fixture--/s2.jsonl") }))
   #expect(context.notes.count == 39)
-  #expect(context.notes.first?.explanation == "Note 3.")
+  #expect(context.notes.first?.explanation == "Note 1.")
+  #expect(context.notes.last?.explanation == "Note 41.")
   #expect(context.omittedNotes == DreamPriorOmissions(
-    overBudget: 1, liveSession: 1, unverifiedSource: 1))
+    overBudget: 0, liveSession: 2, unverifiedSource: 1))
   #expect(context.isWithinBudget)
 }
 

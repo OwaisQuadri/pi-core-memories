@@ -266,6 +266,10 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
     fixture.store().run(
       selection: fixture.selection, prepare: transactionUncalledPrepare,
       call: transactionUncalled), reason: .interruptedCall)
+  let inspected = try DreamInspection.read(stateRoot: fixture.state)
+  let saved = try #require(inspected.runs.first { $0.id == pending.runID })
+  #expect(saved.attempts.first?.status == "Rejected reply")
+  #expect(saved.attempts.first?.diagnostic == "Reply exceeds a frozen validation limit")
 
   let currentIntent = DreamRunEncoding.ReplacementIntent(
     schemaVersion: 5, admissionHash: intent.admissionHash,

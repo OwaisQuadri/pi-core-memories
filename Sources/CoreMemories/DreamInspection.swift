@@ -126,15 +126,19 @@ package struct DreamInspection: Codable, Sendable {
       directory: directory, run: run, context: context, baseline: request,
       rendering: verifiedRequest.rendering,
       admissionHash: SourceDigest(bytes: admissionBytes), limits: limits)
-    var attempts: [SavedDreamAttempt] = []
-    _ = try reader.verify { attempt in
-      guard let selection = attempt.selection else { return }
+    var verifiedAttempts: [VerifiedDreamAttempt] = []
+    _ = try reader.verify { verifiedAttempts.append($0) }
+    let attempts = verifiedAttempts.enumerated().compactMap { index, attempt -> SavedDreamAttempt? in
+      guard let selection = attempt.selection else { return nil }
+      let nextVersion = verifiedAttempts.indices.contains(index + 1)
+        ? verifiedAttempts[index + 1].replacement?.schemaVersion : nil
       var status = "No saved reply"
       var suggestionCount: Int?
       var diagnostic: String?
       if let response = attempt.response {
         switch DreamDecision.assess(
-          response: response, context: context, rendering: attempt.rendering)
+          response: response, context: context, rendering: attempt.rendering,
+          isHistoricalNoChangeLimitEnforced: nextVersion == 2 || nextVersion == 3)
         {
         case .success(let result):
           suggestionCount = result.plans.count
@@ -150,11 +154,10 @@ package struct DreamInspection: Codable, Sendable {
           }
         }
       }
-      attempts.append(
-        SavedDreamAttempt(
-          number: attempt.attempt.number, provider: selection.provider,
-          modelID: selection.modelID, thinkingLevel: selection.thinkingLevel,
-          status: status, suggestionCount: suggestionCount, diagnostic: diagnostic))
+      return SavedDreamAttempt(
+        number: attempt.attempt.number, provider: selection.provider,
+        modelID: selection.modelID, thinkingLevel: selection.thinkingLevel,
+        status: status, suggestionCount: suggestionCount, diagnostic: diagnostic)
     }
     return SavedDreamRun(
       id: id, generation: run.progress.generation, approvedBase: run.approvedBase,

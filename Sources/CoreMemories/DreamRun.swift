@@ -1825,9 +1825,15 @@ public final class DreamRunStore {
       if Data(canonical.path.utf8) != Data(file.path.utf8) {
         guard attempted.insert(Data(canonical.path.utf8)).inserted else { return nil }
       }
-      let directory = open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+      var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
       guard directory >= 0 else { throw DreamRunError.unsafeState }
       defer { _ = close(directory) }
+      for component in parent.pathComponents.dropFirst() {
+        let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard next >= 0 else { throw DreamRunError.unsafeState }
+        _ = close(directory)
+        directory = next
+      }
       var status = stat()
       if fstatat(directory, file.lastPathComponent, &status, AT_SYMLINK_NOFOLLOW) != 0 {
         guard errno == ENOENT else { throw DreamRunError.unsafeState }

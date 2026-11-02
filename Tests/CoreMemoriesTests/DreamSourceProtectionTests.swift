@@ -215,6 +215,14 @@ func sourceProtectionProtectedOwnerIsSkippedWithoutBlockingDream(isParentLinked:
       continue
     }
     try #require(frame["type"] as? String == "modelRequest")
+    let messages = try #require(frame["messages"] as? [[String: Any]])
+    let text = try #require(messages.first?["text"] as? String)
+    let context = try #require(
+      JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    let limitations = try #require(context["limitations"] as? [String])
+    #expect(
+      limitations.contains(
+        "A protected local instruction-owner file was not opened; owner coverage is incomplete."))
     try worker.send(workerReply(frame, text: workerDecision(frame)))
   }
   try worker.finish()

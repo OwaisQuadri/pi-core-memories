@@ -178,15 +178,23 @@ func sourceProtectionChangedRawOrAuthorityBytesBlockBeforeFreeze(target: String)
     })
 }
 
-@Test
-func sourceProtectionProtectedOwnerIsSkippedWithoutBlockingDream() throws {
+@Test(arguments: [false, true])
+func sourceProtectionProtectedOwnerIsSkippedWithoutBlockingDream(isParentLinked: Bool) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   try fixture.populate()
   let owner = fixture.root.appendingPathComponent("AGENTS.md")
-  try fixture.write("Follow author-policy.md.\n", file: owner)
-  try fixture.write(
-    "SYNTHETIC_PROTECTED_OWNER", file: fixture.root.appendingPathComponent("author-policy.md"))
+  let locator = isParentLinked ? "safe-link/policy.md" : "author-policy.md"
+  let protectedOwner = isParentLinked
+    ? fixture.root.appendingPathComponent("credentials/policy.md")
+    : fixture.root.appendingPathComponent(locator)
+  try fixture.write("SYNTHETIC_PROTECTED_OWNER", file: protectedOwner)
+  if isParentLinked {
+    try FileManager.default.createSymbolicLink(
+      at: fixture.root.appendingPathComponent("safe-link"),
+      withDestinationURL: protectedOwner.deletingLastPathComponent())
+  }
+  try fixture.write("Follow \(locator).\n", file: owner)
   var start = workerStart(fixture)
   var roots = start["roots"] as! [String: Any]
   roots["globalAgents"] = owner.path

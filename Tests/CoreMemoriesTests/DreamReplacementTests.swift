@@ -230,16 +230,29 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
     }, reason: .invalidDecision)
   let request = try #require(baselineRequest)
   let requestHash = SourceDigest(bytes: try Data(contentsOf: fixture.payload("request.json")))
-  _ = try transactionPending(
-    fixture.store().run(
+  let interrupted = try fixture.store()
+  interrupted.persistenceFault = {
+    if $0 == .afterDirectorySync("replacement-1.json") { throw POSIXError(.EIO) }
+  }
+  #expect(throws: DreamRunError.persistenceFailure) {
+    try interrupted.run(
       selection: fixture.selection, resume: .replaceInvalidResponse,
       recoveryTarget: DreamRecoveryTarget(runID: pending.runID, requestHash: requestHash.rawValue),
-      prepare: transactionUncalledPrepare, call: { _ in throw CancellationError() }),
-    reason: .cancelled)
+      prepare: transactionUncalledPrepare, call: transactionUncalled)
+  }
   let intentURL = try fixture.payload("replacement-1.json")
   let intent = try DreamRunEncoding.decode(
     DreamRunEncoding.ReplacementIntent.self, bytes: Data(contentsOf: intentURL))
   #expect(intent.schemaVersion == 5)
+  let notStarted = try DreamInspection.read(stateRoot: fixture.state)
+  let waiting = try #require(notStarted.runs.first { $0.id == pending.runID })
+  #expect(waiting.attempts.map(\.status) == ["Rejected reply", "Call not started"])
+  #expect(waiting.attempts.last?.provider == nil)
+  _ = try transactionPending(
+    fixture.store().run(
+      selection: fixture.selection, resume: .retryInterruptedCall,
+      prepare: transactionUncalledPrepare, call: { _ in throw CancellationError() }),
+    reason: .cancelled)
   _ = try transactionPending(
     fixture.store().run(
       selection: fixture.selection, prepare: transactionUncalledPrepare,

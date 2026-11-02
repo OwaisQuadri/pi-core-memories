@@ -11,9 +11,9 @@ package struct DreamArtifact: Codable, Sendable, Identifiable {
 
 package struct SavedDreamAttempt: Codable, Sendable, Identifiable {
   package let number: Int
-  package let provider: String
-  package let modelID: String
-  package let thinkingLevel: String
+  package let provider: String?
+  package let modelID: String?
+  package let thinkingLevel: String?
   package let status: String
   package let suggestionCount: Int?
   package let diagnostic: String?
@@ -128,11 +128,10 @@ package struct DreamInspection: Codable, Sendable {
       admissionHash: SourceDigest(bytes: admissionBytes), limits: limits)
     var verifiedAttempts: [VerifiedDreamAttempt] = []
     _ = try reader.verify { verifiedAttempts.append($0) }
-    let attempts = verifiedAttempts.enumerated().compactMap { index, attempt -> SavedDreamAttempt? in
-      guard let selection = attempt.selection else { return nil }
+    let attempts = verifiedAttempts.enumerated().map { index, attempt -> SavedDreamAttempt in
       let nextVersion = verifiedAttempts.indices.contains(index + 1)
         ? verifiedAttempts[index + 1].replacement?.schemaVersion : nil
-      var status = "No saved reply"
+      var status = attempt.selection == nil ? "Call not started" : "No saved reply"
       var suggestionCount: Int?
       var diagnostic: String?
       if let response = attempt.response {
@@ -155,8 +154,8 @@ package struct DreamInspection: Codable, Sendable {
         }
       }
       return SavedDreamAttempt(
-        number: attempt.attempt.number, provider: selection.provider,
-        modelID: selection.modelID, thinkingLevel: selection.thinkingLevel,
+        number: attempt.attempt.number, provider: attempt.selection?.provider,
+        modelID: attempt.selection?.modelID, thinkingLevel: attempt.selection?.thinkingLevel,
         status: status, suggestionCount: suggestionCount, diagnostic: diagnostic)
     }
     return SavedDreamRun(

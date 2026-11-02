@@ -121,8 +121,12 @@ struct DreamsView: View {
               ForEach(run.attempts) { attempt in
                 VStack(alignment: .leading, spacing: 5) {
                   Text("Attempt \(attempt.number + 1) · \(attempt.status)").fontWeight(.medium)
-                  Text("\(attempt.provider) / \(attempt.modelID) / \(attempt.thinkingLevel)")
-                    .font(.caption).textSelection(.enabled)
+                  if let provider = attempt.provider, let modelID = attempt.modelID,
+                    let thinkingLevel = attempt.thinkingLevel
+                  {
+                    Text("\(provider) / \(modelID) / \(thinkingLevel)")
+                      .font(.caption).textSelection(.enabled)
+                  }
                   if let diagnostic = attempt.diagnostic {
                     Text(diagnostic).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
                   }

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -230,6 +231,27 @@ func sourceProtectionProtectedOwnerIsSkippedWithoutBlockingDream(isParentLinked:
     (try fixture.snapshot(fixture.state)).values.allSatisfy {
       !String(decoding: $0.bytes, as: UTF8.self).contains("SYNTHETIC_PROTECTED_OWNER")
     })
+}
+
+@Test
+func sourceProtectionSwappedAncestorCannotOpenProtectedOwnerDirectory() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let checked = fixture.root.appendingPathComponent("safe/nested")
+  try FileManager.default.createDirectory(at: checked, withIntermediateDirectories: true)
+  try fixture.write(
+    "SYNTHETIC_PROTECTED_OWNER",
+    file: fixture.root.appendingPathComponent("credentials/nested/policy.md"))
+  try FileManager.default.moveItem(
+    at: checked.deletingLastPathComponent(),
+    to: fixture.root.appendingPathComponent("moved"))
+  try FileManager.default.createSymbolicLink(
+    at: checked.deletingLastPathComponent(),
+    withDestinationURL: fixture.root.appendingPathComponent("credentials"))
+  #expect(throws: DreamRunError.unsafeState) {
+    let directory = try DreamRunStore.openCanonicalDirectory(checked)
+    _ = close(directory)
+  }
 }
 
 @Test(arguments: [".env", "auth.json", "credentials.md", "unknown"])

@@ -1825,15 +1825,8 @@ public final class DreamRunStore {
       if Data(canonical.path.utf8) != Data(file.path.utf8) {
         guard attempted.insert(Data(canonical.path.utf8)).inserted else { return nil }
       }
-      var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-      guard directory >= 0 else { throw DreamRunError.unsafeState }
+      let directory = try Self.openCanonicalDirectory(parent)
       defer { _ = close(directory) }
-      for component in parent.pathComponents.dropFirst() {
-        let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard next >= 0 else { throw DreamRunError.unsafeState }
-        _ = close(directory)
-        directory = next
-      }
       var status = stat()
       if fstatat(directory, file.lastPathComponent, &status, AT_SYMLINK_NOFOLLOW) != 0 {
         guard errno == ENOENT else { throw DreamRunError.unsafeState }
@@ -2757,6 +2750,18 @@ public final class DreamRunStore {
     guard let path = realpath(url.path, nil) else { throw DreamRunError.unsafeState }
     defer { free(path) }
     return URL(fileURLWithPath: String(cString: path))
+  }
+
+  static func openCanonicalDirectory(_ url: URL) throws -> Int32 {
+    var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard directory >= 0 else { throw DreamRunError.unsafeState }
+    for component in url.pathComponents.dropFirst() {
+      let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+      _ = close(directory)
+      guard next >= 0 else { throw DreamRunError.unsafeState }
+      directory = next
+    }
+    return directory
   }
 
   private static func isWithin(_ child: URL, _ parent: URL) -> Bool {

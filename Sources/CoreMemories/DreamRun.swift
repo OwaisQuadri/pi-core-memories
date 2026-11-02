@@ -1805,7 +1805,7 @@ public final class DreamRunStore {
     var totalBytes = 0
     func captureOwner(_ file: URL, scope: DreamMemoryScope) throws -> String? {
       guard !DreamSourceProtection.isProtectedPath(file.path) else {
-        throw DreamSourceProtectionError.blocked
+        throw DreamSourceProtectionError.protectedPath
       }
       guard attempted.insert(Data(file.path.utf8)).inserted else { return nil }
       let parent: URL

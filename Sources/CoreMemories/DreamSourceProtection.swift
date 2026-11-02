@@ -1,7 +1,31 @@
 import Foundation
 
+package enum RedactionRefusal: String, Sendable {
+  case notReady = "not-ready"
+  case unavailable, timeout, cancelled
+  case invalidInput = "invalid-input"
+  case invalidOutput = "invalid-output"
+  case failed
+}
+
 package enum DreamSourceProtectionError: Error, Equatable, Sendable {
-  case unavailable, blocked, changed, limitExceeded, requestLimit, timeout, cancelled, invalidReply
+  case unavailable, changed, limitExceeded, requestLimit, timeout, cancelled, invalidReply
+  case invalidToolCall, protectedRead, invalidSourceText, missingProvenance
+  case invalidRecord, protectedPath
+  case redaction(RedactionRefusal)
+
+  package var reason: String {
+    switch self {
+    case .redaction(.notReady): "redactionNotReady"
+    case .redaction(.unavailable): "redactionUnavailable"
+    case .redaction(.timeout): "redactionTimeout"
+    case .redaction(.cancelled): "redactionCancelled"
+    case .redaction(.invalidInput): "redactionInvalidInput"
+    case .redaction(.invalidOutput): "redactionInvalidOutput"
+    case .redaction(.failed): "redactionFailed"
+    default: String(describing: self)
+    }
+  }
 }
 
 package enum DreamSourceProtection {
@@ -90,11 +114,11 @@ package enum DreamSourceProtection {
         where block["type"] as? String == "toolCall" {
           guard let id = block["id"] as? String, calls[id] == nil,
             let name = block["name"] as? String
-          else { throw DreamSourceProtectionError.blocked }
+          else { throw DreamSourceProtectionError.invalidToolCall }
           if name == "read" {
             guard let arguments = block["arguments"] as? [String: Any],
               let path = arguments["path"] as? String
-            else { throw DreamSourceProtectionError.blocked }
+            else { throw DreamSourceProtectionError.invalidToolCall }
             calls[id] = (name, isProtectedPath(path))
           } else {
             calls[id] = (name, false)
@@ -114,12 +138,14 @@ package enum DreamSourceProtection {
   }
 
   static func requireAdmissibleReadProvenance(_ records: [[String: Any]]) throws {
-    guard try omittedReadResults(records).isEmpty else { throw DreamSourceProtectionError.blocked }
+    guard try omittedReadResults(records).isEmpty else {
+      throw DreamSourceProtectionError.protectedRead
+    }
   }
 
   static func text(_ bytes: Data) throws -> String {
     guard let text = String(data: bytes, encoding: .utf8) else {
-      throw DreamSourceProtectionError.blocked
+      throw DreamSourceProtectionError.invalidSourceText
     }
     return text
   }
@@ -154,7 +180,9 @@ package enum DreamSourceProtection {
       pieces.append(selection.question)
       pieces += selection.agentWrittenSelectedLabels
     }
-    guard let provenance = batch.provenance else { throw DreamSourceProtectionError.blocked }
+    guard let provenance = batch.provenance else {
+      throw DreamSourceProtectionError.missingProvenance
+    }
     for input in provenance.stripping {
       pieces += [input.name, try text(input.bytes)]
     }

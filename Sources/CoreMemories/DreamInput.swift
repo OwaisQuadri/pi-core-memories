@@ -610,7 +610,7 @@ extension SessionReader {
         try beforeRead(folder.appendingPathComponent(name))
         guard !DreamSourceProtection.isProtectedPath(folder.appendingPathComponent(name).path)
         else {
-          throw DreamSourceProtectionError.blocked
+          throw DreamSourceProtectionError.protectedPath
         }
         originals.append(try directory.capture(name, isFollowingLinks: true))
       }

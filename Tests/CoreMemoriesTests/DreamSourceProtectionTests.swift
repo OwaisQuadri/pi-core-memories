@@ -167,7 +167,8 @@ func sourceProtectionChangedRawOrAuthorityBytesBlockBeforeFreeze(target: String)
   #expect(final["status"] as? String == "blocked")
   #expect(
     final["reason"] as? String
-      == (target == "ownerBlocked" ? "sourceProtection:blocked" : "sourceProtection:changed"))
+      == (target == "ownerBlocked"
+        ? "sourceProtection:redactionUnavailable" : "sourceProtection:changed"))
   try worker.finish()
   #expect(try fixture.protectedState() == originals)
   let state = try fixture.snapshot(fixture.state)
@@ -232,7 +233,7 @@ func sourceProtectionProtectedReadNeverSendsBodyToHostOrFreezesIt(path: String) 
       "content": "SYNTHETIC_BODY",
     ]
   ]
-  #expect(throws: DreamSourceProtectionError.blocked) {
+  #expect(throws: DreamSourceProtectionError.protectedRead) {
     try DreamSourceProtection.requireAdmissibleReadProvenance([call, result])
   }
 }

@@ -308,6 +308,28 @@ func dreamWorkerCompletesOneGenerationAndRepeatMakesNoRequest(isProposal: Bool) 
   try recovery.finish()
 }
 
+@Test func dreamWorkerReportsRedactionRefusalCode() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  worker.isProtectingAutomatically = false
+  try worker.send(workerStart(fixture))
+  let request = try worker.frame()
+  #expect(request["type"] as? String == "sourceProtectionRequest")
+  try worker.send([
+    "version": 1, "type": "sourceProtectionResult", "invocationID": request["invocationID"]!,
+    "requestID": request["requestID"]!, "inputDigest": request["inputDigest"]!,
+    "status": "blocked", "code": "unavailable",
+  ])
+  let final = try worker.frame()
+  #expect(final["status"] as? String == "blocked")
+  #expect(final["reason"] as? String == "sourceProtection:redactionUnavailable")
+  #expect(final["detail"] is NSNull)
+  try worker.finish()
+}
+
 private enum PrivateMirrorError: Error, CustomReflectable {
   case failure(String)
 

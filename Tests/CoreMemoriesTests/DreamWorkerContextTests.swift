@@ -42,7 +42,7 @@ private func workerContextReject(_ fixture: TransactionFixture, claim: String? =
 }
 
 @Test(arguments: ["fresh", "replay", "catalogue-only-replay"])
-func dreamWorkerHistoricalLiveExclusionPrecedesProtectionAndFrozenReplay(mode: String) throws {
+func dreamWorkerHistoricalLiveExclusionPrecedesProtectionOnFreshAndReplay(mode: String) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   try fixture.populate(texts: [String(repeating: "OLD_SESSION_SENTINEL ", count: 10)])
@@ -83,8 +83,6 @@ func dreamWorkerHistoricalLiveExclusionPrecedesProtectionAndFrozenReplay(mode: S
   try first.send(workerReply(request, category: "failed"))
   #expect(try first.frame()["status"] as? String == "pending")
   try first.finish()
-  let names = ["input.json", "context.json", "request.json"]
-  let frozen = try names.map { try Data(contentsOf: fixture.payload($0, generation: 1)) }
   let retry = try DreamWorkerProcess()
   defer { retry.clean() }
   checked = []
@@ -95,22 +93,26 @@ func dreamWorkerHistoricalLiveExclusionPrecedesProtectionAndFrozenReplay(mode: S
   start = workerStart(fixture, resume: "retryInterruptedCall")
   start["excludedSessionIDs"] = ["one"]
   try retry.send(start)
-  let deferred = try retry.frame()
-  #expect(deferred["status"] as? String == "pending")
-  #expect(deferred["reason"] as? String == "sourceSessionLive")
-  try retry.finish()
-  #expect(checked.isEmpty)
-  #expect(try names.map { try Data(contentsOf: fixture.payload($0, generation: 1)) } == frozen)
+  let next = try retry.frame()
+  #expect(next["type"] as? String == "modelRequest")
+  #expect(!String(describing: next).contains("OLD_SESSION_SENTINEL"))
+  #expect(!String(describing: next).contains("PRIOR_CLAIM_SENTINEL"))
   #expect(
-    !FileManager.default.fileExists(
-      atPath: fixture.state.appendingPathComponent("generations/2.json").path))
+    !checked.contains {
+      $0.contains("OLD_SESSION_SENTINEL") || $0.contains("PRIOR_CLAIM_SENTINEL")
+    })
+  try retry.send(workerReply(next, text: workerDecision(next)))
+  #expect(try retry.frame()["status"] as? String == "completed")
+  try retry.finish()
+  let generation = fixture.state.appendingPathComponent("generations/2.json")
+  let saved = String(decoding: try Data(contentsOf: generation), as: UTF8.self)
+  #expect(saved.contains("two.jsonl"))
+  #expect(saved.contains("one.jsonl"))
+
   let resumed = try DreamWorkerProcess()
   defer { resumed.clean() }
-  try resumed.send(workerStart(fixture, resume: "retryInterruptedCall"))
-  let resumedRequest = try resumed.frame()
-  #expect(resumedRequest["type"] as? String == "modelRequest")
-  try resumed.send(workerReply(resumedRequest, text: workerDecision(resumedRequest)))
-  #expect(try resumed.frame()["status"] as? String == "completed")
+  try resumed.send(workerStart(fixture))
+  #expect(try resumed.frame()["status"] as? String == "noNewRecords")
   try resumed.finish()
 }
 

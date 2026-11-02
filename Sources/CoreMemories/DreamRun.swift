@@ -175,7 +175,8 @@ public enum DreamPendingReason: String, Sendable {
 }
 
 public enum DreamResumeAction: Sendable {
-  case inspectOrContinue, retryInterruptedCall, replaceInvalidResponse, discardInvalidResponse
+  case inspectOrContinue, retryInterruptedCall, replaceInvalidResponse, discardInvalidResponse,
+    discardLiveSource
 }
 
 public struct DreamRecoveryTarget: Sendable {
@@ -1274,8 +1275,8 @@ public final class DreamRunStore {
         name == "\(generation).json", generation <= progress.generation
       else { throw DreamRunError.corruption }
     }
-    if (resume == .replaceInvalidResponse || resume == .discardInvalidResponse
-      || recoveryTarget != nil),
+    if resume == .replaceInvalidResponse || resume == .discardInvalidResponse
+      || resume == .discardLiveSource || recoveryTarget != nil,
       !(try admissions.isPresent("\(progress.generation).json"))
     {
       throw DreamRunError.replacementUnavailable
@@ -1406,24 +1407,34 @@ public final class DreamRunStore {
       try save(generation: progress.generation, hash: chain.hash, sealed: sealed)
     }
     if let recoveryTarget {
-      guard (resume == .replaceInvalidResponse || resume == .discardInvalidResponse),
+      guard resume == .replaceInvalidResponse || resume == .discardInvalidResponse
+        || resume == .discardLiveSource,
         sealed.run.runID == recoveryTarget.runID,
         sealed.request.requestHash == recoveryTarget.requestHash,
         try loadCallSelection(sealed, attempt: ResponseAttempt(number: 0)) == selection
       else { throw DreamRunError.replacementUnavailable }
     }
-    if resume == .discardInvalidResponse {
-      guard recoveryTarget != nil, sealed.rendering == .priorContextV5,
+    if resume == .discardInvalidResponse || resume == .discardLiveSource {
+      guard recoveryTarget != nil,
         !(try sealed.directory.isPresent("decisions.json")),
         !(try sealed.directory.isPresent("completion.json")),
         try sealed.directory.child("receipts").names().isEmpty,
         try sealed.directory.names().allSatisfy({ DiscardMarker.allowedFiles.contains($0) })
       else { throw DreamRunError.replacementUnavailable }
       let attempt = try attemptReader(sealed).verify()
-      guard attempt.attempt.number == 0, let response = attempt.response,
-        case .failure = DreamDecision.assess(
-          response: response, context: sealed.context, rendering: attempt.rendering)
+      guard attempt.attempt.number == 0, let response = attempt.response
       else { throw DreamRunError.replacementUnavailable }
+      if resume == .discardInvalidResponse {
+        guard sealed.rendering == .priorContextV5,
+          case .failure = DreamDecision.assess(
+            response: response, context: sealed.context, rendering: attempt.rendering)
+        else { throw DreamRunError.replacementUnavailable }
+      } else {
+        guard sealed.rendering == .current,
+          try checkProtection(
+            sealed, excludedSessionIDs: excludedSessionIDs, protect: nil) == .sourceSessionLive
+        else { throw DreamRunError.replacementUnavailable }
+      }
       let marker = DiscardMarker(
         schemaVersion: 2, runID: sealed.run.runID, generation: progress.generation,
         requestHash: sealed.request.requestHash.rawValue,

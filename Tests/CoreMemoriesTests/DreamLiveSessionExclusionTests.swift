@@ -111,3 +111,46 @@ import Testing
   try resumed.finish()
   #expect(try Data(contentsOf: fixture.payload("response.json")) == response)
 }
+
+@Test func dreamWorkerSkipsExactSavedRunOnlyWhileSourceIsLive() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: ["LIVE_SENTINEL"])
+  let first = try DreamWorkerProcess()
+  defer { first.clean() }
+  try first.send(workerStart(fixture))
+  let request = try first.frame()
+  try first.send(workerReply(request, text: "Invalid semantic response"))
+  #expect(try first.frame()["reason"] as? String == "invalidDecision")
+  try first.finish()
+
+  let runID = try #require(request["runID"] as? String)
+  let requestHash = try #require(request["requestHash"] as? String)
+  let response = try Data(contentsOf: fixture.payload("response.json"))
+  var start = workerStart(fixture, resume: "discardLiveSource")
+  start["recoveryTarget"] = ["runID": runID, "requestHash": requestHash]
+  let denied = try DreamWorkerProcess()
+  defer { denied.clean() }
+  try denied.send(start)
+  #expect(try denied.frame()["status"] as? String == "blocked")
+  try denied.finish()
+  #expect(try Data(contentsOf: fixture.payload("response.json")) == response)
+
+  let other = fixture.sessions.appendingPathComponent("--fixture--/two.jsonl")
+  try fixture.write(
+    dreamHeader("two", cwd: fixture.root.path, name: nil) + "\n"
+      + dreamUser("u", nil, dreamOld, "Historical green buttons.") + "\n", file: other)
+  start["excludedSessionIDs"] = ["one"]
+  let skipped = try DreamWorkerProcess()
+  defer { skipped.clean() }
+  try skipped.send(start)
+  let fresh = try skipped.frame()
+  #expect(fresh["type"] as? String == "modelRequest")
+  #expect(!String(describing: fresh).contains("LIVE_SENTINEL"))
+  try skipped.send(workerReply(fresh, text: workerDecision(fresh)))
+  #expect(try skipped.frame()["status"] as? String == "completed")
+  try skipped.finish()
+  let savedRun = fixture.state.appendingPathComponent("runs/\(runID)")
+  #expect(!FileManager.default.fileExists(atPath: savedRun.path))
+  #expect(FileManager.default.fileExists(atPath: fixture.source.path))
+}

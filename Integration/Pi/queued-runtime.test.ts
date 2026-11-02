@@ -117,7 +117,11 @@ test("manual dream recovery binds the selected model and archived run before one
 	} finally { await f.stop(); }
 });
 
-test("discard needs a later exact reply and starts one fresh version-6 run", async () => {
+for (const scenario of [
+	{ operation: "present-discard", resume: "discardInvalidResponse", confirmation: /permanently delete this invalid run/ },
+	{ operation: "present-skip-open", resume: "discardLiveSource", confirmation: /only if an open source still blocks it/ },
+]) {
+test(`${scenario.operation} needs a later exact reply and starts one fresh run`, async () => {
 	const runID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 	const freshID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
 	const requestHash = "a".repeat(64);
@@ -125,7 +129,7 @@ test("discard needs a later exact reply and starts one fresh version-6 run", asy
 	let runs = 0; let calls = 0;
 	const f = runtime(async (start, call, signal) => {
 		runs++;
-		assert.equal(start.resume, "discardInvalidResponse");
+		assert.equal(start.resume, scenario.resume);
 		assert.deepEqual(start.recoveryTarget, { runID, requestHash });
 		assert.deepEqual(start.selection, selection);
 		const request = { ...archivedRequest(start), runID: freshID, requestID: `${freshID}:${"b".repeat(64)}`, requestHash: "b".repeat(64) };
@@ -135,10 +139,10 @@ test("discard needs a later exact reply and starts one fresh version-6 run", asy
 	try {
 		await f.emit("session_start");
 		const tool = f.tools.get("memory_dream_recover"); assert.ok(tool);
-		await assert.rejects(tool.execute("wrong-model", { operation: "present-discard", runID, requestHash, selection: { ...selection, modelID: "different" } }, undefined, undefined, f.ctx), /selected model changed/i);
-		const shown = await tool.execute("exact-target", { operation: "present-discard", runID, requestHash, selection }, undefined, undefined, f.ctx);
+		await assert.rejects(tool.execute("wrong-model", { operation: scenario.operation, runID, requestHash, selection: { ...selection, modelID: "different" } }, undefined, undefined, f.ctx), /selected model changed/i);
+		const shown = await tool.execute("exact-target", { operation: scenario.operation, runID, requestHash, selection }, undefined, undefined, f.ctx);
 		assert.match(JSON.stringify(shown.details), /proposal-queued/);
-		assert.match(String(f.messages.at(-1)?.content), /permanently delete this invalid run/);
+		assert.match(String(f.messages.at(-1)?.content), scenario.confirmation);
 		assert.equal(runs, 0); assert.equal(calls, 0);
 		const early = await tool.execute("early", { operation: "reply" }, undefined, undefined, f.ctx);
 		assert.match(JSON.stringify(early.details), /no-live-conversation-reply/);
@@ -151,6 +155,34 @@ test("discard needs a later exact reply and starts one fresh version-6 run", asy
 		assert.match(JSON.stringify(result.details), new RegExp(`"runID":"${freshID}"`));
 		assert.equal(runs, 1); assert.equal(calls, 1);
 		assert.match(JSON.stringify((await tool.execute("replay", { operation: "reply" }, undefined, undefined, f.ctx)).details), /no-live-recovery-proposal/);
+	} finally { await f.stop(); }
+});
+}
+
+test("skip with no closed sessions resumes background work when a source closes", async () => {
+	const runID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+	const requestHash = "a".repeat(64);
+	const selection = { provider: "openai-codex", modelID: "selected", thinkingLevel: "high" };
+	const starts: DreamStart[] = [];
+	const f = runtime(async (start) => {
+		starts.push(start);
+		return { status: "noNewRecords", proposals: [] } as DreamReport;
+	}, "tui", undefined, { idleMilliseconds: 20 });
+	try {
+		await f.emit("session_start");
+		const tool = f.tools.get("memory_dream_recover"); assert.ok(tool);
+		await tool.execute("present", { operation: "present-skip-open", runID, requestHash, selection }, undefined, undefined, f.ctx);
+		await f.emit("input", { text: "yes", source: "interactive" });
+		await f.emit("before_agent_start", { messageType: "user", prompt: "yes" });
+		const message = { role: "user", content: "yes", timestamp: 1 };
+		await f.emit("message_start", { message });
+		f.entries.push({ type: "message", id: "skip-user", message });
+		const result = await tool.execute("reply", { operation: "reply" }, undefined, undefined, f.ctx);
+		assert.match(JSON.stringify(result.details), /"status":"noNewRecords"/);
+		f.peers.splice(0);
+		await until(() => starts.length >= 2, "Closed source did not resume background dreaming.");
+		assert.equal(starts[0]?.resume, "discardLiveSource");
+		assert.deepEqual(starts[1]?.excludedSessionIDs, ["session"]);
 	} finally { await f.stop(); }
 });
 

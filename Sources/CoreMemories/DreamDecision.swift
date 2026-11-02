@@ -908,7 +908,10 @@ private struct DecisionValidator {
     if isSuccessor { expectedKeys.insert("successor") }
     let object = try value.object(keys: expectedKeys)
     let rawSources = try object["sources"]!.array()
-    try context.limits.check(rawSources.count, maximum: context.limits.maximumSources)
+    try context.limits.check(
+      rawSources.count,
+      maximum: kind == "noChange"
+        ? context.limits.maximumReferences : context.limits.maximumSources)
     let sources = try rawSources.map { try source($0) }.sorted(by: isSourceOrdered)
     guard !sources.isEmpty, Set(sources).count == sources.count else {
       throw DecisionDiagnostic(.sourceList)

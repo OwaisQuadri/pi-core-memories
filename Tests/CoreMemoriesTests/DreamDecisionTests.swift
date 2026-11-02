@@ -478,6 +478,35 @@ func dreamRequestSavedV3AndV4StillVerifyWithoutPriorContextSections(
   }
 }
 
+@Test func dreamNoChangeCanCoverMoreThanProposalSourceLimit() throws {
+  let fixture = try DecisionFixture(texts: (0..<67).map { "Event \($0)." })
+  defer { fixture.clean() }
+  let context = try fixture.context()
+  let sources = context.primaryCatalogue.map(\.id)
+  #expect(sources.count == 67)
+  let noChange = decisionNoChange(sources, code: "notDurable")
+  let response = try fixture.response([noChange], context: context)
+  let validated = try DreamDecision.validate(response: response, context: context)
+  #expect(validated.plans.isEmpty)
+  #expect(validated.notes.count == 1)
+  #expect(validated.notes.first?.sources == sources)
+
+  let bounded = try fixture.context(limits: DreamDecisionLimits(maximumReferences: 66))
+  let boundedResponse = try fixture.response([noChange], context: bounded)
+  switch DreamDecision.assess(response: boundedResponse, context: bounded) {
+  case .success: Issue.record("Expected the total reference limit to reject 67 sources")
+  case .failure(let rejection): #expect(rejection.failure.code == .limitExceeded)
+  }
+
+  var proposal = decisionAdd(sources[0])
+  proposal["sources"] = sources.map(decisionSource)
+  let proposalResponse = try fixture.response([proposal], context: context)
+  switch DreamDecision.assess(response: proposalResponse, context: context) {
+  case .success: Issue.record("Expected the proposal source limit to reject 67 sources")
+  case .failure(let rejection): #expect(rejection.failure.code == .limitExceeded)
+  }
+}
+
 @Test func dreamDecisionRejectsNonPrimarySupport() throws {
   let fixture = try DecisionFixture()
   defer { fixture.clean() }

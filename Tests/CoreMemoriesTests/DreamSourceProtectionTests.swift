@@ -178,6 +178,44 @@ func sourceProtectionChangedRawOrAuthorityBytesBlockBeforeFreeze(target: String)
     })
 }
 
+@Test
+func sourceProtectionProtectedOwnerIsSkippedWithoutBlockingDream() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let owner = fixture.root.appendingPathComponent("AGENTS.md")
+  try fixture.write("Follow author-policy.md.\n", file: owner)
+  try fixture.write(
+    "SYNTHETIC_PROTECTED_OWNER", file: fixture.root.appendingPathComponent("author-policy.md"))
+  var start = workerStart(fixture)
+  var roots = start["roots"] as! [String: Any]
+  roots["globalAgents"] = owner.path
+  start["roots"] = roots
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  worker.isProtectingAutomatically = false
+  try worker.send(start)
+  while true {
+    let frame = try worker.frame()
+    #expect(!String(describing: frame).contains("SYNTHETIC_PROTECTED_OWNER"))
+    if frame["type"] as? String == "final" {
+      #expect(frame["status"] as? String == "completed")
+      break
+    }
+    if frame["type"] as? String == "sourceProtectionRequest" {
+      try worker.send(workerProtectionReply(frame))
+      continue
+    }
+    try #require(frame["type"] as? String == "modelRequest")
+    try worker.send(workerReply(frame, text: workerDecision(frame)))
+  }
+  try worker.finish()
+  #expect(
+    (try fixture.snapshot(fixture.state)).values.allSatisfy {
+      !String(decoding: $0.bytes, as: UTF8.self).contains("SYNTHETIC_PROTECTED_OWNER")
+    })
+}
+
 @Test(arguments: [".env", "auth.json", "credentials.md", "unknown"])
 func sourceProtectionProtectedReadNeverSendsBodyToHostOrFreezesIt(path: String) throws {
   let fixture = try TransactionFixture()

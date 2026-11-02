@@ -1804,10 +1804,12 @@ public final class DreamRunStore {
     var attempted: Set<Data> = []
     var totalBytes = 0
     func captureOwner(_ file: URL, scope: DreamMemoryScope) throws -> String? {
-      guard !DreamSourceProtection.isProtectedPath(file.path) else {
-        throw DreamSourceProtectionError.protectedPath
-      }
       guard attempted.insert(Data(file.path.utf8)).inserted else { return nil }
+      guard !DreamSourceProtection.isProtectedPath(file.path) else {
+        limitations.append(
+          "A protected local instruction-owner file was not opened; owner coverage is incomplete.")
+        return nil
+      }
       let parent: URL
       do { parent = try Self.canonicalExisting(file.deletingLastPathComponent()) } catch {
         limitations.append(

@@ -117,7 +117,11 @@ test("manual dream recovery binds the selected model and archived run before one
 	} finally { await f.stop(); }
 });
 
-test("discard needs a later exact reply and starts one fresh version-6 run", async () => {
+for (const scenario of [
+	{ operation: "present-discard", resume: "discardInvalidResponse", confirmation: /permanently delete this invalid run/ },
+	{ operation: "present-skip-open", resume: "discardLiveSource", confirmation: /only if an open source still blocks it/ },
+]) {
+test(`${scenario.operation} needs a later exact reply and starts one fresh run`, async () => {
 	const runID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 	const freshID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
 	const requestHash = "a".repeat(64);
@@ -125,7 +129,7 @@ test("discard needs a later exact reply and starts one fresh version-6 run", asy
 	let runs = 0; let calls = 0;
 	const f = runtime(async (start, call, signal) => {
 		runs++;
-		assert.equal(start.resume, "discardInvalidResponse");
+		assert.equal(start.resume, scenario.resume);
 		assert.deepEqual(start.recoveryTarget, { runID, requestHash });
 		assert.deepEqual(start.selection, selection);
 		const request = { ...archivedRequest(start), runID: freshID, requestID: `${freshID}:${"b".repeat(64)}`, requestHash: "b".repeat(64) };
@@ -135,10 +139,10 @@ test("discard needs a later exact reply and starts one fresh version-6 run", asy
 	try {
 		await f.emit("session_start");
 		const tool = f.tools.get("memory_dream_recover"); assert.ok(tool);
-		await assert.rejects(tool.execute("wrong-model", { operation: "present-discard", runID, requestHash, selection: { ...selection, modelID: "different" } }, undefined, undefined, f.ctx), /selected model changed/i);
-		const shown = await tool.execute("exact-target", { operation: "present-discard", runID, requestHash, selection }, undefined, undefined, f.ctx);
+		await assert.rejects(tool.execute("wrong-model", { operation: scenario.operation, runID, requestHash, selection: { ...selection, modelID: "different" } }, undefined, undefined, f.ctx), /selected model changed/i);
+		const shown = await tool.execute("exact-target", { operation: scenario.operation, runID, requestHash, selection }, undefined, undefined, f.ctx);
 		assert.match(JSON.stringify(shown.details), /proposal-queued/);
-		assert.match(String(f.messages.at(-1)?.content), /permanently delete this invalid run/);
+		assert.match(String(f.messages.at(-1)?.content), scenario.confirmation);
 		assert.equal(runs, 0); assert.equal(calls, 0);
 		const early = await tool.execute("early", { operation: "reply" }, undefined, undefined, f.ctx);
 		assert.match(JSON.stringify(early.details), /no-live-conversation-reply/);
@@ -153,6 +157,7 @@ test("discard needs a later exact reply and starts one fresh version-6 run", asy
 		assert.match(JSON.stringify((await tool.execute("replay", { operation: "reply" }, undefined, undefined, f.ctx)).details), /no-live-recovery-proposal/);
 	} finally { await f.stop(); }
 });
+}
 
 test("dream recovery cannot use deferred, transformed, or abandoned replies", async () => {
 	const runID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";

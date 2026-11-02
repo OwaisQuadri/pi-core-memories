@@ -224,9 +224,12 @@ private struct WorkerStart {
     case "retryInterruptedCall": resume = .retryInterruptedCall
     case "replaceInvalidResponse": resume = .replaceInvalidResponse
     case "discardInvalidResponse": resume = .discardInvalidResponse
+    case "discardLiveSource": resume = .discardLiveSource
     default: throw WorkerError.protocolFailure
     }
-    if resume == .replaceInvalidResponse || resume == .discardInvalidResponse {
+    if resume == .replaceInvalidResponse || resume == .discardInvalidResponse
+      || resume == .discardLiveSource
+    {
       guard let raw = object["recoveryTarget"] as? [String: Any] else {
         throw WorkerError.protocolFailure
       }

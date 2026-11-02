@@ -42,7 +42,7 @@ type PresentedState = {
 	preview: { details: string };
 };
 type DreamRecoveryState = PresentedState & {
-	action: "replace" | "discard";
+	action: "replace" | "discard" | "skipOpen";
 	runID: string;
 	requestHash: string;
 	selection: DreamSelection;
@@ -598,7 +598,8 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			const roots = await deps.roots(getAgentDir(), ctx.cwd);
 			const scope = await deps.scope(combined);
 			if (!isCurrent()) throw new Error("Dream recovery owner changed before dispatch.");
-			const start: DreamStart = { version: 1, type: "start", invocationID: randomUUID(), roots, selection, resume: action === "discard" ? "discardInvalidResponse" : "replaceInvalidResponse", recoveryTarget: { runID, requestHash }, batchTextBytes, ...scope, excludedSessionIDs };
+			const resume = action === "discard" ? "discardInvalidResponse" : action === "skipOpen" ? "discardLiveSource" : "replaceInvalidResponse";
+			const start: DreamStart = { version: 1, type: "start", invocationID: randomUUID(), roots, selection, resume, recoveryTarget: { runID, requestHash }, batchTextBytes, ...scope, excludedSessionIDs };
 			const report = await deps.run(start, async (request, workerSignal) => {
 				if (!isCurrent() || workerSignal.aborted || (action === "replace" ? request.runID !== runID : request.runID === runID)) throw new Error("Dream recovery target or owner changed.");
 				assertArchivedRequest(request, [...new Set([sessionID, ...await deps.live(deps.liveDirectory)])]);
@@ -609,7 +610,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			if (report.status !== "blocked" && report.status !== "busy" && report.status !== "noNewRecords" && (action === "replace" ? report.runID !== runID : report.runID === runID)) return { status: "blocked", reason: "targetChanged" };
 			failures = report.status === "completed" ? 0 : 3;
 			const reason = report.reason && /^[A-Za-z0-9:._-]{1,80}$/.test(report.reason) ? report.reason : "unknown";
-			reportDreamStatus(report.status === "completed" ? "dreaming: idle"
+			reportDreamStatus(report.status === "completed" || report.status === "noNewRecords" ? "dreaming: idle"
 				: report.status === "blocked" ? `dreaming: error(code: blocked, reason: ${reason}, message: "Native dream worker blocked the run")`
 				: `dreaming: error(code: pending, reason: ${reason}, message: "Native dream worker kept the run pending")`);
 			return { status: report.status, runID: report.runID, reason: report.reason, detail: report.detail, proposalCount: report.proposals.length };
@@ -620,9 +621,9 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 	registerMemoryManagement(pi, (owner, request, signal, ctx) => perform(owner, "manage", { request }, signal, ctx));
 	pi.registerTool({
 		name: "memory_dream_recover", label: "Dream recovery", executionMode: "sequential",
-		description: "Present a saved invalid dream and selected model in ordinary chat before one replacement or discard-and-fresh run. Present-discard permanently removes the exact invalid run and starts fresh from its cursor; it cannot restore the rejected reply. Use reply only after a later original interactive user reply to the displayed proposal. The user must answer yes to approve the selected action. Do not supply approval text in tool parameters. A pending or transformed reply cannot start the action. Native checks the saved run and baseline request hash again before deletion or the call. This is not approval for any memory write.",
+		description: "Present an exact saved dream run and selected model before one replacement, invalid-reply discard, or live-source skip. A skip deletes the exact saved request and response only if an open source still blocks that run, then selects again from its cursor. A later original interactive user reply must be yes to approve the selected action. Do not supply approval text in tool parameters. A pending or transformed reply cannot start the action. Native checks the exact target and locks the writer before deletion or the call. This is not approval for any memory write.",
 		parameters: Type.Object({
-			operation: Type.Union([Type.Literal("present"), Type.Literal("present-discard"), Type.Literal("reply"), Type.Literal("cancel")]),
+			operation: Type.Union([Type.Literal("present"), Type.Literal("present-discard"), Type.Literal("present-skip-open"), Type.Literal("reply"), Type.Literal("cancel")]),
 			runID: Type.Optional(Type.String({ pattern: "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$" })),
 			requestHash: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$" })),
 			selection: Type.Optional(Type.Object({ provider: Type.String({ maxLength: 256 }), modelID: Type.String({ maxLength: 256 }), thinkingLevel: Type.String({ maxLength: 256 }) }, { additionalProperties: false })),
@@ -630,7 +631,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		async execute(_id, params, signal, _update, ctx) {
 			let result: unknown;
 			if (params.operation === "cancel") { closeRecovery(); result = { status: "not-started" }; }
-			else if (params.operation === "present" || params.operation === "present-discard") {
+			else if (params.operation === "present" || params.operation === "present-discard" || params.operation === "present-skip-open") {
 				if (ctx.mode !== "tui" || !ctx.hasUI || !isAlive || !marker || foreground || conversation || background) throw new Error("Dream recovery needs one idle interactive owner.");
 				if (!params.runID || !params.requestHash || !params.selection) throw new Error("Dream recovery needs the exact saved run and selected model.");
 				const model = ctx.model;
@@ -638,10 +639,12 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				const identity = memoryRequestIdentity(ctx);
 				closeRecovery();
 				const proposalId = randomUUID();
-				const action = params.operation === "present-discard" ? "discard" : "replace";
+				const action = params.operation === "present-discard" ? "discard" : params.operation === "present-skip-open" ? "skipOpen" : "replace";
 				const details = action === "discard"
 					? `Dream discard and fresh-run request\nRun to delete: ${params.runID}\nBaseline request hash: ${params.requestHash}\nModel: ${escapeDreamDisplay(`${params.selection.provider}/${params.selection.modelID}, thinking ${params.selection.thinkingLevel}`)}\nReply yes in the next ordinary message to permanently delete this invalid run, then start a fresh version-6 run from its cursor. This deletes its frozen request and rejected reply. Any other reply cancels. Native checks the exact target and locks the writer before deletion. No memory is approved.`
-					: `Dream recovery request\nRun: ${params.runID}\nBaseline request hash: ${params.requestHash}\nModel: ${escapeDreamDisplay(`${params.selection.provider}/${params.selection.modelID}, thinking ${params.selection.thinkingLevel}`)}\nA replacement keeps the original rejected reply. Reply yes in the next ordinary message to approve one model call. Any other reply cancels. Native checks the target again before the call.`;
+					: action === "skipOpen"
+						? `Dream skip-open-source request\nRun to delete: ${params.runID}\nBaseline request hash: ${params.requestHash}\nModel: ${escapeDreamDisplay(`${params.selection.provider}/${params.selection.modelID}, thinking ${params.selection.thinkingLevel}`)}\nReply yes in the next ordinary message to permanently delete this saved run and its response only if an open source still blocks it, then select closed sessions again from the same cursor. Any other reply cancels. Native checks the exact target and locks the writer before deletion. No memory is approved.`
+						: `Dream recovery request\nRun: ${params.runID}\nBaseline request hash: ${params.requestHash}\nModel: ${escapeDreamDisplay(`${params.selection.provider}/${params.selection.modelID}, thinking ${params.selection.thinkingLevel}`)}\nA replacement keeps the original rejected reply. Reply yes in the next ordinary message to approve one model call. Any other reply cancels. Native checks the target again before the call.`;
 				recovery = { action, runID: params.runID, requestHash: params.requestHash, selection: params.selection, proposalId, presentedForRequest: identity.requestID, preview: { details } };
 				try { pi.sendMessage({ customType: "pi-core-memories:proposal", content: details, display: true, details: { proposalId } }, { triggerTurn: false }); }
 				catch (error) { closeRecovery(); throw error; }

@@ -1803,11 +1803,14 @@ public final class DreamRunStore {
     var owners: [PinnedOwnerInput] = []
     var attempted: Set<Data> = []
     var totalBytes = 0
+    let protectedOwnerLimitation =
+      "A protected local instruction-owner file was not opened; owner coverage is incomplete."
     func captureOwner(_ file: URL, scope: DreamMemoryScope) throws -> String? {
-      guard !DreamSourceProtection.isProtectedPath(file.path) else {
-        throw DreamSourceProtectionError.protectedPath
-      }
       guard attempted.insert(Data(file.path.utf8)).inserted else { return nil }
+      guard !DreamSourceProtection.isProtectedPath(file.path) else {
+        limitations.append(protectedOwnerLimitation)
+        return nil
+      }
       let parent: URL
       do { parent = try Self.canonicalExisting(file.deletingLastPathComponent()) } catch {
         limitations.append(
@@ -1815,11 +1818,14 @@ public final class DreamRunStore {
         return nil
       }
       let canonical = parent.appendingPathComponent(file.lastPathComponent)
+      guard !DreamSourceProtection.isProtectedPath(canonical.path) else {
+        limitations.append(protectedOwnerLimitation)
+        return nil
+      }
       if Data(canonical.path.utf8) != Data(file.path.utf8) {
         guard attempted.insert(Data(canonical.path.utf8)).inserted else { return nil }
       }
-      let directory = open(parent.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-      guard directory >= 0 else { throw DreamRunError.unsafeState }
+      let directory = try Self.openCanonicalDirectory(parent)
       defer { _ = close(directory) }
       var status = stat()
       if fstatat(directory, file.lastPathComponent, &status, AT_SYMLINK_NOFOLLOW) != 0 {
@@ -1827,6 +1833,15 @@ public final class DreamRunStore {
         limitations.append(
           "A grounded local instruction-owner file is missing; owner coverage is incomplete.")
         return nil
+      }
+      if status.st_mode & S_IFMT == S_IFLNK,
+        let resolved = realpath(canonical.path, nil)
+      {
+        defer { free(resolved) }
+        if DreamSourceProtection.isProtectedPath(String(cString: resolved)) {
+          limitations.append(protectedOwnerLimitation)
+          return nil
+        }
       }
       guard status.st_mode & S_IFMT == S_IFREG, status.st_size >= 0 else {
         throw DreamRunError.unsafeState
@@ -1930,7 +1945,9 @@ public final class DreamRunStore {
         _ = try captureOwner(file.standardizedFileURL, scope: scope)
       }
     }
-    if let globalAgents {
+    if let globalAgents, DreamSourceProtection.isProtectedPath(globalAgents.path) {
+      limitations.append(protectedOwnerLimitation)
+    } else if let globalAgents {
       do {
         guard let resolved = realpath(globalAgents.path, nil) else {
           if errno == ENOENT { throw DreamRunError.missingPayload }
@@ -2744,6 +2761,18 @@ public final class DreamRunStore {
     guard let path = realpath(url.path, nil) else { throw DreamRunError.unsafeState }
     defer { free(path) }
     return URL(fileURLWithPath: String(cString: path))
+  }
+
+  static func openCanonicalDirectory(_ url: URL) throws -> Int32 {
+    var directory = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard directory >= 0 else { throw DreamRunError.unsafeState }
+    for component in url.pathComponents.dropFirst() {
+      let next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+      _ = close(directory)
+      guard next >= 0 else { throw DreamRunError.unsafeState }
+      directory = next
+    }
+    return directory
   }
 
   private static func isWithin(_ child: URL, _ parent: URL) -> Bool {

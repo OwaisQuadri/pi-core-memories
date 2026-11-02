@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -176,6 +177,89 @@ func sourceProtectionChangedRawOrAuthorityBytesBlockBeforeFreeze(target: String)
     !state.keys.contains {
       $0.hasSuffix("input.json") || $0.hasSuffix("context.json") || $0.hasSuffix("request.json")
     })
+}
+
+@Test(arguments: ["author-policy.md", "safe-link/policy.md", "linked-policy.md", "global-link"])
+func sourceProtectionProtectedOwnerIsSkippedWithoutBlockingDream(locator: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let owner = fixture.root.appendingPathComponent(
+    locator == "global-link" ? "credentials/AGENTS.md" : "AGENTS.md")
+  let protectedOwner = locator == "author-policy.md"
+    ? fixture.root.appendingPathComponent(locator)
+    : fixture.root.appendingPathComponent(
+      locator == "global-link" ? "ordinary.md" : "credentials/policy.md")
+  try fixture.write("SYNTHETIC_PROTECTED_OWNER", file: protectedOwner)
+  if locator == "safe-link/policy.md" {
+    try FileManager.default.createSymbolicLink(
+      at: fixture.root.appendingPathComponent("safe-link"),
+      withDestinationURL: protectedOwner.deletingLastPathComponent())
+  } else if locator == "linked-policy.md" {
+    try FileManager.default.createSymbolicLink(
+      at: fixture.root.appendingPathComponent(locator), withDestinationURL: protectedOwner)
+  } else if locator == "global-link" {
+    try FileManager.default.createDirectory(
+      at: owner.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: owner, withDestinationURL: protectedOwner)
+  }
+  if locator != "global-link" { try fixture.write("Follow \(locator).\n", file: owner) }
+  var start = workerStart(fixture)
+  var roots = start["roots"] as! [String: Any]
+  roots["globalAgents"] = owner.path
+  start["roots"] = roots
+  let worker = try DreamWorkerProcess()
+  defer { worker.clean() }
+  worker.isProtectingAutomatically = false
+  try worker.send(start)
+  while true {
+    let frame = try worker.frame()
+    #expect(!String(describing: frame).contains("SYNTHETIC_PROTECTED_OWNER"))
+    if frame["type"] as? String == "final" {
+      #expect(frame["status"] as? String == "completed")
+      break
+    }
+    if frame["type"] as? String == "sourceProtectionRequest" {
+      try worker.send(workerProtectionReply(frame))
+      continue
+    }
+    try #require(frame["type"] as? String == "modelRequest")
+    let messages = try #require(frame["messages"] as? [[String: Any]])
+    let text = try #require(messages.first?["text"] as? String)
+    let context = try #require(
+      JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    let limitations = try #require(context["limitations"] as? [String])
+    #expect(
+      limitations.contains(
+        "A protected local instruction-owner file was not opened; owner coverage is incomplete."))
+    try worker.send(workerReply(frame, text: workerDecision(frame)))
+  }
+  try worker.finish()
+  #expect(
+    (try fixture.snapshot(fixture.state)).values.allSatisfy {
+      !String(decoding: $0.bytes, as: UTF8.self).contains("SYNTHETIC_PROTECTED_OWNER")
+    })
+}
+
+@Test
+func sourceProtectionSwappedAncestorCannotOpenProtectedOwnerDirectory() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let checked = fixture.root.appendingPathComponent("safe/nested")
+  try FileManager.default.createDirectory(at: checked, withIntermediateDirectories: true)
+  try fixture.write(
+    "SYNTHETIC_PROTECTED_OWNER",
+    file: fixture.root.appendingPathComponent("credentials/nested/policy.md"))
+  try FileManager.default.moveItem(
+    at: checked.deletingLastPathComponent(),
+    to: fixture.root.appendingPathComponent("moved"))
+  try FileManager.default.createSymbolicLink(
+    at: checked.deletingLastPathComponent(),
+    withDestinationURL: fixture.root.appendingPathComponent("credentials"))
+  #expect(throws: DreamRunError.unsafeState) {
+    let directory = try DreamRunStore.openCanonicalDirectory(checked)
+    _ = close(directory)
+  }
 }
 
 @Test(arguments: [".env", "auth.json", "credentials.md", "unknown"])

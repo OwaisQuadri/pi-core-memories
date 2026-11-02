@@ -171,7 +171,7 @@ public enum DreamTransactionResult: Sendable {
 
 public enum DreamPendingReason: String, Sendable {
   case interruptedCall, recoveryApprovalRequired, cancelled, callbackFailure, invalidDecision,
-    staleUnpublishedPlans, droppedBatch
+    staleUnpublishedPlans, droppedBatch, sourceSessionLive
 }
 
 public enum DreamResumeAction: Sendable {
@@ -1452,6 +1452,9 @@ public final class DreamRunStore {
     }
     guard sealed.rendering != .scopeV2 else { throw DreamRunError.unsupportedSchema }
     if isRecovered {
+      if sealed.run.batch.isExcludedSessionPresent(excludedSessionIDs) {
+        return pending(sealed, reason: .sourceSessionLive)
+      }
       try checkProtection(sealed, excludedSessionIDs: excludedSessionIDs, protect: protect)
     }
     var attempt: ResponseAttempt

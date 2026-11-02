@@ -1576,15 +1576,19 @@ extension CapturedSession {
 }
 
 extension PreparedSessionBatch {
-  package func requireNoExcludedSessions(_ ids: Set<String>) throws {
+  package func isExcludedSessionPresent(_ ids: Set<String>) -> Bool {
     let paths = Set(
       exactSourceRecords.map { $0.witness.relativePath.rawValue }
         + admittedViews.map(\.path)
         + (provenance?.sessions.map { $0.path.rawValue } ?? []))
-    guard
-      !positionsAfter.contains(where: {
-        paths.contains($0.relativePath.rawValue) && ids.contains($0.sessionID.rawValue)
-      })
-    else { throw MemoryError("live session excluded from dream intake") }
+    return positionsAfter.contains {
+      paths.contains($0.relativePath.rawValue) && ids.contains($0.sessionID.rawValue)
+    }
+  }
+
+  package func requireNoExcludedSessions(_ ids: Set<String>) throws {
+    guard !isExcludedSessionPresent(ids) else {
+      throw MemoryError("live session excluded from dream intake")
+    }
   }
 }

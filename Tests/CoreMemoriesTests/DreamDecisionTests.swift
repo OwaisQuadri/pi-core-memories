@@ -490,6 +490,12 @@ func dreamRequestSavedV3AndV4StillVerifyWithoutPriorContextSections(
   #expect(validated.plans.isEmpty)
   #expect(validated.notes.count == 1)
   #expect(validated.notes.first?.sources == sources)
+  switch DreamDecision.assess(
+    response: response, context: context, isHistoricalNoChangeLimitEnforced: true)
+  {
+  case .success: Issue.record("Expected the historical 64-source limit to reject 67 sources")
+  case .failure(let rejection): #expect(rejection.failure.code == .limitExceeded)
+  }
 
   let bounded = try fixture.context(limits: DreamDecisionLimits(maximumReferences: 66))
   let boundedResponse = try fixture.response([noChange], context: bounded)

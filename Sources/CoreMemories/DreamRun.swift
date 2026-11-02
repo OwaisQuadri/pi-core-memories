@@ -1414,18 +1414,25 @@ public final class DreamRunStore {
         try loadCallSelection(sealed, attempt: ResponseAttempt(number: 0)) == selection
       else { throw DreamRunError.replacementUnavailable }
     }
-    if resume == .discardInvalidResponse || resume == .discardLiveSource {
-      guard recoveryTarget != nil,
+    let isAutomaticallySkippingLiveSource = try isRecovered
+      && (resume == .inspectOrContinue || resume == .retryInterruptedCall)
+      && checkProtection(
+        sealed, excludedSessionIDs: excludedSessionIDs, protect: nil) == .sourceSessionLive
+    if resume == .discardInvalidResponse || resume == .discardLiveSource
+      || isAutomaticallySkippingLiveSource
+    {
+      guard recoveryTarget != nil || isAutomaticallySkippingLiveSource,
         !(try sealed.directory.isPresent("decisions.json")),
         !(try sealed.directory.isPresent("completion.json")),
         try sealed.directory.child("receipts").names().isEmpty,
         try sealed.directory.names().allSatisfy({ DiscardMarker.allowedFiles.contains($0) })
       else { throw DreamRunError.replacementUnavailable }
       let attempt = try attemptReader(sealed).verify()
-      guard attempt.attempt.number == 0, let response = attempt.response
+      guard attempt.attempt.number == 0,
+        isAutomaticallySkippingLiveSource || attempt.response != nil
       else { throw DreamRunError.replacementUnavailable }
       if resume == .discardInvalidResponse {
-        guard sealed.rendering == .priorContextV5,
+        guard let response = attempt.response, sealed.rendering == .priorContextV5,
           case .failure = DreamDecision.assess(
             response: response, context: sealed.context, rendering: attempt.rendering)
         else { throw DreamRunError.replacementUnavailable }

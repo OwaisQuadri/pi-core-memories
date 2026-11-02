@@ -54,7 +54,7 @@ import Testing
   #expect(!String(decoding: try Data(contentsOf: generation), as: UTF8.self).contains("one.jsonl"))
 }
 
-@Test func dreamWorkerLiveExclusionRefusesExactPendingWithoutResealing() throws {
+@Test func dreamWorkerSkipsInterruptedCallWhenItsSourceOpens() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   try fixture.populate()
@@ -62,54 +62,61 @@ import Testing
   defer { first.clean() }
   try first.send(workerStart(fixture))
   let request = try first.frame()
+  let runID = try #require(request["runID"] as? String)
   try first.send(workerReply(request, category: "failed"))
   #expect(try first.frame()["status"] as? String == "pending")
   try first.finish()
-  let names = ["input.json", "context.json", "request.json"]
-  let before = try names.map { try Data(contentsOf: fixture.payload($0)) }
   let retry = try DreamWorkerProcess()
   defer { retry.clean() }
   var start = workerStart(fixture, resume: "retryInterruptedCall")
   start["excludedSessionIDs"] = ["one"]
   try retry.send(start)
-  let deferred = try retry.frame()
-  #expect(deferred["status"] as? String == "pending")
-  #expect(deferred["reason"] as? String == "sourceSessionLive")
+  #expect(try retry.frame()["status"] as? String == "noNewRecords")
   try retry.finish()
-  #expect(try names.map { try Data(contentsOf: fixture.payload($0)) } == before)
-  #expect(
-    !FileManager.default.fileExists(
-      atPath: fixture.state.appendingPathComponent("generations/1.json").path))
+  #expect(!FileManager.default.fileExists(atPath: fixture.state.appendingPathComponent("runs/\(runID)").path))
+  #expect(FileManager.default.fileExists(atPath: fixture.source.path))
 }
 
-@Test func dreamWorkerSavedReplyWaitsForSourceSessionToClose() throws {
+@Test func dreamWorkerSkipsSavedReplyAndDreamsNextClosedSession() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
-  try fixture.populate()
+  try fixture.populate(texts: ["LIVE_SENTINEL"])
   let first = try DreamWorkerProcess()
   defer { first.clean() }
   try first.send(workerStart(fixture))
   let request = try first.frame()
+  let runID = try #require(request["runID"] as? String)
   try first.send(workerReply(request, text: "Invalid semantic response"))
   #expect(try first.frame()["reason"] as? String == "invalidDecision")
   try first.finish()
-  let response = try Data(contentsOf: fixture.payload("response.json"))
-  let retry = try DreamWorkerProcess()
-  defer { retry.clean() }
+
+  let other = fixture.sessions.appendingPathComponent("--fixture--/two.jsonl")
+  try fixture.write(
+    dreamHeader("two", cwd: fixture.root.path, name: nil) + "\n"
+      + dreamUser("u", nil, dreamOld, "Historical green buttons.") + "\n", file: other)
   var start = workerStart(fixture)
   start["excludedSessionIDs"] = ["one"]
+  let retry = try DreamWorkerProcess()
+  defer { retry.clean() }
   try retry.send(start)
-  let deferred = try retry.frame()
-  #expect(deferred["status"] as? String == "pending")
-  #expect(deferred["reason"] as? String == "sourceSessionLive")
+  let fresh = try retry.frame()
+  #expect(fresh["type"] as? String == "modelRequest")
+  #expect(!String(describing: fresh).contains("LIVE_SENTINEL"))
+  try retry.send(workerReply(fresh, text: workerDecision(fresh)))
+  #expect(try retry.frame()["status"] as? String == "completed")
   try retry.finish()
-  #expect(try Data(contentsOf: fixture.payload("response.json")) == response)
+  #expect(!FileManager.default.fileExists(atPath: fixture.state.appendingPathComponent("runs/\(runID)").path))
+  #expect(FileManager.default.fileExists(atPath: fixture.source.path))
+
   let resumed = try DreamWorkerProcess()
   defer { resumed.clean() }
   try resumed.send(workerStart(fixture))
-  #expect(try resumed.frame()["reason"] as? String == "invalidDecision")
+  let reopened = try resumed.frame()
+  #expect(reopened["type"] as? String == "modelRequest")
+  #expect(String(describing: reopened).contains("LIVE_SENTINEL"))
+  try resumed.send(workerReply(reopened, text: workerDecision(reopened)))
+  #expect(try resumed.frame()["status"] as? String == "completed")
   try resumed.finish()
-  #expect(try Data(contentsOf: fixture.payload("response.json")) == response)
 }
 
 @Test func dreamWorkerSkipsExactSavedRunOnlyWhileSourceIsLive() throws {

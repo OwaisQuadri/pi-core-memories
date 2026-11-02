@@ -1287,7 +1287,9 @@ public final class DreamRunStore {
       guard let runID = chain.record.runID else { throw DreamRunError.corruption }
       let prior = try loadAdmission(generation: progress.generation - 1, chain: chain)
       guard prior.run.runID == runID else { throw DreamRunError.corruption }
-      try checkProtection(prior, excludedSessionIDs: excludedSessionIDs, protect: protect)
+      if let reason = try checkProtection(
+        prior, excludedSessionIDs: excludedSessionIDs, protect: protect)
+      { return pending(prior, reason: reason) }
       try observe(prior.run.progress, prior.run.batch, false)
       return try finish(
         prior, chain: chain, isRecovered: true, isCommitted: true)
@@ -1451,12 +1453,10 @@ public final class DreamRunStore {
         remainingProtections: remainingProtections, call: call, observe: observe)
     }
     guard sealed.rendering != .scopeV2 else { throw DreamRunError.unsupportedSchema }
-    if isRecovered {
-      if sealed.run.batch.isExcludedSessionPresent(excludedSessionIDs) {
-        return pending(sealed, reason: .sourceSessionLive)
-      }
-      try checkProtection(sealed, excludedSessionIDs: excludedSessionIDs, protect: protect)
-    }
+    if isRecovered,
+      let reason = try checkProtection(
+        sealed, excludedSessionIDs: excludedSessionIDs, protect: protect)
+    { return pending(sealed, reason: reason) }
     var attempt: ResponseAttempt
     do {
       let verified = try attemptReader(sealed).verify()
@@ -1684,22 +1684,23 @@ public final class DreamRunStore {
 
   private func checkProtection(
     _ sealed: SealedRun, excludedSessionIDs: Set<String>, protect: (([String]) throws -> Void)?
-  ) throws {
-    try sealed.run.batch.requireNoExcludedSessions(excludedSessionIDs)
+  ) throws -> DreamPendingReason? {
     let related = try (sealed.context.connectedEvidence?.relatedBatchBytes ?? []).map {
       try DreamRunEncoding.retainedBatch(bytes: $0)
     }
-    for batch in related { try batch.requireNoExcludedSessions(excludedSessionIDs) }
-    guard
-      sealed.context.rejectedPredecessors.allSatisfy({
-        excludedSessionIDs.isDisjoint(with: $0.sourceSessions)
-      }), excludedSessionIDs.isDisjoint(with: sealed.context.priorContext?.sessions ?? [])
-    else { throw MemoryError("live session excluded from dream intake") }
-    guard let protect else { return }
+    if sealed.run.batch.isExcludedSessionPresent(excludedSessionIDs)
+      || related.contains(where: { $0.isExcludedSessionPresent(excludedSessionIDs) })
+      || sealed.context.rejectedPredecessors.contains(where: {
+        !excludedSessionIDs.isDisjoint(with: $0.sourceSessions)
+      })
+      || !excludedSessionIDs.isDisjoint(with: sealed.context.priorContext?.sessions ?? [])
+    { return .sourceSessionLive }
+    guard let protect else { return nil }
     for pieces in try protectionPieces(
       batch: sealed.run.batch, related: related, context: sealed.context,
       requestPieces: [sealed.request.systemPrompt] + sealed.request.messages.map(\.text))
     { try protect(pieces) }
+    return nil
   }
 
   private func protectionPieces(

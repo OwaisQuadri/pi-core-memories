@@ -179,15 +179,17 @@ func sourceProtectionChangedRawOrAuthorityBytesBlockBeforeFreeze(target: String)
     })
 }
 
-@Test(arguments: ["author-policy.md", "safe-link/policy.md", "linked-policy.md"])
+@Test(arguments: ["author-policy.md", "safe-link/policy.md", "linked-policy.md", "global-link"])
 func sourceProtectionProtectedOwnerIsSkippedWithoutBlockingDream(locator: String) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
   try fixture.populate()
-  let owner = fixture.root.appendingPathComponent("AGENTS.md")
+  let owner = fixture.root.appendingPathComponent(
+    locator == "global-link" ? "credentials/AGENTS.md" : "AGENTS.md")
   let protectedOwner = locator == "author-policy.md"
     ? fixture.root.appendingPathComponent(locator)
-    : fixture.root.appendingPathComponent("credentials/policy.md")
+    : fixture.root.appendingPathComponent(
+      locator == "global-link" ? "ordinary.md" : "credentials/policy.md")
   try fixture.write("SYNTHETIC_PROTECTED_OWNER", file: protectedOwner)
   if locator == "safe-link/policy.md" {
     try FileManager.default.createSymbolicLink(
@@ -196,8 +198,12 @@ func sourceProtectionProtectedOwnerIsSkippedWithoutBlockingDream(locator: String
   } else if locator == "linked-policy.md" {
     try FileManager.default.createSymbolicLink(
       at: fixture.root.appendingPathComponent(locator), withDestinationURL: protectedOwner)
+  } else if locator == "global-link" {
+    try FileManager.default.createDirectory(
+      at: owner.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: owner, withDestinationURL: protectedOwner)
   }
-  try fixture.write("Follow \(locator).\n", file: owner)
+  if locator != "global-link" { try fixture.write("Follow \(locator).\n", file: owner) }
   var start = workerStart(fixture)
   var roots = start["roots"] as! [String: Any]
   roots["globalAgents"] = owner.path

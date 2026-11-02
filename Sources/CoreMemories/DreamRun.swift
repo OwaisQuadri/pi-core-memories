@@ -1803,10 +1803,10 @@ public final class DreamRunStore {
     var owners: [PinnedOwnerInput] = []
     var attempted: Set<Data> = []
     var totalBytes = 0
+    let protectedOwnerLimitation =
+      "A protected local instruction-owner file was not opened; owner coverage is incomplete."
     func captureOwner(_ file: URL, scope: DreamMemoryScope) throws -> String? {
       guard attempted.insert(Data(file.path.utf8)).inserted else { return nil }
-      let protectedOwnerLimitation =
-        "A protected local instruction-owner file was not opened; owner coverage is incomplete."
       guard !DreamSourceProtection.isProtectedPath(file.path) else {
         limitations.append(protectedOwnerLimitation)
         return nil
@@ -1945,7 +1945,9 @@ public final class DreamRunStore {
         _ = try captureOwner(file.standardizedFileURL, scope: scope)
       }
     }
-    if let globalAgents {
+    if let globalAgents, DreamSourceProtection.isProtectedPath(globalAgents.path) {
+      limitations.append(protectedOwnerLimitation)
+    } else if let globalAgents {
       do {
         guard let resolved = realpath(globalAgents.path, nil) else {
           if errno == ENOENT { throw DreamRunError.missingPayload }

@@ -286,6 +286,22 @@ test("live sessions are excluded at start and a session that opens mid-run block
 	} finally { await f.stop(); }
 });
 
+test("a live source waits without losing its saved run and retries after the session closes", async () => {
+	const starts: DreamStart[] = [];
+	const f = runtime(async (start) => {
+		starts.push(start);
+		const isSourceLive = f.peers.includes("another-live-session");
+		if (isSourceLive) f.peers.splice(f.peers.indexOf("another-live-session"), 1);
+		return { status: isSourceLive ? "pending" : "completed", reason: isSourceLive ? "sourceSessionLive" : null } as DreamReport;
+	}, "tui", undefined, { idleMilliseconds: 50 });
+	try {
+		await f.emit("session_start");
+		await until(() => starts.length === 1 && f.statuses.get("pi-core-memories:dream") === "dreaming: waiting for source session to close", "Waiting status did not persist");
+		await until(() => starts.length >= 2 && f.statuses.get("pi-core-memories:dream") === "dreaming: idle", "No retry after source session closed");
+		assert.deepEqual(starts.slice(0, 2).map((start) => start.resume), ["inspectOrContinue", "inspectOrContinue"]);
+	} finally { await f.stop(); }
+});
+
 function footerHistory(ctx: ExtensionContext): (string | undefined)[] {
 	const history: (string | undefined)[] = []; const setStatus = ctx.ui.setStatus.bind(ctx.ui);
 	Object.assign(ctx.ui, { setStatus: (key: string, value: string | undefined) => { history.push(value); setStatus(key, value); } });

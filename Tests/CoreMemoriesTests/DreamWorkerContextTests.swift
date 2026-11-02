@@ -95,13 +95,23 @@ func dreamWorkerHistoricalLiveExclusionPrecedesProtectionAndFrozenReplay(mode: S
   start = workerStart(fixture, resume: "retryInterruptedCall")
   start["excludedSessionIDs"] = ["one"]
   try retry.send(start)
-  #expect(try retry.frame()["status"] as? String == "blocked")
+  let deferred = try retry.frame()
+  #expect(deferred["status"] as? String == "pending")
+  #expect(deferred["reason"] as? String == "sourceSessionLive")
   try retry.finish()
   #expect(checked.isEmpty)
   #expect(try names.map { try Data(contentsOf: fixture.payload($0, generation: 1)) } == frozen)
   #expect(
     !FileManager.default.fileExists(
       atPath: fixture.state.appendingPathComponent("generations/2.json").path))
+  let resumed = try DreamWorkerProcess()
+  defer { resumed.clean() }
+  try resumed.send(workerStart(fixture, resume: "retryInterruptedCall"))
+  let resumedRequest = try resumed.frame()
+  #expect(resumedRequest["type"] as? String == "modelRequest")
+  try resumed.send(workerReply(resumedRequest, text: workerDecision(resumedRequest)))
+  #expect(try resumed.frame()["status"] as? String == "completed")
+  try resumed.finish()
 }
 
 @Test(arguments: [false, true])

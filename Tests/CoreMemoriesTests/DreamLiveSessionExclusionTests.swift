@@ -72,10 +72,42 @@ import Testing
   var start = workerStart(fixture, resume: "retryInterruptedCall")
   start["excludedSessionIDs"] = ["one"]
   try retry.send(start)
-  #expect(try retry.frame()["status"] as? String == "blocked")
+  let deferred = try retry.frame()
+  #expect(deferred["status"] as? String == "pending")
+  #expect(deferred["reason"] as? String == "sourceSessionLive")
   try retry.finish()
   #expect(try names.map { try Data(contentsOf: fixture.payload($0)) } == before)
   #expect(
     !FileManager.default.fileExists(
       atPath: fixture.state.appendingPathComponent("generations/1.json").path))
+}
+
+@Test func dreamWorkerSavedReplyWaitsForSourceSessionToClose() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate()
+  let first = try DreamWorkerProcess()
+  defer { first.clean() }
+  try first.send(workerStart(fixture))
+  let request = try first.frame()
+  try first.send(workerReply(request, text: "Invalid semantic response"))
+  #expect(try first.frame()["reason"] as? String == "invalidDecision")
+  try first.finish()
+  let response = try Data(contentsOf: fixture.payload("response.json"))
+  let retry = try DreamWorkerProcess()
+  defer { retry.clean() }
+  var start = workerStart(fixture)
+  start["excludedSessionIDs"] = ["one"]
+  try retry.send(start)
+  let deferred = try retry.frame()
+  #expect(deferred["status"] as? String == "pending")
+  #expect(deferred["reason"] as? String == "sourceSessionLive")
+  try retry.finish()
+  #expect(try Data(contentsOf: fixture.payload("response.json")) == response)
+  let resumed = try DreamWorkerProcess()
+  defer { resumed.clean() }
+  try resumed.send(workerStart(fixture))
+  #expect(try resumed.frame()["reason"] as? String == "invalidDecision")
+  try resumed.finish()
+  #expect(try Data(contentsOf: fixture.payload("response.json")) == response)
 }

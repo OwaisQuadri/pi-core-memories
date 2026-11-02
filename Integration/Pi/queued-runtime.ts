@@ -182,7 +182,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			if (dreamStatus === "dreaming: paused") reportDreamStatus("dreaming: active");
 			return;
 		}
-		if (!dreamStatus?.startsWith("dreaming: error(")) reportDreamStatus("dreaming: idle");
+		if (!dreamStatus?.startsWith("dreaming: error(") && dreamStatus !== "dreaming: waiting for source session to close") reportDreamStatus("dreaming: idle");
 		const delay = deps.idleMilliseconds * 2 ** failures;
 		if (timer && timerDelay <= delay) return;
 		clearTimeout(timer); timerDelay = delay;
@@ -240,11 +240,12 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				if (!isCurrent()) return;
 				const recorded = report.callSelection;
 				const isRetrying = report.status === "pending" && report.reason === "interruptedCall" && (!recorded || isDeepStrictEqual(recorded, selection));
+				const isWaitingForSource = report.status === "pending" && report.reason === "sourceSessionLive";
 				if (isRetrying) interruptedCallSelection = selection;
-				const isRescheduled = report.status !== "blocked" && (report.status !== "pending" || isRetrying || report.reason === "cancelled" || report.reason === "droppedBatch");
+				const isRescheduled = report.status !== "blocked" && (report.status !== "pending" || isRetrying || isWaitingForSource || report.reason === "cancelled" || report.reason === "droppedBatch");
 				failures = isRescheduled ? 0 : 3;
 				const blockedReason = report.reason && /^[A-Za-z0-9:._-]{1,80}$/.test(report.reason) ? report.reason : "unknown";
-				reportDreamStatus(isRescheduled ? "dreaming: idle"
+				reportDreamStatus(isWaitingForSource ? "dreaming: waiting for source session to close" : isRescheduled ? "dreaming: idle"
 					: report.status === "blocked" ? `dreaming: error(code: blocked, reason: ${blockedReason}, message: "Native dream worker blocked the run")`
 					: report.reason === "interruptedCall" && recorded ? `dreaming: error(code: interruptedCall, message: ${JSON.stringify(escapeDreamDisplay(`Interrupted dream needs the model it started with: ${recorded.provider}/${recorded.modelID}, thinking ${recorded.thinkingLevel}`))})`
 					: report.reason === "callbackFailure" && report.detail ? `dreaming: error(code: backendFailure, message: ${JSON.stringify(escapeDreamDisplay(report.detail))})`

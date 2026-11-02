@@ -293,12 +293,11 @@ test("a live source waits without losing its saved run and retries after the ses
 		const isSourceLive = f.peers.includes("another-live-session");
 		if (isSourceLive) f.peers.splice(f.peers.indexOf("another-live-session"), 1);
 		return { status: isSourceLive ? "pending" : "completed", reason: isSourceLive ? "sourceSessionLive" : null } as DreamReport;
-	});
-	const footer = footerHistory(f.ctx);
+	}, "tui", undefined, { idleMilliseconds: 50 });
 	try {
 		await f.emit("session_start");
+		await until(() => starts.length === 1 && f.statuses.get("pi-core-memories:dream") === "dreaming: waiting for source session to close", "Waiting status did not persist");
 		await until(() => starts.length >= 2 && f.statuses.get("pi-core-memories:dream") === "dreaming: idle", "No retry after source session closed");
-		assert.ok(footer.includes("dreaming: waiting for source session to close"));
 		assert.deepEqual(starts.slice(0, 2).map((start) => start.resume), ["inspectOrContinue", "inspectOrContinue"]);
 	} finally { await f.stop(); }
 });

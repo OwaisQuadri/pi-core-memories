@@ -1834,6 +1834,15 @@ public final class DreamRunStore {
           "A grounded local instruction-owner file is missing; owner coverage is incomplete.")
         return nil
       }
+      if status.st_mode & S_IFMT == S_IFLNK,
+        let resolved = realpath(canonical.path, nil)
+      {
+        defer { free(resolved) }
+        if DreamSourceProtection.isProtectedPath(String(cString: resolved)) {
+          limitations.append(protectedOwnerLimitation)
+          return nil
+        }
+      }
       guard status.st_mode & S_IFMT == S_IFREG, status.st_size >= 0 else {
         throw DreamRunError.unsafeState
       }

@@ -1517,7 +1517,7 @@ public final class DreamRunStore {
           rejected, name: next.archiveName, directory: sealed.directory, isReplacing: false)
         try install(
           DreamRunEncoding.ReplacementIntent(
-            schemaVersion: feedback == nil ? 2 : 4,
+            schemaVersion: feedback == nil ? 5 : 4,
             admissionHash: sealed.admissionHash.rawValue,
             requestHash: sealed.request.requestHash.rawValue,
             rejectedResponseHash: SourceDigest(bytes: rejected).rawValue,

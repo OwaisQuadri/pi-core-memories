@@ -115,10 +115,10 @@ struct DreamAttemptReader {
       guard
         case .failure(let rejection) = DreamDecision.assess(
           response: rejectedResponse, context: context, rendering: previous.rendering,
-          isHistoricalNoChangeLimitEnforced: intent.schemaVersion < 4)
+          isHistoricalNoChangeLimitEnforced: intent.schemaVersion == 2 || intent.schemaVersion == 3)
       else { throw DreamRunError.corruption }
       switch intent.schemaVersion {
-      case 2:
+      case 2, 5:
         guard intent.attemptNumber == nil, intent.rejectedAttemptNumber == nil,
           intent.rejectedCallIntentHash == nil, intent.feedback == nil, intent.feedbackHash == nil,
           intent.targetRenderingVersion == nil

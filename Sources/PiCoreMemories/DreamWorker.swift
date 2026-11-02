@@ -377,13 +377,10 @@ private final class WorkerInput: @unchecked Sendable {
     if status == "blocked" {
       try WorkerJSON.fields(object, keys.union(["code"]))
       let code = try WorkerJSON.text(object, "code", maximum: 32)
-      guard
-        [
-          "not-ready", "unavailable", "timeout", "cancelled", "invalid-input", "invalid-output",
-          "failed",
-        ].contains(code)
-      else { throw WorkerError.protocolFailure }
-      protectionFailure = .blocked
+      guard let refusal = RedactionRefusal(rawValue: code) else {
+        throw WorkerError.protocolFailure
+      }
+      protectionFailure = .redaction(refusal)
     } else {
       try WorkerJSON.fields(object, keys.union(["policy", "pieces", "outputDigest"]))
       guard status == "checked",
@@ -757,7 +754,7 @@ func executeDreamWorker(arguments: [String]) -> Int32 {
           : ((error as? WorkerError) == .cancelled
             ? "cancelled"
             : (error as? DreamSourceProtectionError).map {
-              "sourceProtection:" + String(describing: $0)
+              "sourceProtection:" + $0.reason
             } ?? "workerFailure")
         let isBusy = (error as? DreamRunError) == .busy
         try WorkerOutput.final(

@@ -194,7 +194,7 @@ package struct DreamAdmittedView: Codable, Equatable, Sendable {
 
   static func omitted(_ bytes: Data) throws -> Data {
     guard let object = try SessionReader.decodeRecord(bytes) as? [String: Any] else {
-      throw DreamSourceProtectionError.blocked
+      throw DreamSourceProtectionError.invalidRecord
     }
     var stub: [String: Any] = [
       "type": object["type"] ?? "", "id": object["id"] ?? "",

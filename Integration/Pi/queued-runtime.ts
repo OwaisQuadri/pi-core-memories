@@ -608,7 +608,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 			}, combined, () => {}, (value: unknown, workerSignal: AbortSignal) => deps.protect(pi, start.invocationID, value, workerSignal));
 			if (!isCurrent()) throw new Error("Dream recovery owner changed before completion.");
 			if (report.status !== "blocked" && report.status !== "busy" && report.status !== "noNewRecords" && (action === "replace" ? report.runID !== runID : report.runID === runID)) return { status: "blocked", reason: "targetChanged" };
-			failures = report.status === "completed" ? 0 : 3;
+			failures = report.status === "completed" || report.status === "noNewRecords" ? 0 : 3;
 			const reason = report.reason && /^[A-Za-z0-9:._-]{1,80}$/.test(report.reason) ? report.reason : "unknown";
 			reportDreamStatus(report.status === "completed" || report.status === "noNewRecords" ? "dreaming: idle"
 				: report.status === "blocked" ? `dreaming: error(code: blocked, reason: ${reason}, message: "Native dream worker blocked the run")`

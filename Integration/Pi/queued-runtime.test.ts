@@ -159,6 +159,33 @@ test(`${scenario.operation} needs a later exact reply and starts one fresh run`,
 });
 }
 
+test("skip with no closed sessions resumes background work when a source closes", async () => {
+	const runID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+	const requestHash = "a".repeat(64);
+	const selection = { provider: "openai-codex", modelID: "selected", thinkingLevel: "high" };
+	const starts: DreamStart[] = [];
+	const f = runtime(async (start) => {
+		starts.push(start);
+		return { status: "noNewRecords", proposals: [] } as DreamReport;
+	}, "tui", undefined, { idleMilliseconds: 20 });
+	try {
+		await f.emit("session_start");
+		const tool = f.tools.get("memory_dream_recover"); assert.ok(tool);
+		await tool.execute("present", { operation: "present-skip-open", runID, requestHash, selection }, undefined, undefined, f.ctx);
+		await f.emit("input", { text: "yes", source: "interactive" });
+		await f.emit("before_agent_start", { messageType: "user", prompt: "yes" });
+		const message = { role: "user", content: "yes", timestamp: 1 };
+		await f.emit("message_start", { message });
+		f.entries.push({ type: "message", id: "skip-user", message });
+		const result = await tool.execute("reply", { operation: "reply" }, undefined, undefined, f.ctx);
+		assert.match(JSON.stringify(result.details), /"status":"noNewRecords"/);
+		f.peers.splice(0);
+		await until(() => starts.length >= 2, "Closed source did not resume background dreaming.");
+		assert.equal(starts[0]?.resume, "discardLiveSource");
+		assert.deepEqual(starts[1]?.excludedSessionIDs, ["session"]);
+	} finally { await f.stop(); }
+});
+
 test("dream recovery cannot use deferred, transformed, or abandoned replies", async () => {
 	const runID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 	const requestHash = "a".repeat(64);

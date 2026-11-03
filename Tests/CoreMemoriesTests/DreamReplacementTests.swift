@@ -40,7 +40,9 @@ import Testing
   #expect(try fixture.snapshot(fixture.state) == saved)
 }
 
-private func freezeV5Request(_ fixture: TransactionFixture) throws {
+private func freezeV5Request(
+  _ fixture: TransactionFixture, rendering: DreamRequestRendering = .priorContextV5
+) throws {
   let root = fixture.state
   let admissionURL = root.appendingPathComponent("admissions/0.json")
   let admission = try DreamRunEncoding.decode(
@@ -59,10 +61,10 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
   let legacy = DreamRunEncoding.Request(
     schemaVersion: 3, runID: request.runID, generation: request.generation,
     inputHash: request.inputHash, contextHash: request.contextHash,
-    systemPrompt: context.systemPrompt(rendering: .priorContextV5),
+    systemPrompt: context.systemPrompt(rendering: rendering),
     messages: try context.requestMessages(
       timestampMilliseconds: request.messages[0].timestampMilliseconds,
-      rendering: .priorContextV5), renderingVersion: 5)
+      rendering: rendering), renderingVersion: rendering.rawValue)
   let requestBytes = try DreamRunEncoding.encode(legacy)
   let changedAdmission = DreamRunEncoding.Admission(
     schemaVersion: admission.schemaVersion, bindingHash: admission.bindingHash,
@@ -292,6 +294,68 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
     try fixture.store().run(
       selection: fixture.selection, prepare: transactionUncalledPrepare,
       call: transactionUncalled)
+  }
+}
+
+@Test func oldInitialNoChangeWithoutReplacementRemainsRejected() throws {
+  for rendering in [DreamRequestRendering.priorContextV5, .scopeContractV6] {
+    let fixture = try TransactionFixture()
+    defer { fixture.clean() }
+    try fixture.populate(texts: (0..<67).map { "Event \($0)." })
+    var request: DreamModelRequest?
+    var noChange: [String: Any] = [:]
+    let pending = try transactionPending(
+      fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) }) {
+        modelRequest in
+        request = modelRequest
+        let context = try transactionObject(modelRequest)
+        let primary = context["primaryEvidence"] as! [[String: Any]]
+        let scopes = context["scopes"] as! [[String: Any]]
+        let sources = primary.map { $0["source"]! }
+        let resolution = scopes.first {
+          ($0["source"] as! NSDictionary) == (sources[0] as! NSDictionary)
+        }!["resolution"] as! [String: Any]
+        noChange = [
+          "kind": "noChange", "sources": sources,
+          "reasonCode": resolution["kind"] as! String == "unresolved" ? "unresolvedScope" : "notDurable",
+          "explanation": "Each source describes a separate event.",
+        ]
+        return try transactionResponse(modelRequest, decisions: [noChange, ["kind": "unsupported"]])
+      }, reason: .invalidDecision)
+    try freezeV5Request(fixture, rendering: rendering)
+    let originalURL = try fixture.payload("response.json")
+    let original = try DreamRunEncoding.decode(
+      DreamRunEncoding.BoundResponse.self, bytes: Data(contentsOf: originalURL))
+    let text = try transactionResponse(try #require(request), decisions: [noChange]).text
+    let historicalResponse = DreamRunEncoding.BoundResponse(
+      schemaVersion: original.schemaVersion, admissionHash: original.admissionHash,
+      runID: original.runID, generation: original.generation,
+      inputHash: original.inputHash, contextHash: original.contextHash,
+      requestHash: original.requestHash, selection: original.selection, text: text,
+      callIntentHash: original.callIntentHash)
+    try DreamRunEncoding.encode(historicalResponse).write(to: originalURL)
+
+    let inspected = try DreamInspection.read(stateRoot: fixture.state)
+    let saved = try #require(inspected.runs.first { $0.id == pending.runID })
+    #expect(saved.attempts.map(\.status) == ["Rejected reply"])
+    #expect(saved.attempts.first?.diagnostic == "Reply exceeds a frozen validation limit")
+    let stillPending = try transactionPending(
+      fixture.store().run(
+        selection: fixture.selection, prepare: transactionUncalledPrepare,
+        call: transactionUncalled), reason: .invalidDecision)
+    #expect(stillPending.runID == pending.runID)
+
+    if rendering == .priorContextV5 {
+      let requestHash = SourceDigest(bytes: try Data(contentsOf: fixture.payload("request.json")))
+      let discarded = try transactionPending(
+        fixture.store().run(
+          selection: fixture.selection, resume: .discardInvalidResponse,
+          recoveryTarget: try DreamRecoveryTarget(
+            runID: pending.runID, requestHash: requestHash.rawValue),
+          prepare: { try fixture.prepare($0) }, call: { _ in throw CancellationError() }),
+        reason: .cancelled)
+      #expect(discarded.runID != pending.runID)
+    }
   }
 }
 

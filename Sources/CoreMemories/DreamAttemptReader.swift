@@ -21,10 +21,7 @@ struct VerifiedDreamAttempt {
   let selection: DreamSelectedCall?
   let response: DurableDreamResponse?
   let rendering: DreamRequestRendering
-
-  var isHistoricalNoChangeLimitEnforced: Bool {
-    replacement.map { (2...4).contains($0.schemaVersion) } ?? false
-  }
+  let isHistoricalNoChangeLimitEnforced: Bool
 }
 
 struct DreamAttemptReader {
@@ -33,6 +30,7 @@ struct DreamAttemptReader {
   let context: DreamDecisionContext
   let baseline: DreamModelRequest
   let rendering: DreamRequestRendering
+  let baselineSchemaVersion: Int
   let admissionHash: SourceDigest
   let limits: DreamRunLimits
 
@@ -156,12 +154,15 @@ struct DreamAttemptReader {
     let effectiveRendering: DreamRequestRendering =
       (replacement?.schemaVersion == 4 || replacement?.schemaVersion == 6)
         ? .scopeContractV6 : rendering
+    let isHistoricalNoChangeLimitEnforced = attempt.number == 0 && baselineSchemaVersion < 4
+      || (replacement.map { (2...4).contains($0.schemaVersion) } ?? false)
     guard try directory.isPresent(attempt.callName) else {
       guard !(try directory.isPresent(attempt.responseName)) else { throw DreamRunError.corruption }
       return VerifiedDreamAttempt(
         attempt: attempt, replacement: replacement,
         replacementHash: replacementHash, callIntentHash: nil, selection: nil, response: nil,
-        rendering: effectiveRendering)
+        rendering: effectiveRendering,
+        isHistoricalNoChangeLimitEnforced: isHistoricalNoChangeLimitEnforced)
     }
     let callBytes = try directory.read(
       attempt.callName, maximum: DreamRunEncoding.maximumMetadataBytes)
@@ -205,6 +206,7 @@ struct DreamAttemptReader {
     return VerifiedDreamAttempt(
       attempt: attempt, replacement: replacement,
       replacementHash: replacementHash, callIntentHash: callHash, selection: selection,
-      response: response, rendering: effectiveRendering)
+      response: response, rendering: effectiveRendering,
+      isHistoricalNoChangeLimitEnforced: isHistoricalNoChangeLimitEnforced)
   }
 }

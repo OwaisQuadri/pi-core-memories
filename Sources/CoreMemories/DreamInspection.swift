@@ -107,9 +107,10 @@ package struct DreamInspection: Codable, Sendable {
     let context = try DreamRunEncoding.context(
       bytes: directory.read("context.json", maximum: limits.maximumFrozenBytes), run: run)
     let requestBytes = try directory.read("request.json", maximum: limits.maximumFrozenBytes)
-    let verifiedRequest = try DreamRunEncoding.decode(
-      DreamRunEncoding.Request.self, bytes: requestBytes
-    ).verifiedDomain(run: run, context: context, bytes: requestBytes)
+    let requestRecord = try DreamRunEncoding.decode(
+      DreamRunEncoding.Request.self, bytes: requestBytes)
+    let verifiedRequest = try requestRecord.verifiedDomain(
+      run: run, context: context, bytes: requestBytes)
     let request = verifiedRequest.request
     let admissionBytes = try root.child("admissions").read(
       "\(run.progress.generation).json", maximum: DreamRunEncoding.maximumMetadataBytes)
@@ -124,7 +125,7 @@ package struct DreamInspection: Codable, Sendable {
     else { throw DreamRunError.corruption }
     let reader = DreamAttemptReader(
       directory: directory, run: run, context: context, baseline: request,
-      rendering: verifiedRequest.rendering,
+      rendering: verifiedRequest.rendering, baselineSchemaVersion: requestRecord.schemaVersion,
       admissionHash: SourceDigest(bytes: admissionBytes), limits: limits)
     var verifiedAttempts: [VerifiedDreamAttempt] = []
     _ = try reader.verify { verifiedAttempts.append($0) }

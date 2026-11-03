@@ -216,7 +216,8 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
   defer { fixture.clean() }
   let context = try fixture.context()
   for (schema, rendering) in [
-    (3, 6), (3, 5), (3, nil), (3, 1), (3, 2), (3, 3), (3, 4), (2, 3), (3, 7), (4, 4),
+    (3, 6), (4, 6), (3, 5), (3, nil), (3, 1), (3, 2), (3, 3), (3, 4),
+    (2, 3), (3, 7), (4, 4), (4, 5), (4, nil),
   ] as [(Int, Int?)]
   {
     let request = DreamRunEncoding.Request(
@@ -226,7 +227,7 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
       messages: try context.requestMessages(timestampMilliseconds: 123), renderingVersion: rendering
     )
     let bytes = try DreamRunEncoding.encode(request)
-    if schema == 3 && rendering == 6 {
+    if (schema == 3 || schema == 4) && rendering == 6 {
       let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
       #expect(
         try saved.domain(run: fixture.run, context: context, bytes: bytes).requestHash

@@ -38,8 +38,8 @@ unapproved amendment and creates a new exact preview. That preview needs a new
 display and a later explicit approval. An earlier reply cannot approve it.
 
 The consumer still needs fresh independent review, complete installed
-background-to-chat verification, and migration acceptance. Source implementation
-does not authorize removal of the old application or its retained data.
+background-to-chat verification, and migration acceptance. Removing the old
+application from this source does not authorize deleting its installed copy or data.
 
 The adapter must find the exact proposal in the current durable transcript and
 capture a later eligible reply. A model's description of a reply, an interactive
@@ -271,9 +271,9 @@ Do not rewrite source archives, reset review state, delete unknown locks, or
 change the approved reference to make a failed check pass. A capacity or
 verification failure preserves prior state and blocks the affected operation.
 
-The existing installed Core Memories application and its data remain in place
+An existing installed Core Memories application and its data remain in place
 until the conversational replacement and migration pass acceptance. Removing
-extension commands does not authorize application removal or data deletion.
+the application source does not authorize uninstalling it or deleting its data.
 
 ## Integration
 
@@ -286,8 +286,8 @@ commands.
   presentation, private consent traffic, checked receipts, and migration limits.
 - [Dream input protocol](docs/dream-input-protocol.md) defines source admission,
   frozen model requests, response validation, and recovery.
-- [Native application notes](docs/native-app.md) describe the retained legacy
-  application and packaging boundary. It is not the replacement review route.
+- [Native runtime and installation](docs/runtime-install.md) describe the worker
+  package and the boundary for retained data.
 
 Isolated protocol tests use native configuration files. They must isolate every
 affected store. They do not add an extension mode or establish that the normal
@@ -309,8 +309,8 @@ installed conversational flow.
 Acceptance includes background intake while windows are in use, normal chat
 handoff, exact displayed approval, conversational changes, rejection, deferral,
 ownership recovery, last-session shutdown, preserved data, and migration.
-Installation follows checked user-merged revisions. Application retirement
-follows replacement and migration acceptance.
+Installation follows checked user-merged revisions. Retirement of an existing
+installed application follows replacement and migration acceptance.
 
 ## License
 

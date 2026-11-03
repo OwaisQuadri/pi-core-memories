@@ -137,7 +137,8 @@ package struct DreamInspection: Codable, Sendable {
       if let response = attempt.response {
         switch DreamDecision.assess(
           response: response, context: context, rendering: attempt.rendering,
-          isHistoricalNoChangeLimitEnforced: nextVersion.map { (2...4).contains($0) } ?? false)
+          isHistoricalNoChangeLimitEnforced: attempt.isHistoricalNoChangeLimitEnforced
+            || (nextVersion.map { (2...4).contains($0) } ?? false))
         {
         case .success(let result):
           suggestionCount = result.plans.count

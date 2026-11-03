@@ -1505,7 +1505,8 @@ public final class DreamRunStore {
         let feedback: DreamReplacementFeedback?
         if sealed.rendering == .priorContextV5 {
           guard case .failure(let rejection) = DreamDecision.assess(
-            response: response, context: sealed.context, rendering: previous.rendering)
+            response: response, context: sealed.context, rendering: previous.rendering,
+            isHistoricalNoChangeLimitEnforced: previous.isHistoricalNoChangeLimitEnforced)
           else { throw DreamRunError.corruption }
           feedback = DreamReplacementFeedback(
             failure: rejection.failure, rendering: previous.rendering)
@@ -2479,7 +2480,8 @@ public final class DreamRunStore {
       guard let durable = saved.response else { throw DreamRunError.missingPayload }
       responseHash = durable.responseHash
       switch DreamDecision.assess(
-        response: durable, context: sealed.context, rendering: saved.rendering)
+        response: durable, context: sealed.context, rendering: saved.rendering,
+        isHistoricalNoChangeLimitEnforced: saved.isHistoricalNoChangeLimitEnforced)
       {
       case .success(let result): validated = result
       case .failure(let rejection): throw rejection.error

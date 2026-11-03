@@ -382,6 +382,27 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
   _ = try transactionPending(
     fixture.store().run(selection: fixture.selection, prepare: transactionUncalledPrepare,
       call: transactionUncalled), reason: .interruptedCall)
+  _ = try transactionPending(
+    fixture.store().run(
+      selection: fixture.selection, resume: .retryInterruptedCall,
+      prepare: transactionUncalledPrepare,
+      call: { request in try transactionResponse(request, decisions: [noChange]) }),
+    reason: .invalidDecision)
+  let inspectedReplacement = try DreamInspection.read(stateRoot: fixture.state)
+  let replacement = try #require(inspectedReplacement.runs.first { $0.id == pending.runID })
+  #expect(replacement.attempts.map(\.status) == ["Rejected reply", "Rejected reply"])
+  #expect(replacement.attempts.last?.diagnostic == "Reply exceeds a frozen validation limit")
+  _ = try transactionPending(
+    fixture.store().run(
+      selection: fixture.selection, resume: .replaceInvalidResponse,
+      recoveryTarget: DreamRecoveryTarget(
+        runID: pending.runID, requestHash: SourceDigest(bytes: requestBytes).rawValue),
+      prepare: transactionUncalledPrepare, call: { _ in throw CancellationError() }),
+    reason: .cancelled)
+  let nextIntent = try DreamRunEncoding.decode(
+    DreamRunEncoding.ReplacementIntent.self,
+    bytes: Data(contentsOf: fixture.payload("replacement-2.json")))
+  #expect(nextIntent.schemaVersion == 6)
 }
 
 @Test func discardingExactInvalidV5ReplyStartsFreshV6Run() throws {

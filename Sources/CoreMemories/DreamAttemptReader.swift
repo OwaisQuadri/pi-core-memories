@@ -21,6 +21,10 @@ struct VerifiedDreamAttempt {
   let selection: DreamSelectedCall?
   let response: DurableDreamResponse?
   let rendering: DreamRequestRendering
+
+  var isHistoricalNoChangeLimitEnforced: Bool {
+    replacement.map { (2...4).contains($0.schemaVersion) } ?? false
+  }
 }
 
 struct DreamAttemptReader {
@@ -116,7 +120,8 @@ struct DreamAttemptReader {
       guard
         case .failure(let rejection) = DreamDecision.assess(
           response: rejectedResponse, context: context, rendering: previous.rendering,
-          isHistoricalNoChangeLimitEnforced: (2...4).contains(intent.schemaVersion))
+          isHistoricalNoChangeLimitEnforced: previous.isHistoricalNoChangeLimitEnforced
+            || (2...4).contains(intent.schemaVersion))
       else { throw DreamRunError.corruption }
       switch intent.schemaVersion {
       case 2, 5:

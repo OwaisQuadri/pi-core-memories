@@ -11,9 +11,9 @@ package struct DreamArtifact: Codable, Sendable, Identifiable {
 
 package struct SavedDreamAttempt: Codable, Sendable, Identifiable {
   package let number: Int
-  package let provider: String
-  package let modelID: String
-  package let thinkingLevel: String
+  package let provider: String?
+  package let modelID: String?
+  package let thinkingLevel: String?
   package let status: String
   package let suggestionCount: Int?
   package let diagnostic: String?
@@ -107,9 +107,10 @@ package struct DreamInspection: Codable, Sendable {
     let context = try DreamRunEncoding.context(
       bytes: directory.read("context.json", maximum: limits.maximumFrozenBytes), run: run)
     let requestBytes = try directory.read("request.json", maximum: limits.maximumFrozenBytes)
-    let verifiedRequest = try DreamRunEncoding.decode(
-      DreamRunEncoding.Request.self, bytes: requestBytes
-    ).verifiedDomain(run: run, context: context, bytes: requestBytes)
+    let requestRecord = try DreamRunEncoding.decode(
+      DreamRunEncoding.Request.self, bytes: requestBytes)
+    let verifiedRequest = try requestRecord.verifiedDomain(
+      run: run, context: context, bytes: requestBytes)
     let request = verifiedRequest.request
     let admissionBytes = try root.child("admissions").read(
       "\(run.progress.generation).json", maximum: DreamRunEncoding.maximumMetadataBytes)
@@ -124,17 +125,21 @@ package struct DreamInspection: Codable, Sendable {
     else { throw DreamRunError.corruption }
     let reader = DreamAttemptReader(
       directory: directory, run: run, context: context, baseline: request,
-      rendering: verifiedRequest.rendering,
+      rendering: verifiedRequest.rendering, baselineSchemaVersion: requestRecord.schemaVersion,
       admissionHash: SourceDigest(bytes: admissionBytes), limits: limits)
-    var attempts: [SavedDreamAttempt] = []
-    _ = try reader.verify { attempt in
-      guard let selection = attempt.selection else { return }
-      var status = "No saved reply"
+    var verifiedAttempts: [VerifiedDreamAttempt] = []
+    _ = try reader.verify { verifiedAttempts.append($0) }
+    let attempts = verifiedAttempts.enumerated().map { index, attempt -> SavedDreamAttempt in
+      let nextVersion = verifiedAttempts.indices.contains(index + 1)
+        ? verifiedAttempts[index + 1].replacement?.schemaVersion : nil
+      var status = attempt.selection == nil ? "Call not started" : "No saved reply"
       var suggestionCount: Int?
       var diagnostic: String?
       if let response = attempt.response {
         switch DreamDecision.assess(
-          response: response, context: context, rendering: attempt.rendering)
+          response: response, context: context, rendering: attempt.rendering,
+          isHistoricalNoChangeLimitEnforced: attempt.isHistoricalNoChangeLimitEnforced
+            || (nextVersion.map { (2...4).contains($0) } ?? false))
         {
         case .success(let result):
           suggestionCount = result.plans.count
@@ -150,11 +155,10 @@ package struct DreamInspection: Codable, Sendable {
           }
         }
       }
-      attempts.append(
-        SavedDreamAttempt(
-          number: attempt.attempt.number, provider: selection.provider,
-          modelID: selection.modelID, thinkingLevel: selection.thinkingLevel,
-          status: status, suggestionCount: suggestionCount, diagnostic: diagnostic))
+      return SavedDreamAttempt(
+        number: attempt.attempt.number, provider: attempt.selection?.provider,
+        modelID: attempt.selection?.modelID, thinkingLevel: attempt.selection?.thinkingLevel,
+        status: status, suggestionCount: suggestionCount, diagnostic: diagnostic)
     }
     return SavedDreamRun(
       id: id, generation: run.progress.generation, approvedBase: run.approvedBase,

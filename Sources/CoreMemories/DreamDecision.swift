@@ -565,12 +565,15 @@ public enum DreamDecision {
 
   static func assess(
     response: DurableDreamResponse, context: DreamDecisionContext,
-    rendering: DreamRequestRendering = .current
+    rendering: DreamRequestRendering = .current,
+    isHistoricalNoChangeLimitEnforced: Bool = false
   )
     -> Result<ValidatedDreamDecision, DreamDecisionRejection>
   {
     do {
-      return .success(try evaluate(response: response, context: context, rendering: rendering))
+      return .success(try evaluate(
+        response: response, context: context, rendering: rendering,
+        isHistoricalNoChangeLimitEnforced: isHistoricalNoChangeLimitEnforced))
     } catch let rejection
       as DreamDecisionRejection
     { return .failure(rejection) } catch let error as DreamDecisionError {
@@ -582,7 +585,8 @@ public enum DreamDecision {
   }
 
   private static func evaluate(
-    response: DurableDreamResponse, context: DreamDecisionContext, rendering: DreamRequestRendering
+    response: DurableDreamResponse, context: DreamDecisionContext, rendering: DreamRequestRendering,
+    isHistoricalNoChangeLimitEnforced: Bool
   ) throws
     -> ValidatedDreamDecision
   {
@@ -614,7 +618,9 @@ public enum DreamDecision {
         error: .context("reply: " + error.message), failure: error.failure)
     } catch { throw DreamDecisionError.schema }
     try context.limits.check(decisions.count, maximum: context.limits.maximumDecisions)
-    var validator = DecisionValidator(context: context, rendering: rendering)
+    var validator = DecisionValidator(
+      context: context, rendering: rendering,
+      isHistoricalNoChangeLimitEnforced: isHistoricalNoChangeLimitEnforced)
     for (index, decision) in decisions.enumerated() {
       do { try validator.accept(decision) } catch DreamDecisionError.limitExceeded {
         throw DreamDecisionRejection(
@@ -668,6 +674,7 @@ private enum DecisionAnchorError: Error {
 private struct DecisionValidator {
   let context: DreamDecisionContext
   let rendering: DreamRequestRendering
+  let isHistoricalNoChangeLimitEnforced: Bool
   var references = 0
   var covered: Set<PrimaryTextID> = []
   var terminal: Set<PrimaryTextID> = []
@@ -910,7 +917,7 @@ private struct DecisionValidator {
     let rawSources = try object["sources"]!.array()
     try context.limits.check(
       rawSources.count,
-      maximum: kind == "noChange"
+      maximum: kind == "noChange" && !isHistoricalNoChangeLimitEnforced
         ? context.limits.maximumReferences : context.limits.maximumSources)
     let sources = try rawSources.map { try source($0) }.sorted(by: isSourceOrdered)
     guard !sources.isEmpty, Set(sources).count == sources.count else {

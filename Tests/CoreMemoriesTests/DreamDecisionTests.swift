@@ -216,7 +216,8 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
   defer { fixture.clean() }
   let context = try fixture.context()
   for (schema, rendering) in [
-    (3, 6), (3, 5), (3, nil), (3, 1), (3, 2), (3, 3), (3, 4), (2, 3), (3, 7), (4, 4),
+    (3, 6), (4, 6), (3, 5), (3, nil), (3, 1), (3, 2), (3, 3), (3, 4),
+    (2, 3), (3, 7), (4, 4), (4, 5), (4, nil),
   ] as [(Int, Int?)]
   {
     let request = DreamRunEncoding.Request(
@@ -226,7 +227,7 @@ func dreamRequestUnversionedReplayPreservesFrozenRenderingAndRawDigest(
       messages: try context.requestMessages(timestampMilliseconds: 123), renderingVersion: rendering
     )
     let bytes = try DreamRunEncoding.encode(request)
-    if schema == 3 && rendering == 6 {
+    if (schema == 3 || schema == 4) && rendering == 6 {
       let saved = try DreamRunEncoding.decode(DreamRunEncoding.Request.self, bytes: bytes)
       #expect(
         try saved.domain(run: fixture.run, context: context, bytes: bytes).requestHash
@@ -490,6 +491,12 @@ func dreamRequestSavedV3AndV4StillVerifyWithoutPriorContextSections(
   #expect(validated.plans.isEmpty)
   #expect(validated.notes.count == 1)
   #expect(validated.notes.first?.sources == sources)
+  switch DreamDecision.assess(
+    response: response, context: context, isHistoricalNoChangeLimitEnforced: true)
+  {
+  case .success: Issue.record("Expected the historical 64-source limit to reject 67 sources")
+  case .failure(let rejection): #expect(rejection.failure.code == .limitExceeded)
+  }
 
   let bounded = try fixture.context(limits: DreamDecisionLimits(maximumReferences: 66))
   let boundedResponse = try fixture.response([noChange], context: bounded)

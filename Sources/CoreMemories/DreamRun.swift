@@ -1347,7 +1347,7 @@ public final class DreamRunStore {
       else { throw DreamRunError.corruption }
       func makeRequest(_ context: DreamDecisionContext) throws -> DreamRunEncoding.Request {
         DreamRunEncoding.Request(
-          schemaVersion: 3, runID: runID, generation: progress.generation,
+          schemaVersion: 4, runID: runID, generation: progress.generation,
           inputHash: run.inputHash.rawValue, contextHash: context.contextHash.rawValue,
           systemPrompt: context.savedSystemPrompt,
           messages: try context.requestMessages(timestampMilliseconds: Int64(milliseconds)),
@@ -1403,7 +1403,7 @@ public final class DreamRunStore {
         admission: admission, admissionHash: SourceDigest(bytes: admissionBytes), run: run,
         context: context,
         request: try request.domain(run: run, context: context, bytes: requestBytes),
-        rendering: .current, directory: directory)
+        rendering: .current, requestSchemaVersion: request.schemaVersion, directory: directory)
       try save(generation: progress.generation, hash: chain.hash, sealed: sealed)
     }
     if let recoveryTarget {
@@ -1434,7 +1434,8 @@ public final class DreamRunStore {
       if resume == .discardInvalidResponse {
         guard let response = attempt.response, sealed.rendering == .priorContextV5,
           case .failure = DreamDecision.assess(
-            response: response, context: sealed.context, rendering: attempt.rendering)
+            response: response, context: sealed.context, rendering: attempt.rendering,
+            isHistoricalNoChangeLimitEnforced: attempt.isHistoricalNoChangeLimitEnforced)
         else { throw DreamRunError.replacementUnavailable }
       } else {
         guard sealed.rendering == .current,
@@ -1505,7 +1506,8 @@ public final class DreamRunStore {
         let feedback: DreamReplacementFeedback?
         if sealed.rendering == .priorContextV5 {
           guard case .failure(let rejection) = DreamDecision.assess(
-            response: response, context: sealed.context, rendering: previous.rendering)
+            response: response, context: sealed.context, rendering: previous.rendering,
+            isHistoricalNoChangeLimitEnforced: previous.isHistoricalNoChangeLimitEnforced)
           else { throw DreamRunError.corruption }
           feedback = DreamReplacementFeedback(
             failure: rejection.failure, rendering: previous.rendering)
@@ -1517,7 +1519,7 @@ public final class DreamRunStore {
           rejected, name: next.archiveName, directory: sealed.directory, isReplacing: false)
         try install(
           DreamRunEncoding.ReplacementIntent(
-            schemaVersion: feedback == nil ? 2 : 4,
+            schemaVersion: feedback == nil ? 5 : 6,
             admissionHash: sealed.admissionHash.rawValue,
             requestHash: sealed.request.requestHash.rawValue,
             rejectedResponseHash: SourceDigest(bytes: rejected).rawValue,
@@ -1549,7 +1551,7 @@ public final class DreamRunStore {
       let prepared = try verifiedAttempt(sealed, attempt: attempt)
       if try sealed.directory.isPresent(attempt.callName) {
         let callSelection = try loadCallSelection(sealed, attempt: attempt)
-        if prepared.replacement?.schemaVersion == 4 {
+        if prepared.replacement?.schemaVersion == 4 || prepared.replacement?.schemaVersion == 6 {
           if resume != .replaceInvalidResponse || callSelection != selection {
             return pending(sealed, reason: .recoveryApprovalRequired, callSelection: callSelection)
           }
@@ -1569,6 +1571,7 @@ public final class DreamRunStore {
         attempt: attempt, replacement: prepared.replacement,
         replacementHash: prepared.replacementHash, selection: selection)
       let isEffective = prepared.replacement?.schemaVersion == 4
+        || prepared.replacement?.schemaVersion == 6
       let intent = DreamRunEncoding.Intent(
         schemaVersion: isEffective ? 3 : 2, admissionHash: sealed.admissionHash.rawValue,
         requestHash: request.requestHash.rawValue,
@@ -2246,6 +2249,7 @@ public final class DreamRunStore {
     let context: DreamDecisionContext
     let request: DreamModelRequest
     let rendering: DreamRequestRendering
+    let requestSchemaVersion: Int
     let directory: DreamStateDirectory
   }
 
@@ -2414,7 +2418,7 @@ public final class DreamRunStore {
     return SealedRun(
       admission: admission, admissionHash: SourceDigest(bytes: bytes), run: run,
       context: context, request: verified.request, rendering: verified.rendering,
-      directory: directory)
+      requestSchemaVersion: request.schemaVersion, directory: directory)
   }
 
   private struct Outcome {
@@ -2434,6 +2438,7 @@ public final class DreamRunStore {
     DreamAttemptReader(
       directory: sealed.directory, run: sealed.run, context: sealed.context,
       baseline: sealed.request, rendering: sealed.rendering,
+      baselineSchemaVersion: sealed.requestSchemaVersion,
       admissionHash: sealed.admissionHash, limits: limits)
   }
 
@@ -2478,7 +2483,8 @@ public final class DreamRunStore {
       guard let durable = saved.response else { throw DreamRunError.missingPayload }
       responseHash = durable.responseHash
       switch DreamDecision.assess(
-        response: durable, context: sealed.context, rendering: saved.rendering)
+        response: durable, context: sealed.context, rendering: saved.rendering,
+        isHistoricalNoChangeLimitEnforced: saved.isHistoricalNoChangeLimitEnforced)
       {
       case .success(let result): validated = result
       case .failure(let rejection): throw rejection.error

@@ -40,7 +40,9 @@ import Testing
   #expect(try fixture.snapshot(fixture.state) == saved)
 }
 
-private func freezeV5Request(_ fixture: TransactionFixture) throws {
+private func freezeV5Request(
+  _ fixture: TransactionFixture, rendering: DreamRequestRendering = .priorContextV5
+) throws {
   let root = fixture.state
   let admissionURL = root.appendingPathComponent("admissions/0.json")
   let admission = try DreamRunEncoding.decode(
@@ -59,10 +61,10 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
   let legacy = DreamRunEncoding.Request(
     schemaVersion: 3, runID: request.runID, generation: request.generation,
     inputHash: request.inputHash, contextHash: request.contextHash,
-    systemPrompt: context.systemPrompt(rendering: .priorContextV5),
+    systemPrompt: context.systemPrompt(rendering: rendering),
     messages: try context.requestMessages(
       timestampMilliseconds: request.messages[0].timestampMilliseconds,
-      rendering: .priorContextV5), renderingVersion: 5)
+      rendering: rendering), renderingVersion: rendering.rawValue)
   let requestBytes = try DreamRunEncoding.encode(legacy)
   let changedAdmission = DreamRunEncoding.Admission(
     schemaVersion: admission.schemaVersion, bindingHash: admission.bindingHash,
@@ -163,7 +165,7 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
   let intent = try DreamRunEncoding.decode(
     DreamRunEncoding.ReplacementIntent.self,
     bytes: Data(contentsOf: fixture.payload("replacement-1.json")))
-  #expect(intent.schemaVersion == 4)
+  #expect(intent.schemaVersion == 6)
   #expect(intent.targetRenderingVersion == 6)
   let intentURL = try fixture.payload("replacement-1.json")
   let originalIntent = try Data(contentsOf: intentURL)
@@ -203,6 +205,268 @@ private func freezeV5Request(_ fixture: TransactionFixture) throws {
   let inspected = try DreamInspection.read(stateRoot: fixture.state)
   let saved = try #require(inspected.runs.first { $0.id == rejected.runID })
   #expect(saved.attempts.map(\.status) == ["Rejected reply", "Reply valid"])
+}
+
+@Test func replayPreservesTheNoChangeLimitInOldArchivesOnly() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: (0..<67).map { "Event \($0)." })
+  var baselineRequest: DreamModelRequest?
+  var noChange: [String: Any] = [:]
+  let pending = try transactionPending(
+    fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) }) {
+      request in
+      baselineRequest = request
+      let context = try transactionObject(request)
+      let primary = context["primaryEvidence"] as! [[String: Any]]
+      let scopes = context["scopes"] as! [[String: Any]]
+      #expect(primary.count == 67)
+      let sources = primary.map { $0["source"]! }
+      let resolution = scopes.first { ($0["source"] as! NSDictionary) == (sources[0] as! NSDictionary) }!["resolution"] as! [String: Any]
+      noChange = [
+        "kind": "noChange", "sources": sources,
+        "reasonCode": resolution["kind"] as! String == "unresolved" ? "unresolvedScope" : "notDurable",
+        "explanation": "Each source describes a separate event.",
+      ]
+      return try transactionResponse(request, decisions: [noChange, ["kind": "unsupported"]])
+    }, reason: .invalidDecision)
+  let request = try #require(baselineRequest)
+  let requestHash = SourceDigest(bytes: try Data(contentsOf: fixture.payload("request.json")))
+  let interrupted = try fixture.store()
+  interrupted.persistenceFault = {
+    if $0 == .afterDirectorySync("replacement-1.json") { throw POSIXError(.EIO) }
+  }
+  #expect(throws: DreamRunError.persistenceFailure) {
+    try interrupted.run(
+      selection: fixture.selection, resume: .replaceInvalidResponse,
+      recoveryTarget: DreamRecoveryTarget(runID: pending.runID, requestHash: requestHash.rawValue),
+      prepare: transactionUncalledPrepare, call: transactionUncalled)
+  }
+  let intentURL = try fixture.payload("replacement-1.json")
+  let intent = try DreamRunEncoding.decode(
+    DreamRunEncoding.ReplacementIntent.self, bytes: Data(contentsOf: intentURL))
+  #expect(intent.schemaVersion == 5)
+  let notStarted = try DreamInspection.read(stateRoot: fixture.state)
+  let waiting = try #require(notStarted.runs.first { $0.id == pending.runID })
+  #expect(waiting.attempts.map(\.status) == ["Rejected reply", "Call not started"])
+  #expect(waiting.attempts.last?.provider == nil)
+  _ = try transactionPending(
+    fixture.store().run(
+      selection: fixture.selection, resume: .retryInterruptedCall,
+      prepare: transactionUncalledPrepare, call: { _ in throw CancellationError() }),
+    reason: .cancelled)
+  _ = try transactionPending(
+    fixture.store().run(
+      selection: fixture.selection, prepare: transactionUncalledPrepare,
+      call: transactionUncalled), reason: .interruptedCall)
+
+  let validText = try transactionResponse(request, decisions: [noChange]).text
+  let originalURL = try fixture.payload("response.json")
+  let original = try DreamRunEncoding.decode(
+    DreamRunEncoding.BoundResponse.self, bytes: Data(contentsOf: originalURL))
+  let historicalResponse = DreamRunEncoding.BoundResponse(
+    schemaVersion: original.schemaVersion, admissionHash: original.admissionHash,
+    runID: original.runID, generation: original.generation,
+    inputHash: original.inputHash, contextHash: original.contextHash,
+    requestHash: original.requestHash, selection: original.selection, text: validText,
+    callIntentHash: original.callIntentHash)
+  let responseBytes = try DreamRunEncoding.encode(historicalResponse)
+  try responseBytes.write(to: originalURL)
+  try responseBytes.write(to: fixture.payload("rejected-1.json"))
+  let historicalIntent = DreamRunEncoding.ReplacementIntent(
+    schemaVersion: 2, admissionHash: intent.admissionHash,
+    requestHash: intent.requestHash, rejectedResponseHash: SourceDigest(bytes: responseBytes).rawValue)
+  try DreamRunEncoding.encode(historicalIntent).write(to: intentURL)
+  _ = try transactionPending(
+    fixture.store().run(
+      selection: fixture.selection, prepare: transactionUncalledPrepare,
+      call: transactionUncalled), reason: .interruptedCall)
+  let inspected = try DreamInspection.read(stateRoot: fixture.state)
+  let saved = try #require(inspected.runs.first { $0.id == pending.runID })
+  #expect(saved.attempts.first?.status == "Rejected reply")
+  #expect(saved.attempts.first?.diagnostic == "Reply exceeds a frozen validation limit")
+
+  let currentIntent = DreamRunEncoding.ReplacementIntent(
+    schemaVersion: 5, admissionHash: intent.admissionHash,
+    requestHash: intent.requestHash, rejectedResponseHash: SourceDigest(bytes: responseBytes).rawValue)
+  try DreamRunEncoding.encode(currentIntent).write(to: intentURL)
+  #expect(throws: DreamRunError.corruption) {
+    try fixture.store().run(
+      selection: fixture.selection, prepare: transactionUncalledPrepare,
+      call: transactionUncalled)
+  }
+}
+
+@Test func oldInitialNoChangeWithoutReplacementRemainsRejected() throws {
+  for rendering in [DreamRequestRendering.priorContextV5, .scopeContractV6] {
+    let fixture = try TransactionFixture()
+    defer { fixture.clean() }
+    try fixture.populate(texts: (0..<67).map { "Event \($0)." })
+    var request: DreamModelRequest?
+    var noChange: [String: Any] = [:]
+    let pending = try transactionPending(
+      fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) }) {
+        modelRequest in
+        request = modelRequest
+        let context = try transactionObject(modelRequest)
+        let primary = context["primaryEvidence"] as! [[String: Any]]
+        let scopes = context["scopes"] as! [[String: Any]]
+        let sources = primary.map { $0["source"]! }
+        let resolution = scopes.first {
+          ($0["source"] as! NSDictionary) == (sources[0] as! NSDictionary)
+        }!["resolution"] as! [String: Any]
+        noChange = [
+          "kind": "noChange", "sources": sources,
+          "reasonCode": resolution["kind"] as! String == "unresolved" ? "unresolvedScope" : "notDurable",
+          "explanation": "Each source describes a separate event.",
+        ]
+        return try transactionResponse(modelRequest, decisions: [noChange, ["kind": "unsupported"]])
+      }, reason: .invalidDecision)
+    try freezeV5Request(fixture, rendering: rendering)
+    let originalURL = try fixture.payload("response.json")
+    let original = try DreamRunEncoding.decode(
+      DreamRunEncoding.BoundResponse.self, bytes: Data(contentsOf: originalURL))
+    let text = try transactionResponse(try #require(request), decisions: [noChange]).text
+    let historicalResponse = DreamRunEncoding.BoundResponse(
+      schemaVersion: original.schemaVersion, admissionHash: original.admissionHash,
+      runID: original.runID, generation: original.generation,
+      inputHash: original.inputHash, contextHash: original.contextHash,
+      requestHash: original.requestHash, selection: original.selection, text: text,
+      callIntentHash: original.callIntentHash)
+    try DreamRunEncoding.encode(historicalResponse).write(to: originalURL)
+
+    let inspected = try DreamInspection.read(stateRoot: fixture.state)
+    let saved = try #require(inspected.runs.first { $0.id == pending.runID })
+    #expect(saved.attempts.map(\.status) == ["Rejected reply"])
+    #expect(saved.attempts.first?.diagnostic == "Reply exceeds a frozen validation limit")
+    let stillPending = try transactionPending(
+      fixture.store().run(
+        selection: fixture.selection, prepare: transactionUncalledPrepare,
+        call: transactionUncalled), reason: .invalidDecision)
+    #expect(stillPending.runID == pending.runID)
+
+    if rendering == .priorContextV5 {
+      let requestHash = SourceDigest(bytes: try Data(contentsOf: fixture.payload("request.json")))
+      let discarded = try transactionPending(
+        fixture.store().run(
+          selection: fixture.selection, resume: .discardInvalidResponse,
+          recoveryTarget: try DreamRecoveryTarget(
+            runID: pending.runID, requestHash: requestHash.rawValue),
+          prepare: { try fixture.prepare($0) }, call: { _ in throw CancellationError() }),
+        reason: .cancelled)
+      #expect(discarded.runID != pending.runID)
+    }
+  }
+}
+
+@Test func historicalV4ReplacementKeepsTheOldNoChangeSourceLimit() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  try fixture.populate(texts: (0..<67).map { "Event \($0)." })
+  var request: DreamModelRequest?
+  var noChange: [String: Any] = [:]
+  let pending = try transactionPending(
+    fixture.store().run(selection: fixture.selection, prepare: { try fixture.prepare($0) }) {
+      modelRequest in
+      request = modelRequest
+      let object = try transactionObject(modelRequest)
+      let sources = (object["primaryEvidence"] as! [[String: Any]]).map { $0["source"]! }
+      let scopes = object["scopes"] as! [[String: Any]]
+      let resolution = scopes.first {
+        ($0["source"] as! NSDictionary) == (sources[0] as! NSDictionary)
+      }!["resolution"] as! [String: Any]
+      noChange = [
+        "kind": "noChange", "sources": sources,
+        "reasonCode": resolution["kind"] as! String == "unresolved" ? "unresolvedScope" : "notDurable",
+        "explanation": "Each source describes a separate event.",
+      ]
+      return try transactionResponse(modelRequest, decisions: [noChange, ["kind": "unsupported"]])
+    }, reason: .invalidDecision)
+  try freezeV5Request(fixture)
+  let originalURL = try fixture.payload("response.json")
+  let original = try DreamRunEncoding.decode(
+    DreamRunEncoding.BoundResponse.self, bytes: Data(contentsOf: originalURL))
+  let text = try transactionResponse(try #require(request), decisions: [noChange]).text
+  let historicalResponse = DreamRunEncoding.BoundResponse(
+    schemaVersion: original.schemaVersion, admissionHash: original.admissionHash,
+    runID: original.runID, generation: original.generation,
+    inputHash: original.inputHash, contextHash: original.contextHash,
+    requestHash: original.requestHash, selection: original.selection, text: text,
+    callIntentHash: original.callIntentHash)
+  let responseBytes = try DreamRunEncoding.encode(historicalResponse)
+  try responseBytes.write(to: originalURL)
+  let rejectedURL = try fixture.payload("rejected-1.json")
+  try responseBytes.write(to: rejectedURL)
+  try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: rejectedURL.path)
+
+  let admissionBytes = try Data(contentsOf: fixture.state.appendingPathComponent("admissions/0.json"))
+  let admission = try DreamRunEncoding.decode(DreamRunEncoding.Admission.self, bytes: admissionBytes)
+  let inputBytes = try Data(contentsOf: fixture.payload("input.json"))
+  let binding = SourceDigest(bytes: try Data(contentsOf: fixture.state.appendingPathComponent("root.json")))
+  let frozen = try DreamRunEncoding.frozen(
+    bytes: inputBytes, runID: admission.runID,
+    inputHash: SourceDigest(bytes: inputBytes), bindingHash: binding, limits: DreamRunLimits())
+  let context = try DreamRunEncoding.context(
+    bytes: Data(contentsOf: fixture.payload("context.json")), run: frozen)
+  let requestBytes = try Data(contentsOf: fixture.payload("request.json"))
+  let savedRequest = try DreamRunEncoding.decode(
+    DreamRunEncoding.Request.self, bytes: requestBytes)
+    .domain(run: frozen, context: context, bytes: requestBytes)
+  let response = try historicalResponse.domain(
+    run: frozen, context: context, request: savedRequest,
+    admissionHash: SourceDigest(bytes: admissionBytes), selection: fixture.selection,
+    bytes: responseBytes, maximumResponseBytes: DreamRunLimits().maximumResponseBytes)
+  guard case .success = DreamDecision.assess(
+    response: response, context: context, rendering: .priorContextV5)
+  else { Issue.record("The historical reply must satisfy the current source limit"); return }
+  guard case .failure(let rejection) = DreamDecision.assess(
+    response: response, context: context, rendering: .priorContextV5,
+    isHistoricalNoChangeLimitEnforced: true)
+  else { Issue.record("The historical reply must exceed the old source limit"); return }
+  #expect(rejection.failure.code == .limitExceeded)
+  let feedback = DreamReplacementFeedback(failure: rejection.failure, rendering: .priorContextV5)
+  let callHash = SourceDigest(bytes: try Data(contentsOf: fixture.payload("call-started.json")))
+  let intent = DreamRunEncoding.ReplacementIntent(
+    schemaVersion: 4, admissionHash: SourceDigest(bytes: admissionBytes).rawValue,
+    requestHash: SourceDigest(bytes: requestBytes).rawValue,
+    rejectedResponseHash: SourceDigest(bytes: responseBytes).rawValue,
+    attemptNumber: 1, rejectedAttemptNumber: 0, rejectedCallIntentHash: callHash.rawValue,
+    feedback: feedback, feedbackHash: SourceDigest(bytes: try feedback.bytes()).rawValue,
+    targetRenderingVersion: 6)
+  let intentBytes = try DreamRunEncoding.encode(intent)
+  let intentURL = try fixture.payload("replacement-1.json")
+  guard FileManager.default.createFile(
+    atPath: intentURL.path, contents: intentBytes,
+    attributes: [.posixPermissions: 0o600])
+  else { throw DreamRunError.persistenceFailure }
+  let inspected = try DreamInspection.read(stateRoot: fixture.state)
+  let saved = try #require(inspected.runs.first { $0.id == pending.runID })
+  #expect(saved.attempts.map(\.status) == ["Rejected reply", "Call not started"])
+  #expect(saved.attempts.first?.diagnostic == "Reply exceeds a frozen validation limit")
+  _ = try transactionPending(
+    fixture.store().run(selection: fixture.selection, prepare: transactionUncalledPrepare,
+      call: transactionUncalled), reason: .interruptedCall)
+  _ = try transactionPending(
+    fixture.store().run(
+      selection: fixture.selection, resume: .retryInterruptedCall,
+      prepare: transactionUncalledPrepare,
+      call: { request in try transactionResponse(request, decisions: [noChange]) }),
+    reason: .invalidDecision)
+  let inspectedReplacement = try DreamInspection.read(stateRoot: fixture.state)
+  let replacement = try #require(inspectedReplacement.runs.first { $0.id == pending.runID })
+  #expect(replacement.attempts.map(\.status) == ["Rejected reply", "Rejected reply"])
+  #expect(replacement.attempts.last?.diagnostic == "Reply exceeds a frozen validation limit")
+  _ = try transactionPending(
+    fixture.store().run(
+      selection: fixture.selection, resume: .replaceInvalidResponse,
+      recoveryTarget: DreamRecoveryTarget(
+        runID: pending.runID, requestHash: SourceDigest(bytes: requestBytes).rawValue),
+      prepare: transactionUncalledPrepare, call: { _ in throw CancellationError() }),
+    reason: .cancelled)
+  let nextIntent = try DreamRunEncoding.decode(
+    DreamRunEncoding.ReplacementIntent.self,
+    bytes: Data(contentsOf: fixture.payload("replacement-2.json")))
+  #expect(nextIntent.schemaVersion == 6)
 }
 
 @Test func discardingExactInvalidV5ReplyStartsFreshV6Run() throws {

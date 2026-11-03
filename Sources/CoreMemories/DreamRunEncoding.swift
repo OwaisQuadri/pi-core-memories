@@ -51,7 +51,9 @@ enum DreamRunEncoding {
           || ((type == Completion.self || type == Request.self || type == Intent.self
             || type == ReplacementIntent.self || type == BoundResponse.self)
             && schema.schemaVersion == 3)
-          || (type == ReplacementIntent.self && schema.schemaVersion == 4)
+          || (type == Request.self && schema.schemaVersion == 4)
+          || (type == ReplacementIntent.self
+            && (4...6).contains(schema.schemaVersion))
           || (type == RecoveryCheckpoint.self && schema.schemaVersion == 1)
       else { throw DreamRunError.unsupportedSchema }
       let value = try decoder.decode(type, from: bytes)
@@ -719,7 +721,7 @@ extension DreamRunEncoding {
       case (3, 3): return [.connectedV3]
       case (3, 4): return [.stuckDetectionV4]
       case (3, 5): return [.priorContextV5]
-      case (3, 6): return [.scopeContractV6]
+      case (3, 6), (4, 6): return [.scopeContractV6]
       default: throw DreamRunError.unsupportedSchema
       }
     }

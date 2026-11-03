@@ -1517,7 +1517,7 @@ public final class DreamRunStore {
           rejected, name: next.archiveName, directory: sealed.directory, isReplacing: false)
         try install(
           DreamRunEncoding.ReplacementIntent(
-            schemaVersion: feedback == nil ? 5 : 4,
+            schemaVersion: feedback == nil ? 5 : 6,
             admissionHash: sealed.admissionHash.rawValue,
             requestHash: sealed.request.requestHash.rawValue,
             rejectedResponseHash: SourceDigest(bytes: rejected).rawValue,
@@ -1549,7 +1549,7 @@ public final class DreamRunStore {
       let prepared = try verifiedAttempt(sealed, attempt: attempt)
       if try sealed.directory.isPresent(attempt.callName) {
         let callSelection = try loadCallSelection(sealed, attempt: attempt)
-        if prepared.replacement?.schemaVersion == 4 {
+        if prepared.replacement?.schemaVersion == 4 || prepared.replacement?.schemaVersion == 6 {
           if resume != .replaceInvalidResponse || callSelection != selection {
             return pending(sealed, reason: .recoveryApprovalRequired, callSelection: callSelection)
           }
@@ -1569,6 +1569,7 @@ public final class DreamRunStore {
         attempt: attempt, replacement: prepared.replacement,
         replacementHash: prepared.replacementHash, selection: selection)
       let isEffective = prepared.replacement?.schemaVersion == 4
+        || prepared.replacement?.schemaVersion == 6
       let intent = DreamRunEncoding.Intent(
         schemaVersion: isEffective ? 3 : 2, admissionHash: sealed.admissionHash.rawValue,
         requestHash: request.requestHash.rawValue,

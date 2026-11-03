@@ -52,7 +52,7 @@ enum DreamRunEncoding {
             || type == ReplacementIntent.self || type == BoundResponse.self)
             && schema.schemaVersion == 3)
           || (type == ReplacementIntent.self
-            && (schema.schemaVersion == 4 || schema.schemaVersion == 5))
+            && (4...6).contains(schema.schemaVersion))
           || (type == RecoveryCheckpoint.self && schema.schemaVersion == 1)
       else { throw DreamRunError.unsupportedSchema }
       let value = try decoder.decode(type, from: bytes)

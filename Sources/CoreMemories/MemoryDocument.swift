@@ -224,20 +224,6 @@ public enum MemoryDocument {
     }
   }
 
-  package static func reviewText(_ bytes: Data) -> String {
-    var text = (try? editableEntry(bytes)) ?? String(decoding: bytes, as: UTF8.self)
-    guard let matches = metadataMatches(in: text, regex: sourceRegex) else { return text }
-    for match in matches.reversed() {
-      guard let range = Range(match.range, in: text) else { continue }
-      var start = range.lowerBound
-      while start > text.startIndex, [" ", "\t"].contains(text[text.index(before: start)]) {
-        start = text.index(before: start)
-      }
-      text.removeSubrange(start..<range.upperBound)
-    }
-    return text
-  }
-
   private static func reviewMetadata(in bytes: Data) -> (
     identity: UUID?, instant: ReviewInstant?, revision: ReviewInstant?, failure: String?,
     range: Range<String.Index>?

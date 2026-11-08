@@ -223,6 +223,8 @@ The explanation must identify an actual changed claim or condition and the relev
 
 Recoverable operation failures emit `blocked` with `code:"busy"` or `code:"blocked"`. A choice whose receipt cannot be established emits `blocked` with `code:"outcome-unresolved"` and `decisionID`. Some recoveries return a `decision` receipt whose status is `outcome-unresolved`. Neither form means saved. Read the current row or inventory for retained limitations rather than interpreting a generic blocked result as success.
 
+Recoverable failures also report `operation` and a bounded `reason` code. The reason identifies a native error case or error type, not its associated data or message. Decision failures and failed final frames also report this reason code. A failure inside manual preview reports its `stage`: `availability`, `controller`, `drafts`, `batchSession`, `path`, `manualRequest`, `composition`, `checkout`, or `display`. A stage is a diagnostic location, not evidence that the preceding stages completed a memory change. Request decoding failures have no preview stage.
+
 Protocol, control-channel, startup, or binding failures can end with `final`, `status:"failed"`, and `code:"protocol-or-binding-failure"`, exit 1. A binding failure during an operation is a recoverable generic `blocked`. EOF/cancel also ends the invocation as failed, without consent. No raw private path or payload is included in error diagnostics. Release is idempotent. A failed ordinary operation does not necessarily release an existing claim; explicit release or channel close does. A consumed choice releases even when its outcome needs recovery.
 
 ## Recurrence and migration

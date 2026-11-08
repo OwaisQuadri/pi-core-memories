@@ -161,7 +161,11 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
       MemoryQueueManagement(queue: $0, configurationURL: configURL, configuration: configuration)
     }
     var managementDisplay: MemoryManagementDisplay?
-    var relocation: (store: DreamRunStore, baseline: String, replacement: URL, roles: DreamSourceRoles, previewHash: String, tuple: [String: String])?
+    var relocation:
+      (
+        store: DreamRunStore, baseline: String, replacement: URL, roles: DreamSourceRoles,
+        previewHash: String, tuple: [String: String]
+      )?
     queue?.isCancelled = { input.isCancelled }
     Thread.detachNewThread { input.read(descriptor: STDIN_FILENO, isControl: false) }
     Thread.detachNewThread { input.read(descriptor: control, isControl: true) }
@@ -187,6 +191,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
     while true {
       let (isControl, object) = try input.next()
       let type = try WorkerJSON.header(object)
+      var isManagementPreviewStarted = false
       do {
         if !isControl, ["approved-list", "approved-get"].contains(type) {
           try WorkerJSON.fields(
@@ -207,7 +212,9 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
         }
         if !isControl, type == "relocation-recover" {
           try WorkerJSON.fields(object, header.union(["decisionID"]))
-          let store = try configuration.reviewSources(stateRoot: configuration.stateURL, memoryRepository: configuration.memoryURL, isReadOnly: true)
+          let store = try configuration.reviewSources(
+            stateRoot: configuration.stateURL, memoryRepository: configuration.memoryURL,
+            isReadOnly: true)
           let decision = try store.recoverRelocationDecision(
             role: .snippets, decisionID: WorkerJSON.identifier(object, "decisionID"))
           if let decision {
@@ -220,8 +227,11 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
           continue
         }
         if !isControl, type == "relocation-preview" {
-          guard display == nil, managementDisplay == nil, relocation == nil else { throw WorkerError.protocolFailure }
-          try WorkerJSON.fields(object, header.union(["sessionID", "requestID", "baselineRunID", "replacement"]))
+          guard display == nil, managementDisplay == nil, relocation == nil else {
+            throw WorkerError.protocolFailure
+          }
+          try WorkerJSON.fields(
+            object, header.union(["sessionID", "requestID", "baselineRunID", "replacement"]))
           let identity = try MemoryQueueRequest(
             sessionID: WorkerJSON.identifier(object, "sessionID"),
             requestID: WorkerJSON.identifier(object, "requestID"))
@@ -229,9 +239,12 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
           let target = try WorkerJSON.text(object, "replacement", maximum: 4096)
           guard target.hasPrefix("/") else { throw WorkerError.protocolFailure }
           let replacement = URL(fileURLWithPath: target)
-          let store = try configuration.reviewSources(stateRoot: configuration.stateURL, memoryRepository: configuration.memoryURL, isReadOnly: true)
+          let store = try configuration.reviewSources(
+            stateRoot: configuration.stateURL, memoryRepository: configuration.memoryURL,
+            isReadOnly: true)
           let historical = try store.historicalSourceIdentities
-          let roles = try configuration.queueSourceRoles(sessions: historical.sessions, stripping: historical.stripping)
+          let roles = try configuration.queueSourceRoles(
+            sessions: historical.sessions, stripping: historical.stripping)
           let preview = try store.previewPromptRelocation(
             baselineRunID: baseline, replacement: replacement, sourceRoles: roles, role: .snippets)
           guard preview.isCompatible, let previewHash = preview.previewHash else {
@@ -246,7 +259,8 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             "preview": encoded(preview),
             "approval": "Approve this snippet relocation. This does not approve any memory change.",
           ]
-          let bytes = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys, .withoutEscapingSlashes])
+          let bytes = try JSONSerialization.data(
+            withJSONObject: payload, options: [.sortedKeys, .withoutEscapingSlashes])
           let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
           let expected = [
             "claimID": claimID, "sequence": "0", "revision": previewHash,
@@ -256,7 +270,9 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
           relocation = (store, baseline, replacement, roles, previewHash, expected)
           payload["displayDigest"] = digest
           input.expect(expected, type: "relocation-presented")
-          try emit("relocation-presentation", ["display": payload, "displayBytes": bytes.base64EncodedString()])
+          try emit(
+            "relocation-presentation",
+            ["display": payload, "displayBytes": bytes.base64EncodedString()])
           continue
         }
         if isControl, let current = relocation {
@@ -268,7 +284,9 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try emit("relocation-presented", ["displayDigest": current.tuple["displayDigest"]!])
           } else {
             guard type == "relocation-reply" else { throw WorkerError.protocolFailure }
-            try WorkerJSON.fields(object, tuple.union(["originalText", "submittedText", "decisionID", "responseReference"]))
+            try WorkerJSON.fields(
+              object,
+              tuple.union(["originalText", "submittedText", "decisionID", "responseReference"]))
             let action = interpretMemoryConversationReply(
               originalText: try WorkerJSON.text(object, "originalText", maximum: 65_536),
               submittedText: try WorkerJSON.text(object, "submittedText", maximum: 65_536),
@@ -278,7 +296,10 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
               try emit("reply-clarify", ["status": "no-decision"])
               continue
             }
-            defer { relocation = nil; input.expect(nil) }
+            defer {
+              relocation = nil
+              input.expect(nil)
+            }
             if action != .approve {
               try emit("relocation-cancelled", ["status": "not-saved"])
               continue
@@ -377,12 +398,22 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
                 responseReference: WorkerJSON.identifier(object, "responseReference"))
               try emit("manage-decision", ["receipt": encoded(receipt)])
             } catch DreamRunError.busy {
-              try emit("blocked", ["code": "outcome-unresolved", "decisionID": decisionID])
+              try emit(
+                "blocked",
+                [
+                  "code": "outcome-unresolved", "decisionID": decisionID,
+                  "reason": "DreamRunError.busy",
+                ])
             } catch {
               if let receipt = try? management.recover(decisionID: decisionID) {
                 try emit("manage-decision", ["receipt": encoded(receipt)])
               } else {
-                try emit("blocked", ["code": "outcome-unresolved", "decisionID": decisionID])
+                try emit(
+                  "blocked",
+                  [
+                    "code": "outcome-unresolved", "decisionID": decisionID,
+                    "reason": dreamWorkerFailureName(error),
+                  ])
               }
             }
           }
@@ -410,12 +441,22 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
                 current, action: action, decisionID: decisionID, responseReference: response)
               try emit("decision", ["receipt": encoded(receipt)])
             } catch DreamRunError.busy {
-              try emit("blocked", ["code": "outcome-unresolved", "decisionID": decisionID])
+              try emit(
+                "blocked",
+                [
+                  "code": "outcome-unresolved", "decisionID": decisionID,
+                  "reason": "DreamRunError.busy",
+                ])
             } catch {
               if let receipt = try? queue.recover(decisionID: decisionID) {
                 try emit("decision", ["receipt": encoded(receipt)])
               } else {
-                try emit("blocked", ["code": "outcome-unresolved", "decisionID": decisionID])
+                try emit(
+                  "blocked",
+                  [
+                    "code": "outcome-unresolved", "decisionID": decisionID,
+                    "reason": dreamWorkerFailureName(error),
+                  ])
               }
             }
           }
@@ -462,7 +503,9 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try emit("decision", ["receipt": encoded(receipt)])
           case "counts":
             try WorkerJSON.fields(object, header)
-            guard display == nil, managementDisplay == nil else { throw WorkerError.protocolFailure }
+            guard display == nil, managementDisplay == nil else {
+              throw WorkerError.protocolFailure
+            }
             try emit("counts", ["review": queue.reviewCount()])
           case "inventory":
             try WorkerJSON.fields(object, header)
@@ -492,6 +535,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             let identity = try MemoryQueueRequest(
               sessionID: WorkerJSON.identifier(object, "sessionID"),
               requestID: WorkerJSON.identifier(object, "requestID"))
+            isManagementPreviewStarted = true
             let current = try management.preview(
               request, identity: identity, isConfirmReviewed: mode == "confirm-reviewed")
             managementDisplay = current
@@ -546,11 +590,22 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
         throw WorkerError.protocolFailure
       } catch {
         let code = (error as? DreamRunError) == .busy ? "busy" : "blocked"
-        try emit("blocked", ["code": code])
+        var diagnostic: [String: Any] = [
+          "code": code, "reason": dreamWorkerFailureName(error), "operation": type,
+        ]
+        if isManagementPreviewStarted, let stage = management?.previewStage {
+          diagnostic["stage"] = stage.rawValue
+        }
+        try emit("blocked", diagnostic)
       }
     }
   } catch {
-    try? emit("final", ["status": "failed", "code": "protocol-or-binding-failure"])
+    try? emit(
+      "final",
+      [
+        "status": "failed", "code": "protocol-or-binding-failure",
+        "reason": dreamWorkerFailureName(error),
+      ])
     return 1
   }
 }

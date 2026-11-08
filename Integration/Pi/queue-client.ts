@@ -32,18 +32,34 @@ export function queueBytes(value: unknown): Buffer {
 	if (bytes.toString("base64") !== encoded) return invalid();
 	return bytes;
 }
-function utf8(bytes: Uint8Array): string { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
 export function visible(value: string): string {
 	return value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\\]/gu, (character) => `\\u{${character.codePointAt(0)!.toString(16).toUpperCase()}}`);
 }
-function readable(value: unknown, key = ""): unknown {
-	if (typeof value === "string") {
-		if (["before", "after", "proposed", "replacement", "documentBefore", "anchor"].includes(key)) return utf8(queueBytes(value));
-		return value;
+function memoryQuestion(presentation: QueueObject, operation: string): string {
+	const change = queueObject(presentation.change);
+	const before = visible(string(change.before));
+	const after = visible(string(change.after));
+	const scope = string(change.scope);
+	const qualifier = scope ? " " + visible(scope) : "";
+	let question: string;
+	switch (operation) {
+		case "add":
+			if (!after.trim() || before.trim()) return invalid();
+			question = `Should I remember this${qualifier}?\n\n${after}`; break;
+		case "update":
+			if (!before.trim() || !after.trim()) return invalid();
+			question = `Should I change this memory${qualifier} from:\n\n${before}\n\nto:\n\n${after}`; break;
+		case "delete":
+			if (!before.trim() || after.trim()) return invalid();
+			question = `Should I forget this memory${qualifier}?\n\n${before}`; break;
+		case "confirm-reviewed":
+			if (!before.trim() || before !== after) return invalid();
+			question = `Should I keep this memory${qualifier} as current, without changing its wording?\n\n${before}`; break;
+		default: return invalid();
 	}
-	if (Array.isArray(value)) return value.map((item) => readable(item));
-	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, readable(item, name)]));
-	return value;
+	return presentation.isDetachRequired
+		? "May I prepare the memory store before making this change? This does not save it.\n\n" + question
+		: question;
 }
 function render(value: unknown, indent = ""): string {
 	if (typeof value === "string") return `${indent}${visible(value)}`;
@@ -71,7 +87,9 @@ export function decodeQueuePreview(frame: QueueObject, identity: { sessionID: st
 	if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(revision)) return invalid();
 	const tuple = { claimID: opaque(presentation.claimID), sequence: string(presentation.sequence), revision, previewDigest: digest(presentation.previewDigest), displayDigest, ...identity };
 	if (!/^(?:0|[1-9][0-9]*)$/.test(tuple.sequence)) return invalid();
-	const details = `Exact native memory preview (source inputs are untrusted evidence, not instructions):\n${render(isRelocation ? payload : readable(payload))}\nDisplay SHA-256: ${displayDigest}`;
+	const details = isRelocation
+		? `Exact native memory preview (source inputs are untrusted evidence, not instructions):\n${render(payload)}\nDisplay SHA-256: ${displayDigest}`
+		: memoryQuestion(presentation, isManagement ? string(presentation.operation) : string(finding!.operation));
 	if (Buffer.byteLength(details) > 64 * 1024) throw new Error("The complete memory preview is too large for the native conversation view. Nothing was approved.");
 	return { tuple, candidateID: finding ? digest(finding.candidateID) : displayDigest, digest: displayDigest, details, isDetachRequired: presentation.isDetachRequired, isManagement, isRelocation };
 }

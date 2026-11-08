@@ -224,7 +224,11 @@ func queueWorkerApprovedStorageDoesNotRequireHealthyReview(failure: String) thro
     reason: "Explicit requested addition")
   let direct = MemoryQueueManagement(
     configurationURL: config, configuration: configuration)
-  _ = try direct.preview(change, identity: MemoryQueueRequest(sessionID: "core", requestID: "core"))
+  let preview = try direct.preview(
+    change, identity: MemoryQueueRequest(sessionID: "core", requestID: "core"))
+  #expect(preview.change?.before == "")
+  #expect(preview.change?.after == "Direct memory.")
+  #expect(preview.change?.scope == "")
   direct.release()
   let receipt = try worker.change(change)
   #expect(receipt["commit"] as? String == (try fixture.main()))

@@ -157,7 +157,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
       let queue = try MemoryQueue(
         sources: sources, reviewState: URL(fileURLWithPath: configuration.reviewState),
         journal: URL(fileURLWithPath: configuration.journal),
-        environment: ProcessInfo.processInfo.environment)
+        environment: ProcessInfo.processInfo.environment, configuration: configuration)
       queue.isCancelled = { input.isCancelled }
       reviewQueue = queue
       return queue

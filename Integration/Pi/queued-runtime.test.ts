@@ -416,6 +416,7 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 						isRelocation = type === "relocation-preview";
 						const request = fields.request as Record<string, unknown> | undefined;
 						const payload = {
+							change: { before: "", after: String(request?.replacement ?? "Keep this preference."), scope: "" },
 							claimID: "unit-claim", sequence: "1", request: { sessionID: fields.sessionID, requestID: fields.requestID }, isDetachRequired: false, previewDigest: "d".repeat(64),
 							...(isRelocation ? { operation: "relocate-snippets", role: "snippets", currentBase: "a".repeat(64), preview: { replacement: fields.replacement, baselineRunID: fields.baselineRunID } } : isManagement ? { operation: request?.operation, path: "MEMORY.md", currentBase: "b".repeat(40), before: "", after: Buffer.from(String(request?.replacement ?? "")).toString("base64"), documentBefore: "", replacement: Buffer.from(String(request?.replacement ?? "")).toString("base64") } : { finding: { candidateID: "c".repeat(64), revision: "a".repeat(64), operation: "add" } }),
 						};
@@ -427,7 +428,7 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 						assert.ok(native); assert.equal(isManagement, false); assert.equal(fields.displayDigest, digest); assert.equal(fields.claimID, native.claimID);
 						const amendment = fields.amendment as Record<string, string>;
 						const replacement = Buffer.from(amendment.replacement!).toString("base64");
-						native = { ...native, sequence: String(Number(native.sequence) + 1), after: replacement, replacement, previewDigest: createHash("sha256").update(JSON.stringify(amendment)).digest("hex") };
+						native = { ...native, change: { before: "", after: amendment.replacement, scope: "" }, sequence: String(Number(native.sequence) + 1), after: replacement, replacement, previewDigest: createHash("sha256").update(JSON.stringify(amendment)).digest("hex") };
 						const bytes = Buffer.from(JSON.stringify(native)); digest = createHash("sha256").update(bytes).digest("hex");
 						return { type: "presentation", display: { presentation: native, displayDigest: digest }, displayBytes: bytes.toString("base64") };
 					}

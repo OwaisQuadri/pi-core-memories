@@ -21,8 +21,10 @@ The extension uses public Pi extension interfaces. It does not require a Pi
 fork or a custom conversation interface. Supported package versions are the
 [peer dependencies in package.json](package.json).
 
-A registered custom-message renderer shows the exact native proposal in the
-normal transcript. One worker stays open for a later reply. Public input and
+A registered custom-message renderer asks about the proposed change in plain
+language in the normal transcript. It shows the memory wording and any named
+project or device scope, without hashes, source records, file paths, or transport
+data. The complete native record stays internal and bound to the displayed question. One worker stays open for a later reply. Public input and
 session events bind that reply to the unchanged prompt, the exact user message,
 and the current displayed proposal. Model tool arguments cannot supply it.
 The old modal approval adapter is removed, with no command or dialog fallback.
@@ -223,9 +225,13 @@ memory for the current runtime only. Each one is capped at 16 KB (about 85
 findings), keeping findings in the queue's stable order and stating how many
 were left out.
 
-Before a change, show the exact proposal, its reason, and its evidence. The user
-can discuss it, request a revision, reject it, defer it, or approve the exact
-displayed change.
+Before a change, ask a plain-language question about that change only. Additions
+show the new memory; updates show the old and new wording; deletions show what
+will be forgotten. Review-date changes say that the wording stays the same.
+Named project or device scope stays visible. Source annotations, internal
+identifiers, audit records, reasons, evidence, and limitations stay in the native
+record, not the question. The user can discuss, revise, reject, defer, or approve
+the displayed change. The question does not ask the user to run a command.
 
 Approval applies only to that proposal. A changed proposal needs a new display
 and new explicit approval. Silence, background work, tool output, an earlier

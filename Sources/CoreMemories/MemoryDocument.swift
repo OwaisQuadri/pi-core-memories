@@ -177,6 +177,20 @@ public enum MemoryDocument {
     return text
   }
 
+  package static func displayText(_ bytes: Data) throws -> String {
+    var text = try editableEntry(bytes)
+    guard let matches = metadataMatches(in: text, regex: sourceRegex) else {
+      throw MemoryError("cannot read memory wording")
+    }
+    for match in matches.reversed() {
+      guard let range = Range(match.range, in: text) else {
+        throw MemoryError("cannot read memory annotation")
+      }
+      text.removeSubrange(range)
+    }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
   static func sourceAnnotations(in bytes: Data) -> [String] {
     let text = String(decoding: bytes, as: UTF8.self)
     return sourceRegex.matches(in: text, range: NSRange(text.startIndex..., in: text)).map {
@@ -212,7 +226,6 @@ public enum MemoryDocument {
     return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).filter {
       guard let range = Range($0.range, in: text) else { return false }
       let start = text[..<range.lowerBound].utf8.count
-      let end = start + text[range].utf8.count
       var slashCount = 0
       var cursor = start
       while cursor > 0, raw[cursor - 1] == 92 {
@@ -220,7 +233,7 @@ public enum MemoryDocument {
         cursor -= 1
       }
       return slashCount.isMultiple(of: 2)
-        && allowed.contains { $0.contains(start) && end <= $0.upperBound }
+        && allowed.contains { $0.contains(start) }
     }
   }
 

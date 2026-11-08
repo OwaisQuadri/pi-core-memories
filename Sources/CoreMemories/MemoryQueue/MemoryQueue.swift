@@ -8,6 +8,7 @@ package final class MemoryQueue {
   private let queueRoot: URL
   let directory: DreamStateDirectory
   private let environment: [String: String]
+  private let configuration: MemoryConfiguration
   private var active: ActiveReview?
   private var sequence: UInt64 = 0
   var configureReview: (MemoryReviewController) -> Void = { _ in }
@@ -23,12 +24,14 @@ package final class MemoryQueue {
   }
 
   package init(
-    sources: DreamRunStore, reviewState: URL, journal: URL, environment: [String: String]
+    sources: DreamRunStore, reviewState: URL, journal: URL, environment: [String: String],
+    configuration: MemoryConfiguration = .defaults
   ) throws {
     self.sources = sources
     repository = sources.acceptedSources.memory
     self.reviewState = reviewState
     self.environment = environment
+    self.configuration = configuration
     let queueRoot = URL(fileURLWithPath: reviewState.path + ".queue")
     self.queueRoot = queueRoot
     let protected =
@@ -323,12 +326,13 @@ package final class MemoryQueue {
       candidateID: row.change.id, clockDate: clockDate, amendment: selected.amendment)
     let checkout = try review.checkoutPreview()
     sequence += 1
-    let presentation = MemoryQueuePresentation(
+    var presentation = MemoryQueuePresentation(
       claimID: UUID().uuidString, sequence: String(sequence), request: request, finding: finding,
       previewDigest: preview.digest.rawValue, currentBase: preview.currentBase,
       before: preview.before, after: preview.after, replacement: preview.replacement,
       isDetachRequired: checkout.isDetachRequired, checkoutCommit: checkout.commit,
       checkoutDigest: checkout.digest.rawValue, amendmentReason: selected.amendment?.reason)
+    presentation.change = try MemoryChangeDescription(before: preview.before, after: preview.after, path: finding.path, configuration: configuration)
     let display = MemoryQueueDisplay(
       presentation: presentation,
       displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(presentation)).rawValue)
@@ -356,13 +360,14 @@ package final class MemoryQueue {
       candidateID: current.preview.change.id, clockDate: clockDate, amendment: amendment)
     let checkout = try current.controller.checkoutPreview()
     sequence += 1
-    let replacement = MemoryQueuePresentation(
+    var replacement = MemoryQueuePresentation(
       claimID: presentation.claimID, sequence: String(sequence), request: presentation.request,
       finding: presentation.finding, previewDigest: preview.digest.rawValue,
       currentBase: preview.currentBase, before: preview.before, after: preview.after,
       replacement: preview.replacement, isDetachRequired: checkout.isDetachRequired,
       checkoutCommit: checkout.commit, checkoutDigest: checkout.digest.rawValue,
       amendmentReason: amendment.reason)
+    replacement.change = try MemoryChangeDescription(before: preview.before, after: preview.after, path: presentation.finding.path, configuration: configuration)
     let amended = MemoryQueueDisplay(
       presentation: replacement,
       displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(replacement)).rawValue)

@@ -17,6 +17,7 @@ package struct MemoryManagementDisplay: Codable, Equatable {
   package let checkoutCommit: String
   package let checkoutDigest: String
   package var displayDigest: String
+  package var change: MemoryChangeDescription? = nil
 
   package func publicationBytes() throws -> Data {
     guard
@@ -153,6 +154,7 @@ package final class MemoryQueueManagement {
       previewDigest: previewDigest, isDetachRequired: checkout.isDetachRequired,
       checkoutCommit: checkout.commit, checkoutDigest: checkout.digest.rawValue,
       displayDigest: "")
+    display.change = try MemoryChangeDescription(before: effect.before, after: effect.after, path: path, configuration: configuration)
     display.displayDigest = SourceDigest(bytes: try display.publicationBytes()).rawValue
     active = (drafts, session, checkout, display)
     messageReference = nil

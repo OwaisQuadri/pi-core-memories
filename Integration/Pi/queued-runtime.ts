@@ -15,6 +15,10 @@ import { protectDreamSources } from "./source-protection.ts";
 import { liveSessionIDs, markLiveSession, type LiveSessionMarker } from "./live-sessions.ts";
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
+function nativeFailure(frame: QueueObject): { failure: "native"; code: string; reason: string } {
+	const token = (value: unknown): string => typeof value === "string" && /^[A-Za-z0-9:._-]{1,80}$/.test(value) ? value : "unknown";
+	return { failure: "native", code: token(frame.code), reason: token(frame.reason) };
+}
 export function memoryRequestIdentity(ctx: Pick<ExtensionContext, "sessionManager">): { sessionID: string; requestID: string } {
 	const entry = [...ctx.sessionManager.getBranch()].reverse().find((entry) => entry.type === "message" && entry.message.role === "user");
 	if (!entry) throw new Error("Memory review needs a durable user request on the current branch.");
@@ -375,11 +379,15 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 						result = await state.client.request(state.preview.isRelocation ? "relocation-reply" : state.preview.isManagement ? "manage-reply" : "reply", { ...state.preview.tuple, originalText: reply.text, submittedText: reply.text, decisionID, responseReference: identity.requestID }, true);
 					} catch {
 						await closeConversation();
-						return { status: "outcome-unresolved", decisionID, recovery };
+						return { status: "outcome-unresolved", decisionID, recovery, failure: "request" };
 					}
-					if (!isCurrent() || result.type === "blocked") {
+					if (!isCurrent()) {
 						await closeConversation();
-						return { status: "outcome-unresolved", decisionID, recovery };
+						return { status: "outcome-unresolved", decisionID, recovery, failure: "changed-request" };
+					}
+					if (result.type === "blocked") {
+						await closeConversation();
+						return { status: "outcome-unresolved", decisionID, recovery, ...nativeFailure(result) };
 					}
 					if (result.type === "reply-clarify" && result.status === "no-decision") { await showConversation(state, identity.requestID, false); return { status: "needs-memory-clarification", tool: owner }; }
 					if ((state.preview.isManagement && result.type === "manage-cancelled" || state.preview.isRelocation && result.type === "relocation-cancelled") && result.status === "not-saved") { await closeConversation(); return { status: "not-saved" }; }
@@ -391,7 +399,7 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 						if (receipt.status === "approved" && (typeof receipt.commit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(receipt.commit) || typeof receipt.auditRef !== "string" || !receipt.auditRef.startsWith("refs/"))) throw new Error("Approved memory receipt has no checked publication.");
 					} catch {
 						await closeConversation();
-						return { status: "outcome-unresolved", decisionID, recovery };
+						return { status: "outcome-unresolved", decisionID, recovery, failure: "receipt" };
 					}
 					if (state.startType === "claim" && receipt.status !== "detached" && receipt.status !== "needs-decision") answeredRevisions.add(state.preview.tuple.revision);
 					if (receipt && receipt.status === "detached") {
@@ -427,9 +435,10 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 				const fields = type === "list" ? { ...identity, offset: params.offset ?? "0" } : type === "approved-get" ? { request: params.request } : type === "recover" || type === "manage-recover" || type === "relocation-recover" ? { decisionID: params.decisionID } : {};
 				const result = await client.request(type, fields);
 				if (type === "recover" || type === "manage-recover" || type === "relocation-recover") {
+					if (result.type === "blocked") return { receipt: null, status: "outcome-unresolved", ...nativeFailure(result) };
 					const receipt = result.receipt ? queueObject(result.receipt) : null;
 					if (type === "relocation-recover" && (result.type !== "relocation-decision" || receipt?.decisionID !== params.decisionID || receipt?.status !== "relocated")) return { receipt: null, status: "outcome-unresolved" };
-					return { receipt, status: result.type === "blocked" || typeof receipt?.status !== "string" ? "outcome-unresolved" : receipt.status };
+					return { receipt, status: typeof receipt?.status !== "string" ? "outcome-unresolved" : receipt.status };
 				}
 				const { invocationID: _invocation, version: _version, ...publicResult } = result;
 				return publicResult;

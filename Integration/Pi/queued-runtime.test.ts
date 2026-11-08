@@ -395,7 +395,7 @@ test("pending and present run the verified queue work once, with at most one cou
 	} finally { await f.stop(); }
 });
 
-function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "deferred" | "rejected")[] = [], rows: unknown[] | (() => unknown[]) = [], overrides: NonNullable<Parameters<typeof registerQueuedRuntime>[1]> = {}) {
+function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | "deferred" | "rejected" | "blocked" | "request-error")[] = [], rows: unknown[] | (() => unknown[]) = [], overrides: NonNullable<Parameters<typeof registerQueuedRuntime>[1]> = {}) {
 	let f: ReturnType<typeof runtime>;
 	const frames: { type: string; fields: Record<string, unknown>; isPrivate?: boolean }[] = [];
 	const signals: AbortSignal[] = []; const closes: number[] = [];
@@ -436,6 +436,8 @@ function conversationalRuntime(responses: ("approved" | "clarify" | "invalid" | 
 					if (type === "reply" || type === "manage-reply" || type === "relocation-reply") {
 						const response = responses.shift() ?? "approved";
 						if (response === "clarify") return { type: "reply-clarify", status: "no-decision" };
+						if (response === "blocked") return { type: "blocked", code: "outcome-unresolved", reason: "DreamRunError.corruption" };
+						if (response === "request-error") throw new Error("Private transport text must not escape.");
 						return { type: isRelocation ? "relocation-decision" : isManagement ? "manage-decision" : "decision", receipt: { decisionID: fields.decisionID, sessionID: fields.sessionID, requestID: fields.requestID, responseReference: fields.responseReference, revision: "a".repeat(64), displayDigest: response === "invalid" ? "0".repeat(64) : digest, status: isRelocation ? "relocated" : response === "deferred" || response === "rejected" ? response : "approved", commit: "f".repeat(40), auditRef: "refs/core-memories/unit-audit" } };
 					}
 					return { type: "released" };
@@ -704,6 +706,37 @@ for (const operation of ["reply", "amend"]) {
 	}
 }
 
+for (const response of ["blocked", "request-error"] as const) {
+	test(`${response} retains a safe failure category without approving memory`, async () => {
+		const f = conversationalRuntime([response]);
+		try {
+			await f.emit("session_start"); await f.call("memory_queue", { operation: "present", revision: "a".repeat(64) });
+			await f.reply("save that memory"); const result = await f.call("memory_queue", { operation: "reply" });
+			const details = result.details as Record<string, unknown>;
+			assert.equal(details.status, "outcome-unresolved"); assert.equal(typeof details.decisionID, "string");
+			assert.equal(details.failure, response === "blocked" ? "native" : "request");
+			if (response === "blocked") { assert.equal(details.code, "outcome-unresolved"); assert.equal(details.reason, "DreamRunError.corruption"); }
+			assert.doesNotMatch(JSON.stringify(details), /Private transport text/);
+			assert.equal(f.frames.filter((frame) => frame.type === "reply").length, 1);
+		} finally { await f.stop(); }
+	});
+}
+
+for (const reason of ["DreamRunError.corruption", "private memory contents\nsecret"]) {
+	test(`management recovery bounds native diagnostic text: ${reason.includes("\n") ? "unsafe" : "safe"}`, async () => {
+		const f = runtime(async () => assert.fail("No model call is needed"), "tui", undefined, {
+			idleMilliseconds: 60_000,
+			open: async () => ({ request: async () => ({ type: "blocked", code: "blocked", reason, detail: "Private memory contents" }), close: async () => {} }),
+		});
+		try {
+			await f.emit("session_start");
+			const result = await f.tool.execute("recover", { operation: "manage-recover", decisionID: "failed-decision" }, undefined, undefined, f.ctx);
+			assert.deepEqual(result.details, { receipt: null, status: "outcome-unresolved", failure: "native", code: "blocked", reason: reason.includes("\n") ? "unknown" : reason });
+			assert.doesNotMatch(JSON.stringify(result.details), /Private memory contents|secret/);
+		} finally { await f.stop(); }
+	});
+}
+
 test("a mismatched native receipt returns its recovery identifier, never approval", async () => {
 	const f = conversationalRuntime(["invalid"]);
 	try {
@@ -711,7 +744,7 @@ test("a mismatched native receipt returns its recovery identifier, never approva
 		await f.reply("save that memory"); const result = await f.call("memory_queue", { operation: "reply" });
 		const details = result.details as Record<string, unknown>;
 		assert.equal(details.status, "outcome-unresolved"); assert.equal(typeof details.decisionID, "string");
-		assert.equal(details.recovery, "recover"); assert.equal(f.closes.length, 1);
+		assert.equal(details.recovery, "recover"); assert.equal(details.failure, "receipt"); assert.equal(f.closes.length, 1);
 	} finally { await f.stop(); }
 });
 

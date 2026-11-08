@@ -343,6 +343,79 @@ func queueWorkerOnlyExactPrivateOriginalReplyReturnsReceipt(mode: String) throws
   worker.process.waitUntilExit()
 }
 
+@Test(arguments: ["valid", "missing-audit", "namespace", "schema", "witness", "attempt"])
+func legacyDetachRecoveryRequiresHistoricalProof(failure: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let config = try queueWorkerConfig(fixture)
+  let configuration = try MemoryConfiguration.load(from: config)
+  let management = MemoryQueueManagement(configurationURL: config, configuration: configuration)
+  let display = try management.preview(
+    MemoryManagementRequest(
+      operation: .add, base: try fixture.main(), path: "MEMORY.md",
+      replacement: "Direct memory. [source: explicit user request; added: 2026-01-01]\n",
+      reason: "Explicit requested addition"),
+    identity: MemoryQueueRequest(sessionID: "legacy", requestID: "legacy"))
+  try management.presented(display, messageReference: "display")
+  #expect(
+    try management.decide(
+      display, action: "detach", decisionID: "legacy", responseReference: "later-reply"
+    ).status == "detached")
+  let journal = fixture.memory.deletingLastPathComponent()
+    .appendingPathComponent(fixture.memory.lastPathComponent + ".management")
+  let current = try DreamStateDirectory.openRoot(journal)
+  let queue = try DreamStateDirectory.openRoot(
+    URL(fileURLWithPath: configuration.reviewState + ".queue"))
+  try queue.installReviewFile(
+    current.read("management-legacy.json", maximum: MemoryReviewEncoding.maximumFileBytes),
+    name: "management-legacy.json")
+  try FileManager.default.removeItem(at: journal.appendingPathComponent("management-legacy.json"))
+  let root = try DreamStateDirectory.openRoot(URL(fileURLWithPath: configuration.reviewState))
+  let original = try MemoryReviewEncoding.decode(
+    ReviewDetachAttempt.self,
+    bytes: current.read(
+      "detach-attempt-\(display.checkoutDigest).json",
+      maximum: MemoryReviewEncoding.maximumFileBytes))
+  let historical = ReviewDetachAttempt(
+    schemaVersion: 1, witness: original.witness, digest: original.digest,
+    auditRef: "refs/memory-review/detach/\(original.digest)")
+  let git = try MemoryStore(repo: fixture.memory).reviewGit
+  #expect(
+    try git.directRefTransaction(
+      "create \(historical.auditRef) \(historical.witness.commit)\n",
+      refs: [historical.auditRef], isolatedHead: historical.witness.commit
+    ).status == 0)
+  var outcome = try #require(
+    JSONSerialization.jsonObject(with: MemoryReviewEncoding.encode(historical)) as? [String: Any])
+  switch failure {
+  case "missing-audit":
+    #expect(
+      try git.directRefTransaction(
+        "delete \(historical.auditRef) \(historical.witness.commit)\n",
+        refs: [historical.auditRef], isolatedHead: historical.witness.commit
+      ).status == 0)
+  case "namespace": outcome["auditRef"] = original.auditRef
+  case "schema": outcome["schemaVersion"] = 2
+  case "witness":
+    var witness = try #require(outcome["witness"] as? [String: Any])
+    witness["main"] = String(repeating: "0", count: 40)
+    outcome["witness"] = witness
+  default: break
+  }
+  let outcomeBytes = try JSONSerialization.data(
+    withJSONObject: outcome, options: [.sortedKeys, .withoutEscapingSlashes])
+  try root.installReviewFile(outcomeBytes, name: "detach-outcome-\(original.digest).json")
+  try root.installReviewFile(
+    failure == "attempt" ? MemoryReviewEncoding.encode(original) : outcomeBytes,
+    name: "detach-attempt-\(original.digest).json")
+  if failure == "valid" {
+    #expect(try management.recover(decisionID: "legacy").status == "detached")
+  } else {
+    #expect(throws: DreamRunError.corruption) { try management.recover(decisionID: "legacy") }
+  }
+  #expect(try fixture.main() == display.currentBase)
+}
+
 @Test func queueWorkerBlockedPreviewReportsSafeStageWithoutPublishing() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

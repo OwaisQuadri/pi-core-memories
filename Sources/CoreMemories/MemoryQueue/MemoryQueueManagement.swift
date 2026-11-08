@@ -328,8 +328,20 @@ package final class MemoryQueueManagement {
         let attempt = try MemoryReviewEncoding.decode(
           ReviewDetachAttempt.self,
           bytes: root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
-        guard attempt.digest == intent.display.checkoutDigest,
-          attempt.witness.commit == intent.display.checkoutCommit
+        guard attempt.schemaVersion == 1,
+          attempt.digest == intent.display.checkoutDigest,
+          attempt.witness.commit == intent.display.checkoutCommit,
+          attempt.digest
+            == SourceDigest(bytes: try MemoryReviewEncoding.encode(attempt.witness)).rawValue,
+          attempt.witness.head == Data("ref: refs/heads/main\n".utf8),
+          MemoryDocument.isMatch(#"\A([0-9a-f]{40}|[0-9a-f]{64})\z"#, attempt.witness.commit),
+          attempt.auditRef == "refs/memory-review/detach/\(attempt.digest)",
+          try root.read(
+            "detach-attempt-\(attempt.digest).json", maximum: MemoryReviewEncoding.maximumFileBytes)
+            == MemoryReviewEncoding.encode(attempt),
+          try MemoryBatchReplay.directCommit(
+            attempt.auditRef, git: MemoryStore(repo: configuration.memoryURL).reviewGit)
+            == attempt.witness.commit
         else { throw DreamRunError.corruption }
         status = "detached"
         commit = attempt.witness.commit

@@ -241,10 +241,24 @@ pending work, not consent.
 
 ## Inspect and change approved memories
 
-Approved memories remain available for inspection in chat. Requested additions,
-updates, deletions, and review-date changes use exact entries and the same
-checked storage authority. Internal tools must not bypass a queue-bound store
-or prescribe a removed command when a write is blocked.
+Approved-memory reads and explicit user-requested changes do not depend on
+dreaming or proposal-review health. Missing dream state, corrupt review data,
+an unavailable review queue or journal, and another live review owner must not
+block these operations. Review dependencies start only for review operations.
+The conversation adapter does not wait for review reminders or refresh review
+counts as part of an approved-memory operation.
+
+Requested additions, updates, deletions, and review-date changes still require
+an exact displayed proposal and a later eligible user reply. Native checks keep
+the approved base, target bytes, source annotations, and checkout consistent.
+The private management path grants publication authority for one exact manual
+batch, not for inferred findings or legacy command writes. Its journal is the
+canonical memory repository's sibling, `<memory>.management`, separate from the
+review queue and review journal. Approved-store, consent, and target failures
+still block the affected operation; review failures do not.
+
+Internal tools must not bypass checked publication or prescribe a removed
+command when a write is blocked.
 
 A blocked preparation or publication step must be explained in conversation.
 Keep the entry, pending proposal, and source evidence intact. A detached

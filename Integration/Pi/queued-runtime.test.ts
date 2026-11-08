@@ -492,6 +492,19 @@ test("a candidate amendment keeps its owner and cannot reuse approval for the ol
 	} finally { await f.stop(); }
 });
 
+test("an approved direct change does not request review counts", async () => {
+	const f = conversationalRuntime();
+	const request = { base: "b".repeat(40), path: "MEMORY.md", replacement: "Requested memory.", reason: "User request." };
+	try {
+		await f.emit("session_start");
+		await f.call("memory_add", request);
+		await f.reply("save that memory");
+		const saved = await f.call("memory_add", request);
+		assert.match(JSON.stringify(saved.details), /"status":"approved"/);
+		assert.equal(f.frames.filter((frame) => frame.type === "counts").length, 0);
+	} finally { await f.stop(); }
+});
+
 test("changing a manual proposal requires a new native preview and a later original reply", async () => {
 	const f = conversationalRuntime();
 	const first = { base: "b".repeat(40), path: "MEMORY.md", replacement: "first", reason: "User request." };
@@ -609,20 +622,39 @@ function hangingReminderRuntime(isCloseHeld = false) {
 	let releaseClose!: () => void; const closeReleased = new Promise<void>((resolve) => { releaseClose = resolve; });
 	if (!isCloseHeld) releaseClose();
 	let opens = 0;
+	const requests: string[] = [];
 	const f = runtime(async () => ({ status: "pending" }) as DreamReport, "tui", undefined, { idleMilliseconds: 60_000, reminderWaitMilliseconds: 20,
 		open: async (_directory, signal) => {
 			const isReminder = ++opens === 1;
 			if (isReminder) reminder.signal = signal;
 			return {
 				request: async (type) => {
+					requests.push(type);
 					if (isReminder) return new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+					if (type === "approved-list" || type === "approved-get") return { type: "approved", base: "b".repeat(40), entries: [] };
+					if (type === "manage-recover") return { type: "manage-decision", receipt: { decisionID: "saved-decision", status: "approved" } };
 					return type === "list" ? { type: "queue", rows: [], nextOffset: null } : { type: "counts", review: 0 };
 				},
 				close: async () => { if (isReminder) { await closeReleased; reminder.isClosed = true; } },
 			};
 		} });
-	return { f, reminder, releaseClose };
+	return { f, reminder, releaseClose, requests };
 }
+
+for (const operation of ["approved-list", "approved-get", "manage-recover"]) {
+	test(`${operation} does not wait for review reminder shutdown or refresh review counts`, async () => {
+		const { f, reminder, releaseClose, requests } = hangingReminderRuntime(true);
+		try {
+			await f.emit("session_start");
+			await reminderTurns(f)();
+			await promptly(f.tool.execute("approved-storage", { operation, decisionID: "saved-decision" }, undefined, undefined, f.ctx));
+			assert.equal(reminder.signal?.aborted, true);
+			assert.equal(reminder.isClosed, false);
+			assert.deepEqual(requests, ["list", operation]);
+		} finally { releaseClose(); await f.stop(); }
+	});
+}
+
 const promptly = <T>(operation: Promise<T>) => Promise.race([operation, sleep(1_000).then(() => assert.fail("The memory tool call waited behind the pending reminder."))]);
 
 test("a memory tool call stops a hanging pending reminder read instead of waiting behind it", async () => {

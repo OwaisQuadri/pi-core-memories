@@ -320,14 +320,15 @@ export function registerQueuedRuntime(pi: ExtensionAPI, overrides: Partial<Runti
 		const abortConversation = () => activeConversation?.abort();
 		combined.addEventListener("abort", abortConversation, { once: true });
 		clearTimeout(timer); timer = undefined;
+		const needsReview = operation !== "cancel" && !["manage", "confirm-reviewed", "approved-list", "approved-get", "manage-recover"].includes(operation) && !(operation === "reply" && conversation?.preview.isManagement);
 		const refreshIdleCounts = () => conversation || background ? Promise.resolve() : refreshCounts(ctx, combined).catch(() => {});
 		foregroundCompletion = (async () => {
 			await conversationClose;
 			abortReminderRead();
-			await Promise.race([reminderRead?.completion, combined.aborted ? undefined : new Promise<void>((resolve) => combined.addEventListener("abort", () => resolve(), { once: true }))]);
+			if (needsReview) await Promise.race([reminderRead?.completion, combined.aborted ? undefined : new Promise<void>((resolve) => combined.addEventListener("abort", () => resolve(), { once: true }))]);
 			combined.throwIfAborted();
 			const result = await run();
-			if (isCurrent()) await refreshIdleCounts();
+			if (isCurrent() && needsReview) await refreshIdleCounts();
 			return result;
 		})();
 		async function run(): Promise<unknown> {

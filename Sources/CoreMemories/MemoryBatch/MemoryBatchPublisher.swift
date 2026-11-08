@@ -10,15 +10,18 @@ final class MemoryBatchPublisher {
   let root: DreamStateDirectory
   let store: MemoryStore
   let review: MemoryReviewController?
+  let managementAuthorization: MemoryManagementAuthorization?
   let fault: ((MemoryReviewPersistenceEvent) throws -> Void)?
 
   init(
     root: DreamStateDirectory, store: MemoryStore, review: MemoryReviewController?,
+    managementAuthorization: MemoryManagementAuthorization? = nil,
     fault: ((MemoryReviewPersistenceEvent) throws -> Void)? = nil
   ) {
     self.root = root
     self.store = store
     self.review = review
+    self.managementAuthorization = managementAuthorization
     self.fault = fault
   }
 
@@ -133,6 +136,11 @@ final class MemoryBatchPublisher {
   ) throws -> MemoryBatchSaveResult {
     try verifyMemoryBatchRepository(store, review: review)
     let saveID = try memoryBatchDigest(draft)
+    if let managementAuthorization {
+      guard managementAuthorization.repository == store.reviewGit.repo.path,
+        managementAuthorization.saveID == saveID, review == nil
+      else { throw DreamRunError.unsafeState }
+    }
     do {
       if let result = try recover(draft) { return result }
       for name in try root.names() where name.hasPrefix("batch-attempt-") {
@@ -290,7 +298,7 @@ final class MemoryBatchPublisher {
       }
       try store.publishCheckedMemoryCommit(
         commit: commit, base: draft.baseCommit, auditRef: auditRef, checkout: expected,
-        reviewBinding: review?.binding)
+        reviewBinding: review?.binding, managementAuthorization: managementAuthorization)
       return commit
     }
     if let leaseState { return try publish(leaseState) }

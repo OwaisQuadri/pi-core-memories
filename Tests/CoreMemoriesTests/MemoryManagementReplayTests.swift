@@ -3,6 +3,97 @@ import Testing
 
 @testable import CoreMemories
 
+@Test func legacyEntryReviewUsesCommittedLocationForIdenticalEntriesWithoutIdentities() throws {
+  let fixture = try Fixture()
+  defer { fixture.clean() }
+  try fixture.write(
+    "# Memory\n\n" + fact("Same preference.") + "\n\n" + fact("Same preference."), path: "MEMORY.md"
+  )
+  try fixture.commit()
+  let manager = try MemoryManagement(repository: fixture.repo)
+  try manager.confirmDetach(manager.checkoutPreview())
+  let base = try fixture.store.approvedCommit()
+  let snapshot = try fixture.store.reviewSnapshot(base: base)
+  let target = try #require(snapshot.reviewEntries().filter { $0.entry.isMutable }.last)
+  #expect(target.entry.identity == nil)
+  let instant = try MemoryDocument.ReviewInstant("2026-07-03T00:00:00Z")
+  let identity = UUID()
+  let after = try MemoryDocument.reviewedBytes(
+    target.entry.bytes, identity: identity, instant: instant)
+  var replacement = try #require(snapshot.documents.first { $0.path == target.path }?.bytes)
+  replacement.replaceSubrange(target.entry.locator.start..<target.entry.locator.end, with: after)
+  let audit = try JSONSerialization.data(
+    withJSONObject: [
+      "origin": "native-approved-entry-review", "base": base, "path": target.path,
+      "before": String(decoding: target.entry.bytes, as: UTF8.self),
+      "after": String(decoding: after, as: UTF8.self), "reviewed": instant.rawValue,
+    ], options: [.sortedKeys, .withoutEscapingSlashes])
+  let commit = try fixture.store.reviewCommit(
+    base: base, path: target.path, replacement: replacement,
+    message: Data("Core memory approved entry review\n\n".utf8) + audit + Data([10]))
+  _ = try fixture.git([
+    "update-ref", "refs/memory-management/changes/\(SourceDigest(bytes: audit).rawValue)", commit,
+  ])
+  _ = try fixture.git(["update-ref", "refs/heads/main", commit, base])
+  let publications = try manager.verifiedDirectPublications()
+  let effect = try #require(publications[commit]?.effects.first)
+  #expect(publications.count == 1)
+  #expect(effect.start == target.entry.locator.start)
+  #expect(effect.identity == identity)
+  #expect(effect.before == target.entry.bytes && effect.after == after)
+}
+
+@Test(arguments: ["valid", "changed-entry", "changed-document"])
+func legacyEntryReviewsReplayWithoutApprovingSuggestionsOrAcceptingContentChanges(
+  alteration: String
+) throws {
+  let fixture = try ReviewFlowFixture()
+  defer { fixture.transaction.clean() }
+  let store = try MemoryStore(repo: fixture.transaction.memory, environment: [:])
+  let git = store.reviewGit
+  let base = try store.approvedCommit()
+  let snapshot = try store.reviewSnapshot(base: base)
+  let target = try #require(snapshot.reviewEntries().first { $0.entry.isMutable })
+  let identity = try #require(target.entry.identity)
+  let instant = try MemoryDocument.ReviewInstant("2026-07-03T00:00:00Z")
+  let after = try MemoryDocument.reviewedBytes(
+    alteration == "changed-entry" ? Data(fact("Altered preference.").utf8) : target.entry.bytes,
+    identity: identity, instant: instant)
+  var replacement = try #require(snapshot.documents.first { $0.path == target.path }?.bytes)
+  replacement.replaceSubrange(target.entry.locator.start..<target.entry.locator.end, with: after)
+  if alteration == "changed-document" {
+    replacement.append(Data(("\n" + fact("Unrelated addition.")).utf8))
+  }
+  let audit = try JSONSerialization.data(
+    withJSONObject: [
+      "origin": "native-approved-entry-review", "base": base, "path": target.path,
+      "before": String(decoding: target.entry.bytes, as: UTF8.self),
+      "after": String(decoding: after, as: UTF8.self), "reviewed": instant.rawValue,
+    ], options: [.sortedKeys, .withoutEscapingSlashes])
+  let commit = try store.reviewCommit(
+    base: base, path: target.path, replacement: replacement,
+    message: Data("Core memory approved entry review\n\n".utf8) + audit + Data([10]))
+  _ = try git.text([
+    "update-ref", "refs/memory-management/changes/\(SourceDigest(bytes: audit).rawValue)", commit,
+  ])
+  _ = try git.text(["update-ref", "refs/heads/main", commit, base])
+  let beforeRefs = try git.text(["for-each-ref", "--format=%(refname) %(objectname)"])
+  if alteration == "valid" {
+    let reopened = try fixture.controller()
+    let rows = try reopened.list()
+    #expect(rows.filter { $0.disposition == .approved }.count == ReviewFlowFixture.retainedCount)
+    #expect(rows.filter { $0.disposition == .pending }.count == ReviewFlowFixture.pendingCount)
+    let pending = try #require(rows.first { $0.disposition == .pending })
+    #expect(
+      try reopened.preview(candidateID: pending.change.id, clockDate: ReviewFlowFixture.reviewDate)
+        .currentBase == commit)
+  } else {
+    #expect(throws: (any Error).self) { _ = try fixture.controller().list() }
+  }
+  #expect(try git.text(["rev-parse", "main"]) == commit)
+  #expect(try git.text(["for-each-ref", "--format=%(refname) %(objectname)"]) == beforeRefs)
+}
+
 @Test func mixedDirectAndBatchHistoryKeepsSuggestionsPendingUntilFreshApproval() throws {
   let fixture = try ReviewFlowFixture()
   defer { fixture.transaction.clean() }

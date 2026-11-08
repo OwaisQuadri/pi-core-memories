@@ -45,7 +45,13 @@ private struct ManagementIntent: Codable {
   let responseReference: String
 }
 
+package enum MemoryManagementPreviewStage: String {
+  case availability, controller, drafts, batchSession, path, manualRequest, composition, checkout,
+    display
+}
+
 package final class MemoryQueueManagement {
+  package private(set) var previewStage: MemoryManagementPreviewStage?
   private let queue: MemoryQueue
   private let configurationURL: URL
   private let configuration: MemoryConfiguration
@@ -72,15 +78,21 @@ package final class MemoryQueueManagement {
     _ request: MemoryManagementRequest, identity: MemoryQueueRequest,
     isConfirmReviewed: Bool = false
   ) throws -> MemoryManagementDisplay {
+    previewStage = .availability
     guard active == nil, sequence < UInt64.max else { throw DreamRunError.busy }
+    previewStage = .controller
     let review = try queue.controller()
+    previewStage = .drafts
     let drafts = try MemoryDraftStore(
       repository: configuration.memoryURL, journal: URL(fileURLWithPath: configuration.journal))
+    previewStage = .batchSession
     let session = try MemoryBatchSession(
       repository: configuration.memoryURL, drafts: drafts, review: review,
       configurationURL: configurationURL)
+    previewStage = .path
     guard let path = request.path else { throw DreamRunError.unsafeState }
     _ = try session.preparePath(path)
+    previewStage = .manualRequest
     if isConfirmReviewed {
       guard request.operation == .get, request.base == session.snapshot.base,
         let entry = try inspect(request).entries.first
@@ -96,11 +108,14 @@ package final class MemoryQueueManagement {
     } else {
       _ = try session.stageManual(request)
     }
+    previewStage = .composition
     let composition = try compose(session)
     guard composition.effects.count == 1, let effect = composition.effects.first,
       let replacement = composition.replacements[path]
     else { throw DreamRunError.unsafeState }
+    previewStage = .checkout
     let checkout = try review.checkoutPreview()
+    previewStage = .display
     sequence += 1
     let claimID = UUID().uuidString
     let previewDigest = try memoryBatchDigest(session.persistenceSnapshot)
@@ -117,6 +132,7 @@ package final class MemoryQueueManagement {
     display.displayDigest = SourceDigest(bytes: try display.publicationBytes()).rawValue
     active = (review, session, checkout, display)
     messageReference = nil
+    previewStage = nil
     return display
   }
 

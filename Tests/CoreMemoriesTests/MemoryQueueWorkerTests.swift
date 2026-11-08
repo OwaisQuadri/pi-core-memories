@@ -70,7 +70,8 @@ private final class QueueWorkerFixture {
       guard readiness == 1 else {
         let helper = process.isRunning ? "running" : "exit \(process.terminationStatus)"
         throw MemoryError(
-          "queue frame missing: poll=\(readiness), errno=\(failureCode), events=\(descriptor.revents), bytes=\(bytes.count), helper=\(helper)")
+          "queue frame missing: poll=\(readiness), errno=\(failureCode), events=\(descriptor.revents), bytes=\(bytes.count), helper=\(helper)"
+        )
       }
       guard let byte = try output.fileHandleForReading.read(upToCount: 1), !byte.isEmpty else {
         let helper = process.isRunning ? "running" : "exit \(process.terminationStatus)"
@@ -168,5 +169,56 @@ func queueWorkerOnlyExactPrivateOriginalReplyReturnsReceipt(mode: String) throws
     #expect(outcome["type"] as? String == "final")
     #expect(try fixture.main() == original)
   }
+  worker.process.waitUntilExit()
+}
+
+@Test func queueWorkerBlockedPreviewReportsSafeStageWithoutPublishing() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  do {
+    let review = try MemoryReviewController(
+      repository: fixture.memory, stateRoot: fixture.root.appendingPathComponent("review"),
+      sources: sources, environment: [:])
+    try review.confirmDetach(review.checkoutPreview())
+  }
+  let catalog = try MemoryManagement(repository: fixture.memory).execute(
+    MemoryManagementRequest(operation: .list))
+  let entry = try #require(catalog.entries.first)
+  let request = MemoryManagementRequest(
+    operation: .delete, base: String(repeating: "0", count: 40), path: entry.path,
+    locator: entry.locator, expected: entry.expected, reason: "Private diagnostic test reason")
+  let worker = try QueueWorkerFixture(config: queueWorkerConfig(fixture))
+  let original = try fixture.main()
+  try worker.send(
+    "manage-preview",
+    [
+      "sessionID": "session", "requestID": "request", "mode": "crud",
+      "request": JSONSerialization.jsonObject(with: JSONEncoder().encode(request)),
+    ])
+  let outcome = try worker.frame()
+  #expect(outcome["type"] as? String == "blocked")
+  #expect(outcome["code"] as? String == "blocked")
+  #expect(outcome["reason"] as? String == "MemoryError")
+  #expect(outcome["operation"] as? String == "manage-preview")
+  #expect(outcome["stage"] as? String == "manualRequest")
+  let text = String(decoding: try JSONSerialization.data(withJSONObject: outcome), as: UTF8.self)
+  #expect(!text.contains(fixture.root.path))
+  #expect(!text.contains(entry.expected))
+  #expect(!text.contains("Private diagnostic test reason"))
+  #expect(try fixture.main() == original)
+  try worker.send(
+    "manage-preview",
+    [
+      "sessionID": "session", "requestID": "request", "mode": "crud",
+      "request": ["operation": "delete"],
+    ])
+  let invalid = try worker.frame()
+  #expect(invalid["type"] as? String == "blocked")
+  #expect(invalid["operation"] as? String == "manage-preview")
+  #expect(invalid["stage"] == nil)
+  #expect(try fixture.main() == original)
+  try worker.send("finish")
+  #expect(try worker.frame()["type"] as? String == "final")
   worker.process.waitUntilExit()
 }

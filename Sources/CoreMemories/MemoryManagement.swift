@@ -85,6 +85,15 @@ private struct MemoryManagementAudit: Codable {
   let revised: String
 }
 
+private struct LegacyEntryReviewAudit: Codable {
+  let origin: String
+  let base: String
+  let path: String
+  let before: String
+  let after: String
+  let reviewed: String
+}
+
 struct PreparedManagementChange {
   let path: String
   let range: Range<Int>
@@ -253,6 +262,21 @@ package final class MemoryManagement {
         throw DreamRunError.corruption
       }
       let message = Data(raw[split.upperBound...])
+      let legacyTitle = Data("Core memory approved entry review\n\n".utf8)
+      if message.starts(with: legacyTitle) {
+        let publication = try verifiedLegacyEntryReview(
+          message: message, title: legacyTitle, raw: raw, split: split, ref: ref, commit: commit)
+        retainedBytes +=
+          raw.count
+          + publication.effects.reduce(0) {
+            $0 + $1.before.count + $1.after.count
+          }
+        guard retainedBytes <= MemoryReviewEncoding.maximumStateBytes else {
+          throw DreamRunError.limitExceeded
+        }
+        publications[commit] = publication
+        continue
+      }
       guard message.starts(with: title), message.last == 10 else {
         throw DreamRunError.corruption
       }
@@ -297,6 +321,48 @@ package final class MemoryManagement {
         base: audit.base, commit: commit, effects: [effect])
     }
     return publications
+  }
+
+  private func verifiedLegacyEntryReview(
+    message: Data, title: Data, raw: Data, split: Range<Data.Index>, ref: String, commit: String
+  ) throws -> VerifiedMemoryPublication {
+    guard message.last == 10 else { throw DreamRunError.corruption }
+    let auditBytes = Data(message.dropFirst(title.count).dropLast())
+    let audit = try MemoryReviewEncoding.decode(LegacyEntryReviewAudit.self, bytes: auditBytes)
+    let headers = String(decoding: raw[..<split.lowerBound], as: UTF8.self).split(separator: "\n")
+    guard audit.origin == "native-approved-entry-review", MemoryStore.isFullOID(audit.base),
+      MemoryDocument.isAllowedPath(audit.path),
+      headers.filter({ $0.hasPrefix("parent ") }) == [Substring("parent " + audit.base)],
+      ref == "refs/memory-management/changes/\(SourceDigest(bytes: auditBytes).rawValue)"
+    else { throw DreamRunError.corruption }
+    let instant = try MemoryDocument.ReviewInstant(audit.reviewed)
+    let snapshot = try store.reviewSnapshot(base: audit.base)
+    let rows = snapshot.reviewEntries()
+    let identities = rows.compactMap { $0.entry.identity }
+    let committed = try store.reviewSnapshot(base: commit)
+    guard Set(identities).count == identities.count,
+      let identity = MemoryDocument.entries(in: Data(audit.after.utf8)).first?.identity,
+      let reviewed = committed.reviewEntries().first(where: {
+        $0.path == audit.path && $0.entry.identity == identity
+      })?.entry,
+      let target = rows.first(where: {
+        $0.path == audit.path && $0.entry.locator.start == reviewed.locator.start
+          && $0.entry.bytes == Data(audit.before.utf8)
+      })?.entry, target.isMutable,
+      try MemoryDocument.reviewedBytes(target.bytes, identity: identity, instant: instant)
+        == Data(audit.after.utf8),
+      var replacement = snapshot.documents.first(where: { $0.path == audit.path })?.bytes
+    else { throw DreamRunError.corruption }
+    let range = target.locator.start..<target.locator.end
+    replacement.replaceSubrange(range, with: Data(audit.after.utf8))
+    try MemoryBatchReplay.validateReplacements(
+      [audit.path: replacement], base: audit.base, commit: commit, store: store)
+    let effect = MemoryBatchEffect(
+      itemID: memoryBatchIdentity("direct:\(commit)"), path: audit.path,
+      start: range.lowerBound, end: range.upperBound, before: target.bytes,
+      after: Data(audit.after.utf8), identity: identity, originalReviewedProposal: nil,
+      additionStyle: .manual, readAnchors: [])
+    return VerifiedMemoryPublication(base: audit.base, commit: commit, effects: [effect])
   }
 
   private func publish(

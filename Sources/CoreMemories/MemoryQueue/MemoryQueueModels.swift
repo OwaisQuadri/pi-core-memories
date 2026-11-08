@@ -125,6 +125,35 @@ package struct MemoryQueueRow: Codable {
   package let blockReason: String?
 }
 
+package struct MemoryChangeDescription: Codable, Equatable {
+  package let before: String
+  package let after: String
+  package let scope: String
+
+  package init(before: Data, after: Data, path: String, configuration: MemoryConfiguration) throws {
+    self.before = try MemoryDocument.displayText(before)
+    self.after = try MemoryDocument.displayText(after)
+    func projectName(_ key: String) throws -> String {
+      let names = Set(configuration.projectBindings.filter { $0.value == key }.keys.map {
+        URL(fileURLWithPath: $0).lastPathComponent
+      })
+      guard names.count == 1, let name = names.first, !name.isEmpty else {
+        throw MemoryError("A project name is needed before this memory change can be shown.")
+      }
+      return "for the \(name) project"
+    }
+    switch DreamMemoryScope(path: path) {
+    case .global: scope = ""
+    case .project(let key): scope = try projectName(key)
+    case .device(let key) where key == configuration.deviceKey: scope = "on this device"
+    case .deviceProject(let device, let project) where device == configuration.deviceKey:
+      scope = try projectName(project) + " on this device"
+    default:
+      throw MemoryError("This device must be identified before its memory change can be shown.")
+    }
+  }
+}
+
 package struct MemoryQueuePresentation: Codable, Equatable {
   package let claimID: String
   package let sequence: String
@@ -139,6 +168,7 @@ package struct MemoryQueuePresentation: Codable, Equatable {
   package let checkoutCommit: String
   package let checkoutDigest: String
   package var amendmentReason: String? = nil
+  package var change: MemoryChangeDescription? = nil
 }
 
 package struct MemoryQueueDisplay: Codable, Equatable {

@@ -114,9 +114,11 @@ Tool/related-window evidence uses the integrated native input component's verifi
 
 `presentation` emits `display` and `displayBytes`. `display` has `presentation` and `displayDigest`. `displayBytes` is base64 of the exact canonical JSON bytes of `display.presentation`, encoded with sorted keys and unescaped slashes. SHA-256 of the decoded bytes equals `displayDigest`. The host can verify bytes directly without reproducing Swift JSON serialization.
 
-The presentation contains `claimID`, decimal `sequence`, `request:{sessionID,requestID}`, full `finding`, `previewDigest`, `currentBase`, base64 `before`, base64 final `after`, base64 full-document `replacement`, Boolean `isDetachRequired`, `checkoutCommit`, and `checkoutDigest`.
+The presentation contains `claimID`, decimal `sequence`, `request:{sessionID,requestID}`, full `finding`, `previewDigest`, `currentBase`, base64 `before`, base64 final `after`, base64 full-document `replacement`, Boolean `isDetachRequired`, `checkoutCommit`, and `checkoutDigest`. New presentations also contain `change:{before,after,scope}`. All fields are covered by `displayDigest`.
 
-The host must display the complete exact proposal and annotations, old/final bytes, scope, reason, evidence, contradictions, and limitations. Base64 is a transport encoding, not a substitute for readable exact bytes. Escape terminal controls and bidirectional formatting deterministically without changing stored bytes or hashes. Do not paraphrase, trim, summarize, truncate, or reorder the proposal for consent. If the complete payload cannot be installed, release without approval.
+Native derives `change.before` and `change.after` from the exact entry ranges using the memory-document parser. It removes only source, reason, memory-identity, and review metadata outside code fences. Other text remains unchanged. The scope is empty for global memory, or a plain-language qualifier with the configured project and device names. Unknown scope names block presentation; the host must not infer a scope from an opaque key.
+
+The host validates the full native record, then displays only a plain-language question about its `change`: new wording for an addition, old and new wording for an update, the forgotten wording for a deletion, or unchanged wording for a review-date change. Named scope remains visible. Source records, reasons, evidence, limitations, hashes, paths, and transport fields stay internal. Their complete bytes remain bound to the question and the later reply. Do not truncate or reword the memory text. Escape terminal controls and bidirectional formatting deterministically without changing stored bytes or hashes. If the complete question cannot be installed, release without approval. A host that requires `change` must reject an older presentation without it.
 
 Native reserves shown-for-request suppression before emitting the presentation. A crash around display can therefore suppress a question that was never visible. It never grants approval.
 
@@ -132,10 +134,10 @@ Only the live owner of an acknowledged presentation can amend it. Native keeps
 that owner and claim, invalidates the old preview, and returns a new sequence,
 preview digest, display digest, and final bytes. The presentation also includes
 `amendmentReason`; the original `finding.reason` remains unchanged. A later claim
-of the retained draft includes the same amendment reason. Both reasons are visible
-and covered by the native display digest. The host must display the new
-exact proposal, acknowledge it with `presented`, and obtain a later explicit
-reply. Amendment alone cannot save memory or reuse an earlier reply.
+of the retained draft includes the same amendment reason. Both reasons remain internal
+and covered by the native display digest. The host must display a new
+plain-language question with the changed memory wording, acknowledge it with
+`presented`, and obtain a later explicit reply. Amendment alone cannot save memory or reuse an earlier reply.
 
 The existing queue ledger retains one unapproved amendment per finding revision.
 A later claim uses that draft to build a fresh preview. Restart does not restore

@@ -34,7 +34,7 @@ test("public SDK session delivers a proposal and binds the later ordinary reply"
 				request: async (type, fields = {}, isPrivate) => {
 					frames.push({ type, fields, isPrivate });
 					if (type === "claim") {
-						const presentation = { claimID: "sdk-claim", sequence: "1", request: { sessionID: fields.sessionID, requestID: fields.requestID }, isDetachRequired: false, previewDigest: "d".repeat(64), finding: { candidateID: "c".repeat(64), revision, operation: "add" } };
+						const presentation = { change: { before: "", after: "Use IEEE for research papers.", scope: "" }, claimID: "sdk-claim", sequence: "1", request: { sessionID: fields.sessionID, requestID: fields.requestID }, isDetachRequired: false, previewDigest: "d".repeat(64), finding: { candidateID: "c".repeat(64), revision, operation: "add" } };
 						const bytes = Buffer.from(JSON.stringify(presentation));
 						digest = createHash("sha256").update(bytes).digest("hex");
 						return { type: "presentation", display: { presentation, displayDigest: digest }, displayBytes: bytes.toString("base64") };

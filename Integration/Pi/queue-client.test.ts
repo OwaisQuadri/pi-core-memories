@@ -12,7 +12,8 @@ const bytes = (value: string): string => Buffer.from(value).toString("base64");
 export function presentation(isDetachRequired = false) {
 	const payload = {
 		claimID: "private-claim", sequence: "1", request: identity,
-		finding: { revision: "a".repeat(64), candidateID: "b".repeat(64), reason: "Exact reason", proposed: bytes("  finding [source: synthetic; added: 2026-10-24]\n"), evidence: [{ exactText: "Use exact bytes", contentDigest: "c".repeat(64) }], limitations: ["synthetic limitation"] },
+		finding: { operation: "update", revision: "a".repeat(64), candidateID: "b".repeat(64), reason: "Exact reason", proposed: bytes("  finding [source: synthetic; added: 2026-10-24]\n"), evidence: [{ exactText: "Use exact bytes", contentDigest: "c".repeat(64) }], limitations: ["synthetic limitation"] },
+		change: { before: "old", after: "finding", scope: "" },
 		previewDigest: "d".repeat(64), currentBase: "e".repeat(40), before: bytes("old\n"), after: bytes("  finding\n"), replacement: bytes("# Memory\n\n  finding\n"), isDetachRequired,
 	};
 	const encoded = Buffer.from(JSON.stringify(payload));
@@ -22,10 +23,12 @@ export function presentation(isDetachRequired = false) {
 test("tampered digest, mismatched display, foreign request and oversized preview cannot authorize", () => {
 	const changedDigest = presentation(); changedDigest.display.displayDigest = "f".repeat(64);
 	assert.throws(() => decodeQueuePreview(changedDigest, identity));
+	const changedWording = presentation(); changedWording.display.presentation.change.after = "Changed without a new digest";
+	assert.throws(() => decodeQueuePreview(changedWording, identity));
 	const changedPayload = presentation(); changedPayload.display.presentation.finding.reason = "changed";
 	assert.throws(() => decodeQueuePreview(changedPayload, identity));
 	assert.throws(() => decodeQueuePreview(presentation(), { ...identity, requestID: "other" }));
-	const oversized = presentation(); oversized.display.presentation.finding.reason = "x".repeat(65_537);
+	const oversized = presentation(); oversized.display.presentation.change.after = "x".repeat(65_537);
 	const encoded = Buffer.from(JSON.stringify(oversized.display.presentation));
 	oversized.displayBytes = encoded.toString("base64"); oversized.display.displayDigest = sha(encoded);
 	assert.throws(() => decodeQueuePreview(oversized, identity), /too large/);
@@ -33,12 +36,38 @@ test("tampered digest, mismatched display, foreign request and oversized preview
 
 test("terminal controls and literal escape sequences render distinctly without changing native digest", () => {
 	const frame = presentation();
-	frame.display.presentation.before = bytes("\u001b[31m\\u{1B}\u202e");
+	frame.display.presentation.change.before = "\u001b[31m\\u{1B}\u202e";
 	const encoded = Buffer.from(JSON.stringify(frame.display.presentation));
 	frame.displayBytes = encoded.toString("base64"); frame.display.displayDigest = sha(encoded);
 	const result = decodeQueuePreview(frame, identity);
 	assert.ok(result.details.includes("\\u{1B}[31m\\u{5C}u{1B}\\u{202E}"));
 	assert.equal(result.digest, sha(encoded));
+});
+
+test("memory previews show only the requested change in natural language", () => {
+	const cases = [
+		["add", "", "Use IEEE for research papers.", "", "Should I remember this?\n\nUse IEEE for research papers."],
+		["update", "Use the old format.", "Use IEEE.", "for the Research project", "Should I change this memory for the Research project from:\n\nUse the old format.\n\nto:\n\nUse IEEE."],
+		["delete", "Offer a writing prompt after work.", "", "on this device", "Should I forget this memory on this device?\n\nOffer a writing prompt after work."],
+		["confirm-reviewed", "Use IEEE.", "Use IEEE.", "", "Should I keep this memory as current, without changing its wording?\n\nUse IEEE."],
+	];
+	for (const [operation, before, after, scope, expected] of cases) {
+		const frame = presentation();
+		frame.display.presentation.finding.operation = operation!;
+		frame.display.presentation.change = { before: before!, after: after!, scope: scope! };
+		const encoded = Buffer.from(JSON.stringify(frame.display.presentation));
+		frame.displayBytes = encoded.toString("base64"); frame.display.displayDigest = sha(encoded);
+		const result = decodeQueuePreview(frame, identity);
+		assert.equal(result.details, expected);
+		assert.equal(result.digest, sha(encoded));
+		for (const technical of ["private-claim", "source:", "SHA-256", "Exact reason", "currentBase", "synthetic limitation"]) assert.ok(!result.details.includes(technical));
+	}
+	const frame = presentation();
+	delete (frame.display.presentation as Record<string, unknown>).change;
+	const encoded = Buffer.from(JSON.stringify(frame.display.presentation));
+	frame.displayBytes = encoded.toString("base64"); frame.display.displayDigest = sha(encoded);
+	assert.throws(() => decodeQueuePreview(frame, identity));
+	assert.ok(decodeQueuePreview(presentation(true), identity).details.startsWith("May I prepare the memory store"));
 });
 
 test("native child keeps private choices on descriptor three and sanitizes stderr failures", async (t) => {

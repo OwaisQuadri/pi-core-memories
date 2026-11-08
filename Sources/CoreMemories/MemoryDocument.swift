@@ -177,6 +177,20 @@ public enum MemoryDocument {
     return text
   }
 
+  package static func displayText(_ bytes: Data) throws -> String {
+    var text = try editableEntry(bytes)
+    guard let matches = metadataMatches(in: text, regex: sourceRegex) else {
+      throw MemoryError("cannot read memory wording")
+    }
+    for match in matches.reversed() {
+      guard let range = Range(match.range, in: text) else {
+        throw MemoryError("cannot read memory annotation")
+      }
+      text.removeSubrange(range)
+    }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
   static func sourceAnnotations(in bytes: Data) -> [String] {
     let text = String(decoding: bytes, as: UTF8.self)
     return sourceRegex.matches(in: text, range: NSRange(text.startIndex..., in: text)).map {

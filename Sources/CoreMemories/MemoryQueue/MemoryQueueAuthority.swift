@@ -89,14 +89,14 @@ enum MemoryQueueAuthority {
     } ?? []
   }
 
-  private static func withBoundReview<T>(
-    git: Git, repository: URL, sourceBinding: String,
+  static func withBoundReview<T>(
+    git: Git, repository: URL, sourceBinding: String, isSnapshot: Bool = false,
     _ operation: (DreamStateDirectory, DreamStateDirectory, ReviewRootBinding) throws -> T
   ) throws -> T? {
     guard let common = try git.commonDirectory(),
       FileManager.default.fileExists(atPath: common.appendingPathComponent("memory-queue").path)
     else { return nil }
-    return try locked(git: git) { root -> T? in
+    func read(_ root: DreamStateDirectory) throws -> T? {
       guard let binding = try binding(root) else { return nil }
       let review = binding.review
       guard review.schemaVersion == 2 else { throw DreamRunError.unsupportedSchema }
@@ -107,20 +107,18 @@ enum MemoryQueueAuthority {
       let queueURL = URL(fileURLWithPath: binding.queue)
       let reviewRoot = try DreamStateDirectory.openRoot(reviewURL, isCreating: false)
       let queue = try DreamStateDirectory.openRoot(queueURL, isCreating: false)
-      let reviewLock = try reviewRoot.openReadLock()
+      var locks: [Int32] = []
       defer {
-        _ = flock(reviewLock, LOCK_UN)
-        _ = close(reviewLock)
+        for lock in locks { _ = flock(lock, LOCK_UN); _ = close(lock) }
       }
-      guard flock(reviewLock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
-      try reviewRoot.verifyLock(reviewLock)
-      let queueLock = try queue.openReadLock()
-      defer {
-        _ = flock(queueLock, LOCK_UN)
-        _ = close(queueLock)
+      if !isSnapshot {
+        for directory in [reviewRoot, queue] {
+          let lock = try directory.openReadLock()
+          locks.append(lock)
+          guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
+          try directory.verifyLock(lock)
+        }
       }
-      guard flock(queueLock, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
-      try queue.verifyLock(queueLock)
       var repositoryStatus = stat()
       var reviewStatus = stat()
       var queueStatus = stat()
@@ -136,10 +134,18 @@ enum MemoryQueueAuthority {
         try reviewRoot.read("root.json", maximum: MemoryReviewEncoding.maximumFileBytes)
           == MemoryReviewEncoding.encode(review)
       else { throw DreamRunError.unsafeState }
-      _ = try reviewRoot.retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
-      _ = try queue.retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
+      if !isSnapshot {
+        _ = try reviewRoot.retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
+        _ = try queue.retainedBytes(maximum: MemoryReviewEncoding.maximumStateBytes)
+      }
       return try operation(reviewRoot, queue, review)
     }
+    if isSnapshot {
+      let root = try DreamStateDirectory.openRoot(
+        common.appendingPathComponent("memory-queue"), isCreating: false)
+      return try read(root)
+    }
+    return try locked(git: git, read)
   }
 
   static func activate(git: Git, review: ReviewRootBinding, queue: URL) throws {

@@ -64,7 +64,7 @@ Opaque identifiers match `[A-Za-z0-9._:-]{1,256}`. This includes invocation, ses
 
 Descriptor 3 must be an inherited, owned anonymous pipe or unnamed connected Unix socket. Named pipes, listening sockets, files, and foreign endpoints fail. The descriptor is close-on-exec before Git runs. Only descriptor 3 accepts `presented`, `reply`, `manage-presented`, and `manage-reply`. The retired `choice` and `manage-choice` frames are rejected, including frames that assert `isInteractive:true`. Ordinary stdin, model text, restored transcripts, and generated answers cannot approve.
 
-One live controller owns the whole review store from successful `claim` through disposition or release. Other owners receive `busy`. List and inventory normally acquire ownership only for their operation, so they can also report busy during another session's review. Queue file locks are short-lived and never held while waiting for a person. No heartbeat timeout steals a live lock. EOF on either host channel, explicit finish/cancel, helper death, and settled choices release ownership. A connected hung host remains busy until it releases or closes.
+One live controller owns the whole review store from successful `claim` through disposition or release. Other owners receive `busy`. List and inventory normally acquire ownership only for their operation. If a writer is busy, list returns the last committed queue snapshot when one is available; inventory can still report busy. Queue file locks are short-lived and never held while waiting for a person. No heartbeat timeout steals a live lock. EOF on either host channel, explicit finish/cancel, helper death, and settled choices release ownership. A connected hung host remains busy until it releases or closes.
 
 ## Ready and independent approved-memory operations
 
@@ -82,7 +82,7 @@ Every row below adds fields to `{version:1,type,invocationID}`. Fields are exact
 
 | Type | Additional fields | Result |
 | --- | --- | --- |
-| `list` | `sessionID`, `requestID`, `offset` | `queue` with `rows` and `nextOffset` |
+| `list` | `sessionID`, `requestID`, `offset` | `queue` with `rows`, `nextOffset`, and Boolean `isSnapshot` |
 | `claim` | `sessionID`, `requestID`, `revision` | `presentation` |
 | `amend` | current presentation tuple and `amendment:{replacement,reason}` | replacement `presentation`; no decision |
 | `release` | none | `released` |
@@ -93,6 +93,15 @@ Every row below adds fields to `{version:1,type,invocationID}`. Fields are exact
 | `cancel` | none | closes the invocation without granting consent |
 
 `offset` is a canonical nonnegative decimal string of at most ten characters and cannot exceed the current row count. A page contains at most 64 rows. `nextOffset` is a decimal string or null. Pages are current projections, not a frozen listing transaction. Claims revalidate the exact revision regardless of a previous page.
+
+`isSnapshot:false` means normal verified listing completed. `isSnapshot:true`
+means a writer was busy and the page came from the last committed queue ledger.
+This read checks the repository/source binding and recorded dispositions. It
+does not take writer locks, change state, import new dream results, recover
+unfinished decisions, or check current proposal eligibility. It omits findings
+with recorded outcomes. The consumer must label snapshot results as incomplete,
+including empty pages. A missing or invalid snapshot remains a read failure,
+not an empty queue. Presentation and publication keep their normal checks.
 
 `sessionID` and `requestID` form the suppression identity. The host must retain both for a resumed request, including retries, tools, compaction, and restart. A fresh runtime incarnation is not permission to invent a new request. Before a genuinely different request, branch change, or reload, the host must release the old claim and invalidate its live reply authority. A candidate wording amendment instead keeps the same request and review owner and invalidates the old preview.
 

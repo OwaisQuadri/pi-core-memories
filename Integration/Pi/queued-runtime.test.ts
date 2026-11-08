@@ -568,10 +568,54 @@ function reminderTurns(f: ReturnType<typeof runtime>, transcript: ContextMessage
 		return request();
 	}, { request });
 }
-function reminderRuntime(rows: () => unknown[], fail?: Error, mode = "tui") {
+function reminderRuntime(rows: () => unknown[], fail?: Error, mode = "tui", isSnapshot = false) {
 	return runtime(async () => ({ status: "pending" }) as DreamReport, mode, undefined, { idleMilliseconds: 60_000,
-		open: async () => ({ request: async (type) => { if (fail) throw fail; return type === "list" ? { type: "queue", rows: rows(), nextOffset: null } : { type: "released" }; }, close: async () => {} }) });
+		open: async () => ({ request: async (type) => { if (fail) throw fail; return type === "list" ? { type: "queue", rows: rows(), nextOffset: null, isSnapshot } : { type: "released" }; }, close: async () => {} }) });
 }
+
+test("an empty proposal queue has an explicit section on the first turn", async () => {
+	const f = reminderRuntime(() => []);
+	try {
+		await f.emit("session_start");
+		assert.equal((await reminderTurns(f)()).reminder, "MEMORY PROPOSALS (surface during relevant work)\nThere are currently no proposals.");
+	} finally { await f.stop(); }
+});
+
+for (const hasRows of [false, true]) {
+	test(`a committed proposal snapshot is labeled as incomplete: ${hasRows}`, async () => {
+		const f = reminderRuntime(() => hasRows ? [pendingRow("a".repeat(64), "Saved proposal.")] : [], undefined, "tui", true);
+		try {
+			await f.emit("session_start");
+			const { reminder } = await reminderTurns(f)();
+			assert.match(reminder!, /MEMORY PROPOSALS.*\nLast committed queue snapshot/);
+			assert.match(reminder!, /New dream results and current eligibility have not been checked/);
+			assert.doesNotMatch(reminder!, /There are currently no proposals/);
+			if (hasRows) assert.match(reminder!, /Saved proposal/);
+			else assert.match(reminder!, /The current queue may differ/);
+		} finally { await f.stop(); }
+	});
+}
+
+test("a failed proposal read is unknown, never absent or empty", async () => {
+	const f = reminderRuntime(() => [], new Error("busy"));
+	try {
+		await f.emit("session_start");
+		const { reminder } = await reminderTurns(f)();
+		assert.equal(reminder, "MEMORY PROPOSALS (surface during relevant work)\nProposals could not be read. The queue state is unknown, not empty.");
+	} finally { await f.stop(); }
+});
+
+test("a successful empty read replaces the previous nonempty proposal list", async () => {
+	let rows = [pendingRow("a".repeat(64), "Synthetic pending claim.")];
+	const f = reminderRuntime(() => rows);
+	try {
+		await f.emit("session_start");
+		const turn = reminderTurns(f);
+		assert.match((await turn()).reminder!, /Synthetic pending claim/);
+		rows = [];
+		assert.equal((await turn()).reminder, "MEMORY PROPOSALS (surface during relevant work)\nThere are currently no proposals.");
+	} finally { await f.stop(); }
+});
 
 test("a pending finding the user's request could match reaches the model each turn, and decided findings do not", async () => {
 	const pending = "a".repeat(64);
@@ -606,7 +650,7 @@ test("a slow pending reminder keeps its own worker alive past the turn's wait an
 	try {
 		await f.emit("session_start");
 		const turn = reminderTurns(f);
-		assert.equal((await turn()).reminder, undefined);
+		assert.match((await turn()).reminder!, /MEMORY PROPOSALS.*\nProposals could not be read/);
 		await f.emit("input", { text: "Next request.", source: "interactive" });
 		await sleep(0);
 		assert.equal(lists, 1);
@@ -664,7 +708,7 @@ test("a memory tool call stops a hanging pending reminder read instead of waitin
 	const { f, reminder } = hangingReminderRuntime();
 	try {
 		await f.emit("session_start");
-		assert.equal((await reminderTurns(f)()).reminder, undefined);
+		assert.match((await reminderTurns(f)()).reminder!, /MEMORY PROPOSALS.*\nProposals could not be read/);
 		assert.equal(reminder.signal?.aborted, false);
 		await promptly(f.tool.execute("during-reminder", { operation: "pending" }, undefined, undefined, f.ctx));
 		assert.equal(reminder.signal?.aborted, true); assert.equal(reminder.isClosed, true);

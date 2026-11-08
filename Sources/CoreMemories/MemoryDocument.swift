@@ -226,7 +226,6 @@ public enum MemoryDocument {
     return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).filter {
       guard let range = Range($0.range, in: text) else { return false }
       let start = text[..<range.lowerBound].utf8.count
-      let end = start + text[range].utf8.count
       var slashCount = 0
       var cursor = start
       while cursor > 0, raw[cursor - 1] == 92 {
@@ -234,7 +233,7 @@ public enum MemoryDocument {
         cursor -= 1
       }
       return slashCount.isMultiple(of: 2)
-        && allowed.contains { $0.contains(start) && end <= $0.upperBound }
+        && allowed.contains { $0.contains(start) }
     }
   }
 

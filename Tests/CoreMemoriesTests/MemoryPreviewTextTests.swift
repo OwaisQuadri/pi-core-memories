@@ -13,6 +13,15 @@ import Testing
   #expect(try MemoryDocument.displayText(Data()).isEmpty)
 }
 
+@Test(arguments: ["**synthetic**", "*synthetic*", "`synthetic`"])
+func previewTextOmitsFormattedSourceReferences(_ reference: String) throws {
+  let entry = Data("Keep this. [source: \(reference); added: 2026-11-07]\n".utf8)
+  let original = entry
+  #expect(MemoryDocument.failures(in: entry).isEmpty)
+  #expect(try MemoryDocument.displayText(entry) == "Keep this.")
+  #expect(entry == original)
+}
+
 @Test func previewTextRetainsLiteralCodeAndOrdinaryBrackets() throws {
   let entry = Data("Keep `[source: literal; added: 2026-11-07]` and [ordinary text]. [source: synthetic; added: 2026-11-07]\n".utf8)
   #expect(try MemoryDocument.displayText(entry) == "Keep `[source: literal; added: 2026-11-07]` and [ordinary text].")

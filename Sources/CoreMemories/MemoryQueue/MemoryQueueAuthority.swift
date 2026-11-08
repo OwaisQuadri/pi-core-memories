@@ -167,11 +167,14 @@ enum MemoryQueueAuthority {
     }
   }
 
-  static func publish<T>(git: Git, review: ReviewRootBinding?, _ operation: () throws -> T) throws
-    -> T
+  static func publish<T>(
+    git: Git, review: ReviewRootBinding?,
+    managementAuthorization: MemoryManagementAuthorization? = nil,
+    _ operation: () throws -> T
+  ) throws -> T
   {
     try locked(git: git) { root in
-      if let binding = try binding(root) {
+      if managementAuthorization == nil, let binding = try binding(root) {
         guard let review, binding.review == review else {
           throw MemoryError("queue-bound publication requires its verified native review profile")
         }

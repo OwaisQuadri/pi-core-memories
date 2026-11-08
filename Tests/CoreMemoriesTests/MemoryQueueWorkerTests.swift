@@ -26,7 +26,7 @@ private final class QueueWorkerFixture {
   let process = Process()
   let invocation = "queue-fixture"
 
-  init(config: URL, isReviewAvailable: Bool = true) throws {
+  init(config: URL) throws {
     process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
     process.arguments = [
       "xctest", "-XCTest", "CoreMemoriesTests.MemoryQueueWorkerProcessHelper/testQueueWorkerHelper",
@@ -43,7 +43,7 @@ private final class QueueWorkerFixture {
     try send("start", ["config": config.path])
     let ready = try frame()
     try #require(ready["type"] as? String == "ready")
-    #expect(ready["isReviewAvailable"] as? Bool == isReviewAvailable)
+    #expect(ready["isReviewAvailable"] as? Bool == false)
   }
 
   deinit {
@@ -98,6 +98,53 @@ private final class QueueWorkerFixture {
     return display
   }
 
+  func change(_ request: MemoryManagementRequest) throws -> [String: Any] {
+    for attempt in 0..<2 {
+      try send(
+        "manage-preview",
+        [
+          "sessionID": "session", "requestID": UUID().uuidString, "mode": "crud",
+          "request": try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)),
+        ])
+      let preview = try frame()
+      try #require(
+        preview["type"] as? String == "manage-presentation", "attempt \(attempt): \(preview)")
+      let display = try #require(preview["display"] as? [String: Any])
+      let identity = try #require(display["request"] as? [String: Any])
+      var tuple: [String: Any] = [
+        "claimID": display["claimID"]!, "sequence": display["sequence"]!,
+        "revision": display["currentBase"]!, "previewDigest": display["previewDigest"]!,
+        "displayDigest": display["displayDigest"]!, "sessionID": identity["sessionID"]!,
+        "requestID": identity["requestID"]!, "messageReference": "message",
+      ]
+      try send("manage-presented", tuple, isControl: true)
+      try #require(frame()["type"] as? String == "manage-presented")
+      tuple.removeValue(forKey: "messageReference")
+      let decisionID = UUID().uuidString
+      let approval =
+        display["isDetachRequired"] as? Bool == true
+        ? "Detach the memory checkout" : "Approve this memory change"
+      tuple["originalText"] = approval
+      tuple["submittedText"] = approval
+      tuple["decisionID"] = decisionID
+      tuple["responseReference"] = "later-human-message"
+      try send("manage-reply", tuple, isControl: true)
+      let outcome = try frame()
+      try #require(outcome["type"] as? String == "manage-decision")
+      let receipt = try #require(outcome["receipt"] as? [String: Any])
+      try send("manage-recover", ["decisionID": decisionID])
+      #expect(try frame()["receipt"] as? NSDictionary == receipt as NSDictionary)
+      if display["isDetachRequired"] as? Bool == true {
+        #expect(attempt == 0)
+        #expect(receipt["status"] as? String == "detached")
+      } else {
+        try #require(receipt["status"] as? String == "approved")
+        return receipt
+      }
+    }
+    throw MemoryError("direct change did not publish after checkout preparation")
+  }
+
   func tuple(_ display: [String: Any]) throws -> [String: Any] {
     let presentation = try #require(display["presentation"] as? [String: Any])
     let finding = try #require(presentation["finding"] as? [String: Any])
@@ -124,7 +171,9 @@ private func queueWorkerConfig(_ fixture: TransactionFixture) throws -> URL {
   return url
 }
 
-@Test(arguments: ["missing-dream", "corrupt-review", "unavailable-queue", "busy-review", "unavailable-journal"])
+@Test(arguments: [
+  "missing-dream", "corrupt-review", "unavailable-queue", "busy-review", "unavailable-journal",
+])
 func queueWorkerApprovedStorageDoesNotRequireHealthyReview(failure: String) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
@@ -141,7 +190,8 @@ func queueWorkerApprovedStorageDoesNotRequireHealthyReview(failure: String) thro
   switch failure {
   case "missing-dream": try FileManager.default.removeItem(at: fixture.state)
   case "corrupt-review":
-    try fixture.write("invalid review", file: URL(fileURLWithPath: configuration.reviewState + "/root.json"))
+    try fixture.write(
+      "invalid review", file: URL(fileURLWithPath: configuration.reviewState + "/root.json"))
   case "unavailable-queue":
     let root = URL(fileURLWithPath: configuration.reviewState + ".queue")
     try FileManager.default.removeItem(at: root)
@@ -162,7 +212,7 @@ func queueWorkerApprovedStorageDoesNotRequireHealthyReview(failure: String) thro
     expected: entry.expected)
   #expect(try manager.execute(request).entries.first?.expected == entry.expected)
   #expect(try MemoryStore(repo: fixture.memory).render(cwd: fixture.root).contains(entry.expected))
-  let worker = try QueueWorkerFixture(config: config, isReviewAvailable: failure != "missing-dream")
+  let worker = try QueueWorkerFixture(config: config)
   try worker.send("approved-list")
   #expect(try worker.frame()["type"] as? String == "approved")
   let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request))
@@ -172,11 +222,77 @@ func queueWorkerApprovedStorageDoesNotRequireHealthyReview(failure: String) thro
     operation: .add, base: catalog.base, path: "MEMORY.md",
     replacement: "Direct memory. [source: explicit user request; added: 2026-01-01]\n",
     reason: "Explicit requested addition")
-  try worker.send("manage-preview", [
-    "sessionID": "session", "requestID": "request", "mode": "crud",
-    "request": try JSONSerialization.jsonObject(with: JSONEncoder().encode(change)),
-  ])
-  #expect(try worker.frame()["type"] as? String == "manage-presentation")
+  let direct = MemoryQueueManagement(
+    configurationURL: config, configuration: configuration)
+  _ = try direct.preview(change, identity: MemoryQueueRequest(sessionID: "core", requestID: "core"))
+  direct.release()
+  let receipt = try worker.change(change)
+  #expect(receipt["commit"] as? String == (try fixture.main()))
+  let restarted = try QueueWorkerFixture(config: config)
+  try restarted.send("manage-recover", ["decisionID": receipt["decisionID"]!])
+  #expect(try restarted.frame()["receipt"] as? NSDictionary == receipt as NSDictionary)
+  if failure == "missing-dream" {
+    let journal = fixture.memory.deletingLastPathComponent()
+      .appendingPathComponent(fixture.memory.lastPathComponent + ".management")
+    let current = try DreamStateDirectory.openRoot(journal)
+    let name = "management-\(try #require(receipt["decisionID"] as? String)).json"
+    let queue = try DreamStateDirectory.openRoot(
+      URL(fileURLWithPath: configuration.reviewState + ".queue"))
+    try queue.installReviewFile(
+      current.read(name, maximum: MemoryReviewEncoding.maximumFileBytes), name: name)
+    try FileManager.default.removeItem(at: journal.appendingPathComponent(name))
+    var legacyConfiguration = configuration
+    legacyConfiguration.journal = journal.path
+    try legacyConfiguration.save(to: config)
+    let legacyWorker = try QueueWorkerFixture(config: config)
+    try legacyWorker.send("manage-recover", ["decisionID": receipt["decisionID"]!])
+    #expect(try legacyWorker.frame()["receipt"] as? NSDictionary == receipt as NSDictionary)
+  }
+  let added = try manager.execute(MemoryManagementRequest(operation: .list))
+  let newEntry = try #require(added.entries.first { $0.expected.contains("Direct memory.") })
+  let update = MemoryManagementRequest(
+    operation: .update, base: added.base, path: newEntry.path, locator: newEntry.locator,
+    expected: newEntry.expected,
+    replacement: "Updated memory. [source: explicit user request; added: 2026-01-01]\n",
+    reason: "Explicit requested update")
+  _ = try worker.change(update)
+  let updated = try manager.execute(MemoryManagementRequest(operation: .list))
+  let updatedEntry = try #require(updated.entries.first { $0.expected.contains("Updated memory.") })
+  _ = try worker.change(
+    MemoryManagementRequest(
+      operation: .delete, base: updated.base, path: updatedEntry.path,
+      locator: updatedEntry.locator,
+      expected: updatedEntry.expected, reason: "Explicit requested deletion"))
+  let remaining = try manager.execute(MemoryManagementRequest(operation: .list))
+  #expect(!remaining.entries.contains { $0.expected.contains("Updated memory.") })
+}
+
+@Test
+func directMemoryChangeRejectsRetargetedConfiguration() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let config = try queueWorkerConfig(fixture)
+  var configuration = try MemoryConfiguration.load(from: config)
+  let direct = MemoryQueueManagement(configurationURL: config, configuration: configuration)
+  let request = MemoryManagementRequest(
+    operation: .add, base: try fixture.main(), path: "MEMORY.md",
+    replacement: "Direct memory. [source: explicit user request; added: 2026-01-01]\n",
+    reason: "Explicit requested addition")
+  let identity = try MemoryQueueRequest(sessionID: "core", requestID: "core")
+  let detach = try direct.preview(request, identity: identity)
+  try direct.presented(detach, messageReference: "display-detach")
+  #expect(
+    try direct.decide(
+      detach, action: "detach", decisionID: "detach", responseReference: "reply-detach"
+    ).status == "detached")
+  let display = try direct.preview(request, identity: identity)
+  try direct.presented(display, messageReference: "display")
+  configuration.roots?.memory = fixture.root.appendingPathComponent("another-memory").path
+  try configuration.save(to: config)
+  #expect(throws: DreamRunError.unsafeState) {
+    try direct.decide(display, action: "approve", decisionID: "approve", responseReference: "reply")
+  }
+  #expect(try fixture.main() == request.base)
 }
 
 @Test(arguments: ["valid", "stdin", "stale", "legacy-choice"])

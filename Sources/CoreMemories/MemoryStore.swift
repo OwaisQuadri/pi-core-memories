@@ -529,12 +529,20 @@ public struct MemoryStore: Sendable {
 
   func publishCheckedMemoryCommit(
     commit: String, base: String, auditRef: String, checkout: ReviewCheckoutWitness,
-    reviewBinding: ReviewRootBinding? = nil
+    reviewBinding: ReviewRootBinding? = nil,
+    managementAuthorization: MemoryManagementAuthorization? = nil
   ) throws {
     guard checkout.head == Data((checkout.commit + "\n").utf8), checkout.main == base else {
       throw MemoryError("publication requires the confirmed detached checkout")
     }
-    try MemoryQueueAuthority.publish(git: git, review: reviewBinding) {
+    if let managementAuthorization {
+      guard managementAuthorization.repository == git.repo.path,
+        auditRef == "refs/memory-batches/\(managementAuthorization.saveID)"
+      else { throw DreamRunError.unsafeState }
+    }
+    try MemoryQueueAuthority.publish(
+      git: git, review: reviewBinding, managementAuthorization: managementAuthorization
+    ) {
       let result = try git.directRefTransaction(
         "update refs/heads/main \(commit) \(base)\ncreate \(auditRef) \(commit)\n",
         refs: ["refs/heads/main", auditRef], isolatedHead: checkout.commit)

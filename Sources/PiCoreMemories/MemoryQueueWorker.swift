@@ -150,29 +150,32 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
     }
     let configuration = try MemoryConfiguration.load(from: configURL)
     let input = QueueInput(invocation: invocation)
-    let sources = try? configuration.reviewSources(isCancelled: { input.isCancelled })
-    let queue = try sources.map { sources in
-      try MemoryQueue(
+    var reviewQueue: MemoryQueue?
+    func loadReviewQueue() throws -> MemoryQueue {
+      if let reviewQueue { return reviewQueue }
+      let sources = try configuration.reviewSources(isCancelled: { input.isCancelled })
+      let queue = try MemoryQueue(
         sources: sources, reviewState: URL(fileURLWithPath: configuration.reviewState),
         journal: URL(fileURLWithPath: configuration.journal),
         environment: ProcessInfo.processInfo.environment)
+      queue.isCancelled = { input.isCancelled }
+      reviewQueue = queue
+      return queue
     }
-    let management = queue.map {
-      MemoryQueueManagement(queue: $0, configurationURL: configURL, configuration: configuration)
-    }
+    let management = MemoryQueueManagement(
+      configurationURL: configURL, configuration: configuration)
     var managementDisplay: MemoryManagementDisplay?
     var relocation:
       (
         store: DreamRunStore, baseline: String, replacement: URL, roles: DreamSourceRoles,
         previewHash: String, tuple: [String: String]
       )?
-    queue?.isCancelled = { input.isCancelled }
     Thread.detachNewThread { input.read(descriptor: STDIN_FILENO, isControl: false) }
     Thread.detachNewThread { input.read(descriptor: control, isControl: true) }
     defer {
       input.stop()
-      management?.release()
-      queue?.release()
+      management.release()
+      reviewQueue?.release()
     }
     let tuple: Set<String> = [
       "version", "type", "invocationID", "claimID", "sequence", "revision",
@@ -184,9 +187,8 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
       "ready",
       [
         "policyVersion": 1, "ownership": "whole-store", "successors": "source-bound-v1",
-        "isReviewAvailable": queue != nil,
-        "reason": queue == nil
-          ? "verified dream sources unavailable; inventory only" as Any : NSNull(),
+        "isReviewAvailable": false,
+        "reason": "review is initialized only for review operations",
       ])
     while true {
       let (isControl, object) = try input.next()
@@ -320,20 +322,6 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
           continue
         }
         guard relocation == nil else { throw WorkerError.protocolFailure }
-        guard let queue else {
-          guard !isControl, ["inventory", "finish"].contains(type) else {
-            throw WorkerError.protocolFailure
-          }
-          try WorkerJSON.fields(object, header)
-          if type == "finish" {
-            try emit("final", ["status": "completed"])
-            return 0
-          }
-          try emit(
-            "inventory",
-            ["inventory": encoded(MemoryQueueInventory.readOnly(configuration: configuration))])
-          continue
-        }
         var originalReplyAction: MemoryConversationAction?
         if isControl, ["reply", "manage-reply"].contains(type) {
           try WorkerJSON.fields(
@@ -366,7 +354,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             continue
           }
           if type == "manage-reply", [MemoryConversationAction.reject, .postpone].contains(action) {
-            management?.release()
+            management.release()
             managementDisplay = nil
             input.expect(nil)
             try emit("manage-cancelled", ["status": "not-saved"])
@@ -374,7 +362,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
           }
           originalReplyAction = action
         }
-        if isControl, let current = managementDisplay, let management {
+        if isControl, let current = managementDisplay {
           try matchTuple(object, tuple: managementTuple(current))
           let managementFields = header.union(managementTuple(current).keys)
           if type == "manage-presented" {
@@ -418,6 +406,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             }
           }
         } else if isControl {
+          let queue = try loadReviewQueue()
           guard let current = display else { throw WorkerError.protocolFailure }
           try matchTuple(object, tuple: queueTuple(current))
           if type == "presented" {
@@ -471,8 +460,8 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             input.expect(nil)
             display = nil
             managementDisplay = nil
-            management?.release()
-            queue.release()
+            management.release()
+            reviewQueue?.release()
             try emit("released")
           case "amend":
             guard let current = display, managementDisplay == nil,
@@ -482,7 +471,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
             try WorkerJSON.fields(amendment, ["replacement", "reason"])
             try matchTuple(object, tuple: queueTuple(current))
             input.expect(nil)
-            let amended = try queue.amend(
+            let amended = try loadReviewQueue().amend(
               current,
               amendment: MemoryBatchAmendment(
                 replacement: WorkerJSON.text(amendment, "replacement", maximum: 262_144),
@@ -499,20 +488,20 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
               ])
           case "recover":
             try WorkerJSON.fields(object, header.union(["decisionID"]))
-            let receipt = try queue.recover(decisionID: WorkerJSON.identifier(object, "decisionID"))
+            let receipt = try loadReviewQueue().recover(decisionID: WorkerJSON.identifier(object, "decisionID"))
             try emit("decision", ["receipt": encoded(receipt)])
           case "counts":
             try WorkerJSON.fields(object, header)
             guard display == nil, managementDisplay == nil else {
               throw WorkerError.protocolFailure
             }
-            try emit("counts", ["review": queue.reviewCount()])
+            try emit("counts", ["review": loadReviewQueue().reviewCount()])
           case "inventory":
             try WorkerJSON.fields(object, header)
-            let inventory = try queue.inventory(configuration: configuration)
+            let inventory = try (try? loadReviewQueue())?.inventory(configuration: configuration)
+              ?? MemoryQueueInventory.readOnly(configuration: configuration)
             try emit("inventory", ["inventory": encoded(inventory)])
           case "manage-recover":
-            guard let management else { throw WorkerError.protocolFailure }
             try WorkerJSON.fields(object, header.union(["decisionID"]))
             try emit(
               "manage-decision",
@@ -521,7 +510,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
                   management.recover(decisionID: WorkerJSON.identifier(object, "decisionID")))
               ])
           case "manage-preview":
-            guard display == nil, managementDisplay == nil, let management else {
+            guard display == nil, managementDisplay == nil, relocation == nil else {
               throw WorkerError.protocolFailure
             }
             try WorkerJSON.fields(
@@ -548,6 +537,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
               ])
           case "list", "claim":
             guard managementDisplay == nil else { throw WorkerError.protocolFailure }
+            let queue = try loadReviewQueue()
             let fields =
               type == "list"
               ? ["sessionID", "requestID", "offset"] : ["sessionID", "requestID", "revision"]
@@ -593,7 +583,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
         var diagnostic: [String: Any] = [
           "code": code, "reason": dreamWorkerFailureName(error), "operation": type,
         ]
-        if isManagementPreviewStarted, let stage = management?.previewStage {
+        if isManagementPreviewStarted, let stage = management.previewStage {
           diagnostic["stage"] = stage.rawValue
         }
         try emit("blocked", diagnostic)

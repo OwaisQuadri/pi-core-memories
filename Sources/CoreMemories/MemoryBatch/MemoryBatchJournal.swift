@@ -3,12 +3,13 @@ import Foundation
 extension MemoryDraftStore {
   func saveBatch(
     _ draft: MemoryDraft, expectedDigest: String, review: MemoryReviewController?,
-    checkout: ReviewCheckoutWitness, authorized: Set<UUID>, didPersist: ((String) -> Void)? = nil
+    checkout: ReviewCheckoutWitness, managementAuthorization: MemoryManagementAuthorization? = nil,
+    authorized: Set<UUID>, didPersist: ((String) -> Void)? = nil
   ) throws -> MemoryBatchSaveResult {
     do {
       return try performBatchSave(
         draft, expectedDigest: expectedDigest, review: review, checkout: checkout,
-        authorized: authorized, didPersist: didPersist)
+        authorized: authorized, managementAuthorization: managementAuthorization, didPersist: didPersist)
     } catch {
       let saveID = try memoryBatchDigest(draft)
       let isKnownUnpublished: Bool
@@ -35,10 +36,11 @@ extension MemoryDraftStore {
 
   private func performBatchSave(
     _ draft: MemoryDraft, expectedDigest: String, review: MemoryReviewController?,
-    checkout: ReviewCheckoutWitness, authorized: Set<UUID>, didPersist: ((String) -> Void)?
+    checkout: ReviewCheckoutWitness, authorized: Set<UUID>,
+    managementAuthorization: MemoryManagementAuthorization?, didPersist: ((String) -> Void)?
   ) throws -> MemoryBatchSaveResult {
     try withBatchJournal(review, isWaitingForWriter: true) { state in
-      let publisher = batchPublisher(review)
+      let publisher = batchPublisher(review, managementAuthorization: managementAuthorization)
       do {
         if let recovered = try publisher.recover(draft) { return recovered }
       } catch {
@@ -113,8 +115,10 @@ extension MemoryDraftStore {
     }
   }
 
-  private func batchPublisher(_ review: MemoryReviewController?) -> MemoryBatchPublisher {
-    MemoryBatchPublisher(root: root, store: store, review: review) { event in
+  private func batchPublisher(
+    _ review: MemoryReviewController?, managementAuthorization: MemoryManagementAuthorization? = nil
+  ) -> MemoryBatchPublisher {
+    MemoryBatchPublisher(root: root, store: store, review: review, managementAuthorization: managementAuthorization) { event in
       try self.batchPersistenceFault?(event)
       try review?.persistenceFault?(event)
       if event == .beforePublication { try self.beforePublication?() }

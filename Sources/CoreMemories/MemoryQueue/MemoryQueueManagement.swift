@@ -50,23 +50,48 @@ package enum MemoryManagementPreviewStage: String {
     display
 }
 
+package struct MemoryManagementAuthorization {
+  let repository: String
+  let saveID: String
+
+  fileprivate init(repository: URL, draft: MemoryDraft) throws {
+    guard let items = draft.batch?.items, items.count == 1 else { throw DreamRunError.unsafeState }
+    switch items[0].intent {
+    case .manual, .confirmReviewed: break
+    default: throw DreamRunError.unsafeState
+    }
+    self.repository = repository.path
+    self.saveID = try memoryBatchDigest(draft)
+  }
+}
+
 package final class MemoryQueueManagement {
   package private(set) var previewStage: MemoryManagementPreviewStage?
-  private let queue: MemoryQueue
   private let configurationURL: URL
   private let configuration: MemoryConfiguration
   private var active:
     (
-      MemoryReviewController, MemoryBatchSession, MemoryReviewCheckoutPreview,
+      MemoryDraftStore, MemoryBatchSession, MemoryReviewCheckoutPreview,
       MemoryManagementDisplay
     )?
   private var messageReference: String?
   private var sequence: UInt64 = 0
 
-  package init(queue: MemoryQueue, configurationURL: URL, configuration: MemoryConfiguration) {
-    self.queue = queue
+  package init(
+    configurationURL: URL, configuration: MemoryConfiguration
+  ) {
     self.configurationURL = configurationURL
     self.configuration = configuration
+  }
+
+  private func drafts() throws -> MemoryDraftStore {
+    let selected = try MemoryStore(repo: configuration.memoryURL).reviewGit.repo
+    guard let resolved = realpath(selected.path, nil) else { throw DreamRunError.unsafeState }
+    defer { free(resolved) }
+    let repository = URL(fileURLWithPath: String(cString: resolved))
+    let journal = repository.deletingLastPathComponent()
+      .appendingPathComponent(repository.lastPathComponent + ".management")
+    return try MemoryDraftStore(repository: repository, journal: journal)
   }
 
   package func inspect(_ request: MemoryManagementRequest) throws -> MemoryManagementResult {
@@ -80,15 +105,10 @@ package final class MemoryQueueManagement {
   ) throws -> MemoryManagementDisplay {
     previewStage = .availability
     guard active == nil, sequence < UInt64.max else { throw DreamRunError.busy }
-    previewStage = .controller
-    let review = try queue.controller()
     previewStage = .drafts
-    let drafts = try MemoryDraftStore(
-      repository: configuration.memoryURL, journal: URL(fileURLWithPath: configuration.journal))
+    let drafts = try drafts()
     previewStage = .batchSession
-    let session = try MemoryBatchSession(
-      repository: configuration.memoryURL, drafts: drafts, review: review,
-      configurationURL: configurationURL)
+    let session = try MemoryBatchSession(repository: configuration.memoryURL, drafts: drafts)
     previewStage = .path
     guard let path = request.path else { throw DreamRunError.unsafeState }
     _ = try session.preparePath(path)
@@ -114,7 +134,11 @@ package final class MemoryQueueManagement {
       let replacement = composition.replacements[path]
     else { throw DreamRunError.unsafeState }
     previewStage = .checkout
-    let checkout = try review.checkoutPreview()
+    let witness = session.checkout
+    let checkout = MemoryReviewCheckoutPreview(
+      commit: witness.commit, main: witness.main,
+      isDetachRequired: witness.head == Data("ref: refs/heads/main\n".utf8),
+      digest: SourceDigest(bytes: try MemoryReviewEncoding.encode(witness)), witness: witness)
     previewStage = .display
     sequence += 1
     let claimID = UUID().uuidString
@@ -130,7 +154,7 @@ package final class MemoryQueueManagement {
       checkoutCommit: checkout.commit, checkoutDigest: checkout.digest.rawValue,
       displayDigest: "")
     display.displayDigest = SourceDigest(bytes: try display.publicationBytes()).rawValue
-    active = (review, session, checkout, display)
+    active = (drafts, session, checkout, display)
     messageReference = nil
     previewStage = nil
     return display
@@ -155,44 +179,126 @@ package final class MemoryQueueManagement {
     _ display: MemoryManagementDisplay, action: String, decisionID: String,
     responseReference: String
   ) throws -> MemoryManagementReceipt {
-    guard let (review, session, checkout, current) = active, current == display,
+    guard let (drafts, session, checkout, current) = active, current == display,
       let messageReference, responseReference != messageReference,
       MemoryQueueRequest.isIdentifier(responseReference),
       MemoryQueueRequest.isIdentifier(decisionID),
       ["approve", "detach"].contains(action), action != "approve" || !checkout.isDetachRequired
     else { throw DreamRunError.unsafeState }
     defer { release() }
-    guard try memoryBatchDigest(session.persistenceSnapshot) == display.previewDigest,
+    guard try MemoryConfiguration.load(from: configurationURL).memoryURL == configuration.memoryURL,
+      try memoryBatchDigest(session.persistenceSnapshot) == display.previewDigest,
       try compose(session).replacements[display.path] == display.replacement
     else { throw DreamRunError.unsafeState }
     let intent = ManagementIntent(
       decisionID: decisionID, display: display, draft: session.persistenceSnapshot, action: action,
       responseReference: responseReference)
     let name = "management-\(decisionID).json"
-    guard try !queue.directory.isPresent(name) else {
+    guard try !drafts.root.isPresent(name) else {
       throw MemoryError("decision key already used; recover its receipt")
     }
-    try queue.directory.installReviewFile(MemoryReviewEncoding.encode(intent), name: name)
+    try drafts.root.installReviewFile(MemoryReviewEncoding.encode(intent), name: name)
     if action == "detach" {
       guard checkout.isDetachRequired else { throw DreamRunError.unsafeState }
-      try review.confirmDetach(checkout)
+      let gitCheckout = try drafts.store.reviewGit.reviewCheckout()
+      try gitCheckout.withLeaseState { state in
+        try gitCheckout.lock(state: state, detachedHead: Data((checkout.commit + "\n").utf8))
+        guard try gitCheckout.witness(isLocked: true) == checkout.witness else {
+          throw MemoryError("checkout confirmation is stale")
+        }
+        let attempt = ReviewDetachAttempt(
+          schemaVersion: 1, witness: checkout.witness, digest: checkout.digest.rawValue,
+          auditRef: "refs/memory-management/detach/\(checkout.digest.rawValue)")
+        try drafts.root.installReviewFile(
+          MemoryReviewEncoding.encode(attempt), name: "detach-attempt-\(attempt.digest).json")
+        try gitCheckout.detach(checkout.witness)
+      }
     } else {
-      _ = try session.save()
+      let authorization = try MemoryManagementAuthorization(
+        repository: drafts.store.reviewGit.repo, draft: session.persistenceSnapshot)
+      _ = try session.save(managementAuthorization: authorization)
     }
-    return try recover(decisionID: decisionID, review: review)
+    return try recover(decisionID: decisionID)
   }
 
   package func recover(decisionID: String) throws -> MemoryManagementReceipt {
-    try recover(decisionID: decisionID, review: queue.controller())
+    guard MemoryQueueRequest.isIdentifier(decisionID) else { throw DreamRunError.unsafeState }
+    let drafts = try drafts()
+    let name = "management-\(decisionID).json"
+    guard try drafts.root.isPresent(name) else {
+      return try recoverLegacy(decisionID: decisionID)
+    }
+    let intent = try MemoryReviewEncoding.decode(
+      ManagementIntent.self,
+      bytes: drafts.root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
+    guard intent.decisionID == decisionID else { throw DreamRunError.corruption }
+    var status = "outcome-unresolved"
+    var commit: String?
+    var auditRef: String?
+    if intent.action == "approve" {
+      if let outcome = try drafts.recoverBatch(
+        draftID: intent.draft.draftID, revision: intent.draft.revision)
+      {
+        switch outcome {
+        case .saved(let receipt), .savedNeedsRecovery(let receipt, _):
+          if receipt.commit != nil, receipt.auditRef != nil {
+            status = "approved"
+            commit = receipt.commit
+            auditRef = receipt.auditRef
+          }
+        default: break
+        }
+      }
+    } else if intent.action == "detach" {
+      let digest = intent.display.checkoutDigest
+      let attempt = try MemoryReviewEncoding.decode(
+        ReviewDetachAttempt.self,
+        bytes: drafts.root.read(
+          "detach-attempt-\(digest).json", maximum: MemoryReviewEncoding.maximumFileBytes))
+      guard attempt.schemaVersion == 1, attempt.digest == digest,
+        attempt.witness.commit == intent.display.checkoutCommit,
+        attempt.digest
+          == SourceDigest(bytes: try MemoryReviewEncoding.encode(attempt.witness)).rawValue,
+        attempt.witness.head == Data("ref: refs/heads/main\n".utf8),
+        attempt.auditRef == "refs/memory-management/detach/\(digest)"
+      else { throw DreamRunError.corruption }
+      let git = drafts.store.reviewGit
+      let checkout = try git.reviewCheckout()
+      try checkout.withLeaseState { _ in
+        if let saved = try MemoryBatchReplay.directCommit(attempt.auditRef, git: git) {
+          guard saved == attempt.witness.commit else { throw DreamRunError.corruption }
+        } else {
+          let witness = try checkout.witness()
+          guard witness.head == Data((attempt.witness.commit + "\n").utf8),
+            witness.gitDevice == attempt.witness.gitDevice,
+            witness.gitInode == attempt.witness.gitInode,
+            witness.index == attempt.witness.index, witness.config == attempt.witness.config,
+            witness.sharedIndexes == attempt.witness.sharedIndexes
+          else { return }
+          let result = try git.directRefTransaction(
+            "create \(attempt.auditRef) \(attempt.witness.commit)\n", refs: [attempt.auditRef],
+            isolatedHead: attempt.witness.commit)
+          guard result.status == 0 else { throw DreamRunError.persistenceFailure }
+        }
+        try drafts.root.installReviewFile(
+          MemoryReviewEncoding.encode(attempt), name: "detach-outcome-\(digest).json")
+        status = "detached"
+        commit = attempt.witness.commit
+        auditRef = attempt.auditRef
+      }
+    }
+    return MemoryManagementReceipt(
+      decisionID: decisionID, displayDigest: intent.display.displayDigest, status: status,
+      commit: commit, auditRef: auditRef)
   }
 
-  private func recover(decisionID: String, review: MemoryReviewController) throws
-    -> MemoryManagementReceipt
-  {
+  private func recoverLegacy(decisionID: String) throws -> MemoryManagementReceipt {
+    let directory = try DreamStateDirectory.openRoot(
+      URL(fileURLWithPath: configuration.reviewState + ".queue"), isCreating: false)
     guard MemoryQueueRequest.isIdentifier(decisionID) else { throw DreamRunError.unsafeState }
     let intent = try MemoryReviewEncoding.decode(
       ManagementIntent.self,
-      bytes: queue.directory.read(
+      bytes: directory.read(
         "management-\(decisionID).json", maximum: MemoryReviewEncoding.maximumFileBytes))
     guard intent.decisionID == decisionID else { throw DreamRunError.corruption }
     var status = "outcome-unresolved"
@@ -202,7 +308,7 @@ package final class MemoryQueueManagement {
       let drafts = try MemoryDraftStore(
         repository: configuration.memoryURL, journal: URL(fileURLWithPath: configuration.journal))
       if let result = try drafts.recoverBatch(
-        draftID: intent.draft.draftID, revision: intent.draft.revision, review: review)
+        draftID: intent.draft.draftID, revision: intent.draft.revision)
       {
         switch result {
         case .saved(let receipt), .savedNeedsRecovery(let receipt, _):
@@ -215,12 +321,13 @@ package final class MemoryQueueManagement {
         }
       }
     } else if intent.action == "detach" {
-      _ = try review.list()
+      let root = try DreamStateDirectory.openRoot(
+        URL(fileURLWithPath: configuration.reviewState), isCreating: false)
       let name = "detach-outcome-\(intent.display.checkoutDigest).json"
-      if try review.root.isPresent(name) {
+      if try root.isPresent(name) {
         let attempt = try MemoryReviewEncoding.decode(
           ReviewDetachAttempt.self,
-          bytes: review.root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
+          bytes: root.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
         guard attempt.digest == intent.display.checkoutDigest,
           attempt.witness.commit == intent.display.checkoutCommit
         else { throw DreamRunError.corruption }

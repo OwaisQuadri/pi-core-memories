@@ -18,13 +18,13 @@ The first stdin frame has exactly these fields:
 {"version":1,"type":"start","invocationID":"fixture-review","config":"/tmp/memory-queue-fixture/config.json"}
 ```
 
-`config` is an absolute configuration filename or JSON `null` for `MemoryConfiguration.defaultURL`. Configuration is loaded once. No cwd-derived queue, root flags, approval flag, or caller-supplied binding is accepted. `MemoryConfiguration.reviewSources()` resolves the saved dream roots and verifies their repository/source binding. Existing configuration fields remain authoritative. The queue directory is `reviewState + ".queue"`, outside the repository, sessions, stripping roots, dream state, review state, and journal.
+`config` is an absolute configuration filename or JSON `null` for `MemoryConfiguration.defaultURL`. Configuration is loaded at startup. Direct management rechecks the selected memory repository before applying a reply. No cwd-derived queue, root flags, approval flag, or caller-supplied binding is accepted. Review operations lazily call `MemoryConfiguration.reviewSources()` to resolve the saved dream roots and verify their repository/source binding. Approved-memory operations do not call it. The review queue directory is `reviewState + ".queue"`, outside the repository, sessions, stripping roots, dream state, review state, and journal.
 
 First verified queue access pins the actual review/source/repository binding and queue directory identity in `<canonical Git common directory>/memory-queue/binding.json`. The stable `writer.lock` in that private directory serializes activation with native publication. Different review profiles for the same repository fail rather than create another authority. Retargeting a root or replacing its inode also fails. There is no automatic rebind or reconciliation command.
 
-`MemoryReviewController` checks this binding at initialization and refresh. `MemoryStore.publishCheckedMemoryCommit` holds the repository authority lock through checked publication. A bound repository requires the matching native controller binding. No wire request can supply that proof. Unbound publication semantics remain unchanged.
+`MemoryReviewController` checks this binding at initialization and refresh. `MemoryStore.publishCheckedMemoryCommit` holds the repository authority lock through checked publication. Inferred changes require the matching native controller binding. Explicit user changes use a separate native management authorization, minted only after exact display acknowledgement and an eligible private reply. It binds one manual or confirm-reviewed batch digest and the repository. It cannot authorize candidate-bearing batches. No wire request can supply either proof. Unbound publication semantics remain unchanged.
 
-Direct `manage` mutations and legacy manual draft Save have no review-profile proof and cannot publish after binding. List/get and checked historical recovery remain available. A supported matching-profile path is `MemoryBatchSession(repository:drafts:review:...)` with the actual verified controller, fresh per-item authorization, and `save()`. It supports requested additions, updates, deletions, and confirm-reviewed changes through the existing batch types. The private management operations below expose that matching-profile path; legacy `manage` mutation remains fenced.
+Direct `manage` mutations and legacy manual draft Save have no review-profile proof and cannot publish after binding. List/get and checked historical recovery remain available. A supported matching-profile path is `MemoryBatchSession(repository:drafts:review:...)` with the actual verified controller, fresh per-item authorization, and `save()`. It supports requested additions, updates, deletions, and confirm-reviewed changes through the existing batch types. The private management operations below instead use source-independent explicit management authority; legacy `manage` mutation remains fenced.
 
 ## Conversation and background ownership
 
@@ -66,15 +66,15 @@ Descriptor 3 must be an inherited, owned anonymous pipe or unnamed connected Uni
 
 One live controller owns the whole review store from successful `claim` through disposition or release. Other owners receive `busy`. List and inventory normally acquire ownership only for their operation, so they can also report busy during another session's review. Queue file locks are short-lived and never held while waiting for a person. No heartbeat timeout steals a live lock. EOF on either host channel, explicit finish/cancel, helper death, and settled choices release ownership. A connected hung host remains busy until it releases or closes.
 
-## Ready and inventory-only mode
+## Ready and independent approved-memory operations
 
 Successful start emits:
 
 ```json
-{"version":1,"type":"ready","invocationID":"fixture-review","policyVersion":1,"ownership":"whole-store","successors":"source-bound-v1","isReviewAvailable":true,"reason":null}
+{"version":1,"type":"ready","invocationID":"fixture-review","policyVersion":1,"ownership":"whole-store","successors":"source-bound-v1","isReviewAvailable":false,"reason":"review is initialized only for review operations"}
 ```
 
-If verified dream-source initialization is unavailable, `isReviewAvailable` is false and `reason` is `"verified dream sources unavailable; inventory only"`. Only stdin `inventory`, `approved-list`, `approved-get`, and `finish` are then accepted. This mode creates no controller, repository binding, or queue state. It can report retained manual drafts and ref-only proposals without inventing evidence. It is blocked migration inventory, not completed migration or review.
+Startup does not probe dream sources or create a review controller, repository binding, or queue directory. `isReviewAvailable:false` means review has not been initialized; it is not a failed health check or an operation whitelist. Approved reads and private explicit management remain available when dream state, review state, the review queue, or the review journal is missing, corrupt, or busy. Review operations initialize their own dependencies and report their own failures. Inventory can fall back to retained read-only records without promoting them to verified findings.
 
 ## Stdin operations
 
@@ -169,7 +169,7 @@ Before mutation, native persists the exact decision intent, marked as immediate.
 
 ## Approved-memory management
 
-All operations use the same worker/configuration and common header. Read operations remain useful without verified dream sources and do not create queue authority:
+All operations use the same worker/configuration and common header. Approved reads and explicit management do not require verified dream sources or a review controller. Reads do not create queue authority. The conversation adapter also excludes these operations from review-reminder shutdown waits and review-count refreshes:
 
 | Stdin type | Additional fields | Result |
 | --- | --- | --- |
@@ -185,7 +185,7 @@ All operations use the same worker/configuration and common header. Read operati
 - delete: `{operation:"delete",base,path,locator:{start,end},expected,reason}`
 - get / confirm-reviewed: `{operation:"get",base,path,locator:{start,end},expected}`
 
-Offsets are native numeric UTF-8 byte offsets. Expected/replacement values are exact UTF-8 strings. A CRUD preview permits only add/update/delete; confirm-reviewed uses the exact get target and stages native fresh confirm-reviewed authority. Base, locator, scope and source-annotation preservation are checked by the existing facade. Changes use the actual configured controller and journal; no arbitrary roots or replacement memory store are accepted.
+Offsets are native numeric UTF-8 byte offsets. Expected/replacement values are exact UTF-8 strings. A CRUD preview permits only add/update/delete; confirm-reviewed uses the exact get target and stages native fresh confirm-reviewed authority. Base, locator, scope and source-annotation preservation are checked by the existing facade. Changes use the selected approved repository and its separate canonical sibling journal, `<memory>.management`. No arbitrary roots or replacement memory store are accepted. Management intents, batch drafts, detach attempts, and checked receipts live in this journal, not the inferred-review queue or journal.
 
 The management `display` is a flat object containing `claimID`, decimal `sequence`, `request:{sessionID,requestID}`, `operation`, `reason`, scope `path`, `currentBase`, base64 effect `before`/`after`, base64 full-document `documentBefore`/final `replacement`, `previewDigest`, `isDetachRequired`, `checkoutCommit`, `checkoutDigest`, and `displayDigest`. `displayBytes` is the canonical sorted-key, unescaped-slash JSON object with **only `displayDigest` removed**. SHA-256(decoded displayBytes) equals displayDigest. Verify these native bytes rather than recreating JSON. Display all exact decoded before/final/annotation/scope bytes and reason before enabling the choice. Base64 alone, truncation, paraphrase, partial text, or hidden attachments do not constitute publication.
 
@@ -193,7 +193,7 @@ Descriptor 3 accepts `manage-presented` with the common header, the full queue t
 
 An attached checkout cannot approve. Detach cannot save memory: after its checked receipt, obtain a new preview and a new explicit decision. `release`, finish, either EOF, and helper death invalidate active preview authority. There is only one active inferred or management presentation.
 
-`manage-decision.receipt` has `decisionID`, `displayDigest`, `status`, and optional `commit`/`auditRef`. Only `approved` with a checked native batch receipt proves saved memory. `detached` is checkout preparation only; `outcome-unresolved` does not prove mutation. Intent files (`management-<decisionID>.json`) preserve the exact display, native draft, action and opaque live response reference before mutation. Recovery verifies the native journal/publication or detach outcome and never reconstructs approval. On stale base, changed configuration/checkout/bytes, or failed publication, release and obtain a fresh exact preview and explicit decision. Recovered drafts or model/stdin frames cannot approve.
+`manage-decision.receipt` has `decisionID`, `displayDigest`, `status`, and optional `commit`/`auditRef`. Only `approved` with a checked native batch receipt proves saved memory. `detached` is checkout preparation only; `outcome-unresolved` does not prove mutation. Intent files (`management-<decisionID>.json`) preserve the exact display, native draft, action and opaque live response reference before mutation. Recovery verifies the native journal/publication or detach outcome and never reconstructs approval. Legacy management records remain in their original locations and are verified without opening a review controller or dream sources. If their own proof is unavailable, recovery remains unresolved. On a stale base, changed selected memory repository, changed checkout or bytes, or failed publication, release and obtain a fresh exact preview and explicit decision. Recovered drafts or model/stdin frames cannot approve.
 
 ## Versioned changed-evidence successor
 

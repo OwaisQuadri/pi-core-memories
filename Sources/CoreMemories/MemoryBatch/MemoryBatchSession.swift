@@ -171,10 +171,10 @@ package final class MemoryBatchSession {
     expectedDurableDigest = receipt.digest
   }
 
-  package func save() throws -> MemoryBatchSaveResult {
+  package func save(managementAuthorization: MemoryManagementAuthorization? = nil) throws -> MemoryBatchSaveResult {
     try drafts.saveBatch(
       persistenceSnapshot, expectedDigest: expectedDurableDigest,
-      review: review, checkout: checkout,
+      review: review, checkout: checkout, managementAuthorization: managementAuthorization,
       authorized: Set(items.filter(isAuthorized).map(\.itemID)),
       didPersist: { self.expectedDurableDigest = $0 })
   }

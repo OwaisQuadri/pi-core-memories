@@ -42,7 +42,7 @@ private final class QueueWorkerFixture {
     try control.fileHandleForReading.close()
     try send("start", ["config": config.path])
     let ready = try frame()
-    #expect(ready["type"] as? String == "ready")
+    try #require(ready["type"] as? String == "ready")
     #expect(ready["isReviewAvailable"] as? Bool == isReviewAvailable)
   }
 
@@ -122,6 +122,61 @@ private func queueWorkerConfig(_ fixture: TransactionFixture) throws -> URL {
   let url = fixture.root.appendingPathComponent("config/config.json")
   try configuration.save(to: url)
   return url
+}
+
+@Test(arguments: ["missing-dream", "corrupt-review", "unavailable-queue", "busy-review", "unavailable-journal"])
+func queueWorkerApprovedStorageDoesNotRequireHealthyReview(failure: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  let config = try queueWorkerConfig(fixture)
+  let configuration = try MemoryConfiguration.load(from: config)
+  do {
+    let queue = try MemoryQueue(
+      sources: sources, reviewState: URL(fileURLWithPath: configuration.reviewState),
+      journal: URL(fileURLWithPath: configuration.journal), environment: [:])
+    _ = try queue.list(request: MemoryQueueRequest(sessionID: "setup", requestID: "setup"))
+  }
+  var owner: MemoryReviewController?
+  switch failure {
+  case "missing-dream": try FileManager.default.removeItem(at: fixture.state)
+  case "corrupt-review":
+    try fixture.write("invalid review", file: URL(fileURLWithPath: configuration.reviewState + "/root.json"))
+  case "unavailable-queue":
+    let root = URL(fileURLWithPath: configuration.reviewState + ".queue")
+    try FileManager.default.removeItem(at: root)
+    try fixture.write("unavailable queue", file: root)
+  case "busy-review":
+    owner = try MemoryReviewController(
+      repository: fixture.memory, stateRoot: URL(fileURLWithPath: configuration.reviewState),
+      sources: sources, environment: [:])
+  default:
+    try fixture.write("unavailable journal", file: URL(fileURLWithPath: configuration.journal))
+  }
+  defer { withExtendedLifetime(owner) {} }
+  let manager = try MemoryManagement(repository: fixture.memory)
+  let catalog = try manager.execute(MemoryManagementRequest(operation: .list))
+  let entry = try #require(catalog.entries.first { $0.isMutable })
+  let request = MemoryManagementRequest(
+    operation: .get, base: catalog.base, path: entry.path, locator: entry.locator,
+    expected: entry.expected)
+  #expect(try manager.execute(request).entries.first?.expected == entry.expected)
+  #expect(try MemoryStore(repo: fixture.memory).render(cwd: fixture.root).contains(entry.expected))
+  let worker = try QueueWorkerFixture(config: config, isReviewAvailable: failure != "missing-dream")
+  try worker.send("approved-list")
+  #expect(try worker.frame()["type"] as? String == "approved")
+  let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request))
+  try worker.send("approved-get", ["request": object])
+  #expect(try worker.frame()["type"] as? String == "approved")
+  let change = MemoryManagementRequest(
+    operation: .add, base: catalog.base, path: "MEMORY.md",
+    replacement: "Direct memory. [source: explicit user request; added: 2026-01-01]\n",
+    reason: "Explicit requested addition")
+  try worker.send("manage-preview", [
+    "sessionID": "session", "requestID": "request", "mode": "crud",
+    "request": try JSONSerialization.jsonObject(with: JSONEncoder().encode(change)),
+  ])
+  #expect(try worker.frame()["type"] as? String == "manage-presentation")
 }
 
 @Test(arguments: ["valid", "stdin", "stale", "legacy-choice"])

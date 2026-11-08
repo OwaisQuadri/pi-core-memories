@@ -43,6 +43,8 @@ package func interpretMemoryConversationReply(
   }
   let text = memoryReplyText(originalText)
   guard !text.isEmpty, text == memoryReplyText(submittedText) else { return .clarify }
+  if text == "no" { return .reject }
+  if text == "yes" { return isDetachRequired ? .clarify : .approve }
   let objects = ["this memory", "that memory", "the displayed memory", "the memory shown"]
   if objects.contains(where: { object in
     [

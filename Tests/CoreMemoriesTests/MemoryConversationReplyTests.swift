@@ -27,8 +27,38 @@ func memoryReplyRequiresAnExplicitActionForTheNativeOperation(
     ).rawValue == expected)
 }
 
+@Test(arguments: ["add", "update", "delete", "confirm-reviewed"])
+func memoryQuestionAcceptsYesAndNoForTheBoundProposal(operation: String) {
+  for text in ["yes", " Yes! ", "YES."] {
+    #expect(
+      interpretMemoryConversationReply(
+        originalText: text, submittedText: text, operation: operation, isDetachRequired: false
+      ) == .approve)
+  }
+  #expect(
+    interpretMemoryConversationReply(
+      originalText: "no", submittedText: "no", operation: operation, isDetachRequired: false
+    ) == .reject)
+  #expect(
+    interpretMemoryConversationReply(
+      originalText: "yes", submittedText: "no", operation: operation, isDetachRequired: false
+    ) == .clarify)
+  #expect(
+    interpretMemoryConversationReply(
+      originalText: "yes", submittedText: "yes", operation: operation, isDetachRequired: true
+    ) == .clarify)
+}
+
+@Test func memoryQuestionAgreementDoesNotApproveSnippetRelocation() {
+  #expect(
+    interpretMemoryConversationReply(
+      originalText: "yes", submittedText: "yes", operation: "relocate-snippets",
+      isDetachRequired: false
+    ) == .clarify)
+}
+
 @Test(arguments: [
-  "Yes", "Okay", "Looks good", "Save it", "Remember Toronto", "",
+  "Okay", "Looks good", "Save it", "Remember Toronto", "",
   "Yes, but change Toronto to Ottawa.", "Save that memory if the source is right.",
   "Save that memory and delete another one.", "'Save that memory'", "\"Save that memory\"",
   "Would 'save that memory' work?", "I previously said save that memory.",

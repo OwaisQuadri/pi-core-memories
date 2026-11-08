@@ -123,7 +123,7 @@ private final class QueueWorkerFixture {
       let decisionID = UUID().uuidString
       let approval =
         display["isDetachRequired"] as? Bool == true
-        ? "Detach the memory checkout" : "Approve this memory change"
+        ? "Detach the memory checkout" : "yes"
       tuple["originalText"] = approval
       tuple["submittedText"] = approval
       tuple["decisionID"] = decisionID
@@ -299,7 +299,7 @@ func directMemoryChangeRejectsRetargetedConfiguration() throws {
   #expect(try fixture.main() == request.base)
 }
 
-@Test(arguments: ["valid", "stdin", "stale", "legacy-choice"])
+@Test(arguments: ["valid", "yes", "no", "stdin", "stale", "legacy-choice"])
 func queueWorkerOnlyExactPrivateOriginalReplyReturnsReceipt(mode: String) throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }
@@ -318,8 +318,9 @@ func queueWorkerOnlyExactPrivateOriginalReplyReturnsReceipt(mode: String) throws
   try worker.send("presented", tuple, isControl: true)
   #expect(try worker.frame()["type"] as? String == "presented")
   tuple.removeValue(forKey: "messageReference")
-  tuple["originalText"] = "Save that memory"
-  tuple["submittedText"] = "Save that memory"
+  let reply = mode == "valid" ? "Save that memory" : mode == "no" ? "no" : "yes"
+  tuple["originalText"] = reply
+  tuple["submittedText"] = reply
   tuple["decisionID"] = "save-1"
   tuple["responseReference"] = "human-response"
   if mode == "stale" { tuple["requestID"] = "foreign-request" }
@@ -331,11 +332,15 @@ func queueWorkerOnlyExactPrivateOriginalReplyReturnsReceipt(mode: String) throws
   }
   try worker.send(mode == "legacy-choice" ? "choice" : "reply", tuple, isControl: mode != "stdin")
   let outcome = try worker.frame()
-  if mode == "valid" {
+  if ["valid", "yes", "no"].contains(mode) {
     #expect(outcome["type"] as? String == "decision")
     let receipt = try #require(outcome["receipt"] as? [String: Any])
-    #expect(receipt["status"] as? String == "approved")
-    #expect(receipt["commit"] as? String == (try fixture.main()))
+    #expect(receipt["status"] as? String == (mode == "no" ? "rejected" : "approved"))
+    if mode == "no" {
+      #expect(try fixture.main() == original)
+    } else {
+      #expect(receipt["commit"] as? String == (try fixture.main()))
+    }
     try worker.send("recover", ["decisionID": "save-1"])
     #expect(try worker.frame()["receipt"] as? NSDictionary == receipt as NSDictionary)
     try worker.send("finish")

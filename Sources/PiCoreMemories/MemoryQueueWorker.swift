@@ -537,7 +537,6 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
               ])
           case "list", "claim":
             guard managementDisplay == nil else { throw WorkerError.protocolFailure }
-            let queue = try loadReviewQueue()
             let fields =
               type == "list"
               ? ["sessionID", "requestID", "offset"] : ["sessionID", "requestID", "revision"]
@@ -550,17 +549,26 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
               guard let offset = Int(offsetText), offset >= 0, String(offset) == offsetText else {
                 throw WorkerError.protocolFailure
               }
-              let rows = try queue.list(request: request)
+              let rows: [MemoryQueueRow]
+              let isSnapshot: Bool
+              do {
+                rows = try loadReviewQueue().list(request: request)
+                isSnapshot = false
+              } catch DreamRunError.busy {
+                rows = try MemoryQueue.committedSnapshot(configuration: configuration, request: request)
+                isSnapshot = true
+              }
               guard offset <= rows.count else { throw WorkerError.protocolFailure }
               let end = min(rows.count, offset + 64)
               try emit(
                 "queue",
                 [
                   "rows": encoded(Array(rows[offset..<end])),
+                  "isSnapshot": isSnapshot,
                   "nextOffset": end < rows.count ? String(end) as Any : NSNull(),
                 ])
             } else {
-              let current = try queue.claim(
+              let current = try loadReviewQueue().claim(
                 revision: WorkerJSON.text(object, "revision", maximum: 64), request: request)
               display = current
               input.expect(queueTuple(current))

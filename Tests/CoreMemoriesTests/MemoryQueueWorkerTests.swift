@@ -171,6 +171,64 @@ private func queueWorkerConfig(_ fixture: TransactionFixture) throws -> URL {
   return url
 }
 
+@Test(arguments: ["review", "dream", "queue"])
+func queueWorkerReadsCommittedProposalsWhileAWriterIsActive(owner: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  let config = try queueWorkerConfig(fixture)
+  let configuration = try MemoryConfiguration.load(from: config)
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let expected: [MemoryQueueRow]
+  do {
+    let queue = try queueFixture(fixture, sources: sources)
+    expected = try queue.list(request: request)
+  }
+  try #require(!expected.isEmpty)
+  let review = URL(fileURLWithPath: configuration.reviewState)
+  let queueURL = URL(fileURLWithPath: configuration.reviewState + ".queue")
+  let root = try DreamStateDirectory.openRoot(
+    owner == "review" ? review : owner == "dream" ? fixture.state : queueURL,
+    isCreating: false)
+  let lock = try root.openReadLock()
+  defer { _ = flock(lock, LOCK_UN); _ = close(lock) }
+  try #require(flock(lock, LOCK_EX | LOCK_NB) == 0)
+  let queueFile = queueURL.appendingPathComponent("queue.json")
+  let before = try Data(contentsOf: queueFile)
+  let base = try fixture.main()
+  let snapshot = try MemoryQueue.committedSnapshot(configuration: configuration, request: request)
+  #expect(snapshot.map(\.finding) == expected.map(\.finding))
+  #expect(try Data(contentsOf: queueFile) == before)
+  let worker = try QueueWorkerFixture(config: config)
+  try worker.send("list", ["sessionID": "session", "requestID": "request", "offset": "0"])
+  let page = try worker.frame()
+  #expect(page["type"] as? String == "queue")
+  #expect(page["isSnapshot"] as? Bool == true)
+  let rows = try #require(page["rows"] as? [[String: Any]])
+  #expect(rows.count == expected.count)
+  #expect(try Data(contentsOf: queueFile) == before)
+  #expect(try fixture.main() == base)
+}
+
+@Test(arguments: ["reject", "defer"])
+func committedProposalSnapshotKeepsRecordedDecisions(action: String) throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let sources = try reviewCompletedSiblings(fixture)
+  let config = try queueWorkerConfig(fixture)
+  let configuration = try MemoryConfiguration.load(from: config)
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let queue = try queueFixture(fixture, sources: sources)
+  let row = try #require(queue.list(request: request).first)
+  let display = try queue.claim(revision: row.finding.revision, request: request)
+  try queue.presented(display, messageReference: "message")
+  _ = try queue.decide(display, action: action, decisionID: action, responseReference: "answer")
+  let snapshot = try MemoryQueue.committedSnapshot(configuration: configuration, request: request)
+  let decided = try #require(snapshot.first { $0.finding.revision == row.finding.revision })
+  #expect(decided.disposition == (action == "reject" ? "rejected" : "deferred"))
+  #expect(decided.blockReason != nil)
+}
+
 @Test(arguments: [
   "missing-dream", "corrupt-review", "unavailable-queue", "busy-review", "unavailable-journal",
 ])

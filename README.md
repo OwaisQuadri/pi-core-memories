@@ -191,17 +191,24 @@ queue and gives the model a short reminder: one line per pending finding, with
 its revision and the first line of its proposed entry (up to 120 characters).
 When a finding could be relevant to the current request, the model presents
 that exact proposal. The reminder is never approval, carries no proposal
-control material, and is not saved in the session. Listing is not a pure read:
-it takes the queue lock without waiting and may rewrite `queue.json`. When the
-lock is busy (an open proposal in any window, a dream's short writer phase,
-or another window's queue request), that prompt gets no freshly listed
-reminder; if the
-user answered a listed finding since the last reminder, a copy of that
-reminder without the answered findings is added instead. A new reminder
-is also left out when nothing is pending, while a proposal awaits a reply, or
-when the queue cannot be listed in time. The request is abandoned after two
-seconds and stopping the native worker can take about one more second, so a
-prompt waits about three seconds at most.
+control material, and is not saved in the session. The section starts with
+`MEMORY PROPOSALS (surface during relevant work)`. A successful empty read says
+`There are currently no proposals.` A failed or slow read says that the queue
+state is unknown, not empty.
+
+Normal listing takes the queue lock without waiting and may rewrite
+`queue.json`. If a review, dream, or queue writer is busy, listing reads the
+last committed queue snapshot without taking the writer locks or changing
+state. The reminder marks this snapshot as incomplete: new dream results and
+current eligibility have not been checked. An empty snapshot does not claim
+that the current queue is empty. Presenting a proposal still needs the normal
+writer ownership and eligibility checks. If no committed snapshot exists,
+the reminder reports an unknown state instead.
+
+While a proposal awaits a reply, no new list read starts. Otherwise a prompt
+waits up to two seconds for the read. A slow read continues in the background;
+the next turn can use its result. A memory review tool call stops that read
+before it starts its own operation.
 
 After the user answers a proposal (approve, reject, defer, or amend), that
 finding leaves the reminder for the rest of the session. A new session lists
@@ -215,9 +222,9 @@ same bytes on every later request. It is added after Pi has placed its system
 messages, so system messages in mid-conversation stay where they are and the
 conversation prefix stays cached. A new reminder is added only when the listed
 findings change, and it states that only the latest reminder is current. When
-no listed finding is left while an earlier reminder is still in context, a
-short reminder says that no pending memory proposals need asking about now and
-earlier reminders are out of date. Reminders cost tokens that accumulate only
+no listed finding is left while an earlier reminder is still in context, the
+explicit empty section replaces the current list. An incomplete snapshot keeps
+its snapshot notice instead of claiming that the current queue is empty. Reminders cost tokens that accumulate only
 when the list changes. A reminder is dropped once its prompt is compacted away
 or left on another branch; if that was the latest one, the current reminder is
 added again after the next prompt that lists the queue. Reminders live in

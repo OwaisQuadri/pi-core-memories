@@ -247,8 +247,8 @@ package final class MemoryQueue {
     guard state.findings.count <= 10_000 else { throw DreamRunError.limitExceeded }
   }
 
-  private func blockReason(
-    _ finding: MemoryQueueFinding, request: MemoryQueueRequest, rows: [MemoryReviewCandidate],
+  private static func blockReason(
+    _ finding: MemoryQueueFinding, request: MemoryQueueRequest, rejected: Set<String>,
     state: QueueLedger
   ) -> String? {
     if finding.successor != nil, finding.suppressionEpoch == nil {
@@ -256,7 +256,6 @@ package final class MemoryQueue {
     }
     let revisions = Self.relatedRevisions(finding, state: state)
     let connected = Self.relatedRevisions(finding, state: state, isAcrossEpochs: true)
-    let rejected = Self.rejectedRevisions(rows: rows, state: state)
     let excluded = Set(
       state.findings.first(where: { $0.revision == finding.suppressionEpoch })?.successorRejections
         ?? [])
@@ -281,6 +280,60 @@ package final class MemoryQueue {
     return nil
   }
 
+  package static func committedSnapshot(
+    configuration: MemoryConfiguration, request: MemoryQueueRequest
+  ) throws -> [MemoryQueueRow] {
+    let sources = try configuration.reviewSources(
+      stateRoot: configuration.stateURL, memoryRepository: configuration.memoryURL,
+      isReadOnly: true)
+    let store = try MemoryStore(repo: configuration.memoryURL)
+    let rows = try MemoryQueueAuthority.withBoundReview(
+      git: store.reviewGit, repository: configuration.memoryURL,
+      sourceBinding: sources.reviewSourceBinding().rawValue, isSnapshot: true
+    ) { reviewRoot, queue, binding -> [MemoryQueueRow] in
+      guard try queue.isPresent("queue.json") else { throw DreamRunError.busy }
+      let state = try MemoryReviewEncoding.decode(
+        QueueLedger.self,
+        bytes: queue.read("queue.json", maximum: MemoryReviewEncoding.maximumFileBytes))
+      guard state.schemaVersion == 1,
+        state.binding == SourceDigest(bytes: try MemoryReviewEncoding.encode(binding)).rawValue,
+        state.findings.count <= 10_000,
+        Set(state.findings.map(\.revision)).count == state.findings.count,
+        state.findings.allSatisfy({
+          $0.revision == $0.candidateID
+            && MemoryDocument.isMatch(#"\A[0-9a-f]{64}\z"#, $0.revision)
+        })
+      else { throw MemoryError("queue binding conflict") }
+      let dispositions = try state.findings.map { finding -> MemoryReviewDisposition in
+        for disposition in [MemoryReviewDisposition.rejected, .deferred] {
+          let name = "\(disposition.rawValue)-\(finding.revision).json"
+          guard try reviewRoot.isPresent(name) else { continue }
+          let selection = try MemoryReviewEncoding.decode(
+            ReviewSelection.self,
+            bytes: reviewRoot.read(name, maximum: MemoryReviewEncoding.maximumFileBytes))
+          guard selection.candidateID == finding.revision, selection.disposition == disposition
+          else { throw DreamRunError.corruption }
+          return disposition
+        }
+        return .pending
+      }
+      let rejected = Set(zip(state.findings, dispositions).filter { $0.1 == .rejected }.map { $0.0.revision })
+        .union(state.intents.filter { intent in
+          intent.action == "reject" && !state.receipts.contains(where: {
+            $0.decisionID == intent.decisionID && $0.status != "rejected"
+          })
+        }.map { $0.display.presentation.finding.revision })
+      return try zip(state.findings, dispositions).compactMap { finding, disposition in
+        guard !(try reviewRoot.isPresent("outcome-\(finding.revision).json")) else { return nil }
+        return MemoryQueueRow(
+          finding: finding, disposition: disposition.rawValue,
+          blockReason: blockReason(finding, request: request, rejected: rejected, state: state))
+      }
+    }
+    guard let rows else { throw DreamRunError.busy }
+    return rows
+  }
+
   package func list(request: MemoryQueueRequest) throws -> [MemoryQueueRow] {
     let review = try controller()
     return try importCandidates(review.list(), review: review, request: request)
@@ -295,7 +348,8 @@ package final class MemoryQueue {
         let finding = state.findings.first { $0.revision == row.change.id.rawValue }!
         return MemoryQueueRow(
           finding: finding, disposition: row.disposition.rawValue,
-          blockReason: blockReason(finding, request: request, rows: rows, state: state)
+          blockReason: Self.blockReason(
+            finding, request: request, rejected: Self.rejectedRevisions(rows: rows, state: state), state: state)
             ?? row.limitation)
       }
     }
@@ -314,7 +368,8 @@ package final class MemoryQueue {
       guard let row = rows.first(where: { $0.change.id.rawValue == revision }),
         [.pending, .deferred].contains(row.disposition), row.limitation == nil,
         let finding = state.findings.first(where: { $0.revision == revision }),
-        blockReason(finding, request: request, rows: rows, state: state) == nil
+        Self.blockReason(
+          finding, request: request, rejected: Self.rejectedRevisions(rows: rows, state: state), state: state) == nil
       else { throw MemoryError("finding is stale, blocked, or suppressed") }
       return (
         finding: finding,

@@ -24,7 +24,19 @@ struct ReviewFlowFixture {
       _ = try transactionCompleted(
         sources.run(
           selection: fixture.selection, prepare: { try fixture.prepare($0) },
-          call: { try transactionAdd($0) }))
+          call: { request in
+            let context = try transactionObject(request)
+            let evidence = context["primaryEvidence"] as! [[String: Any]]
+            return try transactionResponse(
+              request,
+              decisions: evidence.enumerated().map { index, item in
+                [
+                  "kind": "add", "scope": ["kind": "global"],
+                  "text": "Synthetic preference \(index).", "sources": [item["source"]!],
+                  "reason": "Retain distinct preferences.", "contradictions": [],
+                ] as [String: Any]
+              })
+          }))
       let state = fixture.root.appendingPathComponent("review")
       let configurationURL = fixture.root.appendingPathComponent("profile/config.json")
       let configuration = MemoryConfiguration(

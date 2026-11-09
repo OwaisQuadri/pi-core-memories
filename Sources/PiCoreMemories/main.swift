@@ -39,7 +39,8 @@ func execute() throws -> Int32 {
   let permitted: [String: Set<String>] = [
     "init": ["--repo"], "project-key": ["--cwd", "--config", "--bindings"],
     "render": ["--repo", "--cwd", "--device-key", "--bindings", "--config"],
-    "check": ["--repo"], "propose": ["--repo", "--base", "--file", "--reason", "--contradictions"],
+    "check": ["--repo", "--config"],
+    "propose": ["--repo", "--base", "--file", "--reason", "--contradictions"],
     "review": ["--repo"], "manage": ["--repo"], "review-catalog": ["--repo", "--cwd", "--config"],
     "dream-scan": ["--sessions", "--since", "--snippets", "--prompts", "--samples"],
   ]
@@ -99,6 +100,17 @@ func execute() throws -> Int32 {
       MemoryStore(repo: url("--repo")).render(
         cwd: url("--cwd"), deviceKey: scope.deviceKey, projectBindings: scope.projectBindings))
   case "check":
+    if let config = options["--config"] {
+      guard options["--repo"] == nil else {
+        throw UsageError(description: "check accepts --repo or --config, not both")
+      }
+      let report = try MemoryIntegrityReport.inspect(
+        configuration: MemoryConfiguration.load(from: URL(fileURLWithPath: config)))
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+      try output(String(decoding: encoder.encode(report), as: UTF8.self) + "\n")
+      return report.isValid ? 0 : 1
+    }
     let failures = try MemoryStore(repo: url("--repo")).check()
     if !failures.isEmpty {
       try FileHandle.standardError.write(

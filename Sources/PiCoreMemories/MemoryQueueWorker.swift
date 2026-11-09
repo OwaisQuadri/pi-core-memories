@@ -590,6 +590,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
         let code = (error as? DreamRunError) == .busy ? "busy" : "blocked"
         var diagnostic: [String: Any] = [
           "code": code, "reason": dreamWorkerFailureName(error), "operation": type,
+          "check": MemoryFailureDiagnostic.code(error),
         ]
         if isManagementPreviewStarted, let stage = management.previewStage {
           diagnostic["stage"] = stage.rawValue
@@ -602,7 +603,7 @@ func executeMemoryQueueWorker(arguments: [String]) -> Int32 {
       "final",
       [
         "status": "failed", "code": "protocol-or-binding-failure",
-        "reason": dreamWorkerFailureName(error),
+        "reason": dreamWorkerFailureName(error), "check": MemoryFailureDiagnostic.code(error),
       ])
     return 1
   }

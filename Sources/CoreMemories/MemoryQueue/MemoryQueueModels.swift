@@ -147,20 +147,29 @@ package struct MemoryChangeDescription: Codable, Equatable {
           return directory.lastPathComponent == ".git"
             ? directory.deletingLastPathComponent().lastPathComponent : directory.lastPathComponent
         })
-      for path in Set(projectDirectories) {
-        let directory = URL(fileURLWithPath: path)
-        guard
-          let resolved = try? MemoryStore.projectKey(
-            cwd: directory, projectBindings: configuration.projectBindings), resolved == key,
-          let worktrees = try? Git(
-            repo: directory, environment: ProcessInfo.processInfo.environment
-          )
-          .data(["worktree", "list", "--porcelain", "-z"]),
-          let first = worktrees.split(separator: 0).first,
-          let record = String(data: Data(first), encoding: .utf8), record.hasPrefix("worktree ")
-        else { continue }
-        let root = URL(fileURLWithPath: String(record.dropFirst("worktree ".count)))
-        names.insert(root.lastPathComponent)
+      if names.isEmpty {
+        for path in Set(projectDirectories) {
+          let directory = URL(fileURLWithPath: path)
+          let git = Git(repo: directory, environment: ProcessInfo.processInfo.environment)
+          guard
+            let resolved = try? MemoryStore.projectKey(
+              cwd: directory, projectBindings: configuration.projectBindings), resolved == key,
+            let common = try? MemoryStore.projectBindingDirectory(cwd: directory),
+            let worktrees = try? git.data(["worktree", "list", "--porcelain", "-z"]),
+            let first = worktrees.split(separator: 0).first,
+            let record = String(data: Data(first), encoding: .utf8), record.hasPrefix("worktree ")
+          else { continue }
+          var root = URL(fileURLWithPath: String(record.dropFirst("worktree ".count)))
+            .resolvingSymlinksInPath()
+          if root.path == URL(fileURLWithPath: common).resolvingSymlinksInPath().path {
+            guard let ownGit = try? git.text(["rev-parse", "--absolute-git-dir"]),
+              URL(fileURLWithPath: ownGit).resolvingSymlinksInPath().path == root.path,
+              let top = try? git.text(["rev-parse", "--show-toplevel"])
+            else { continue }
+            root = URL(fileURLWithPath: top)
+          }
+          names.insert(root.lastPathComponent)
+        }
       }
       guard names.count == 1, let name = names.first, !name.isEmpty else {
         throw MemoryChangeDescriptionError.unidentifiedProject

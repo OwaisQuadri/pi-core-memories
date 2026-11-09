@@ -63,6 +63,29 @@ func previewTextOmitsFormattedSourceReferences(_ reference: String) throws {
     try description("projects/\(key).md", directories: []).scope == "for the Research project")
 }
 
+@Test func previewScopeDoesNotNameSeparateGitMetadataAsTheProject() throws {
+  let fixture = try Fixture()
+  defer { fixture.clean() }
+  let project = fixture.root.appendingPathComponent("Research")
+  let metadata = fixture.root.appendingPathComponent("metadata")
+  try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
+  _ = try fixture.git(["init", "--template=", "--separate-git-dir=\(metadata.path)"], at: project)
+  _ = try fixture.git(["commit", "--allow-empty", "-m", "Separate directory fixture"], at: project)
+  let key = try #require(try MemoryStore.projectKey(cwd: project))
+  var configuration = MemoryConfiguration.defaults
+  func description() throws -> MemoryChangeDescription {
+    try MemoryChangeDescription(
+      before: Data(), after: Data("Keep this.".utf8), path: "projects/\(key).md",
+      configuration: configuration, projectDirectories: [project.path])
+  }
+  let scope = try description().scope
+  #expect(scope == "for the Research project")
+  configuration.projectBindings = [
+    try #require(try MemoryStore.projectBindingDirectory(cwd: project)): key
+  ]
+  #expect(try description().scope == "for the metadata project")
+}
+
 @Test func previewScopeUsesNamesAndRejectsUnidentifiedTargets() throws {
   let device = String(repeating: "a", count: 64)
   let project = String(repeating: "b", count: 64)

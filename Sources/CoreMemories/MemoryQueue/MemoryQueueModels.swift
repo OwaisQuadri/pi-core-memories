@@ -125,20 +125,54 @@ package struct MemoryQueueRow: Codable {
   package let blockReason: String?
 }
 
+package enum MemoryChangeDescriptionError: Error {
+  case unidentifiedProject, unidentifiedDevice
+}
+
 package struct MemoryChangeDescription: Codable, Equatable {
   package let before: String
   package let after: String
   package let scope: String
 
-  package init(before: Data, after: Data, path: String, configuration: MemoryConfiguration) throws {
+  package init(
+    before: Data, after: Data, path: String, configuration: MemoryConfiguration,
+    projectDirectories: [String] = [FileManager.default.currentDirectoryPath]
+  ) throws {
     self.before = try MemoryDocument.displayText(before)
     self.after = try MemoryDocument.displayText(after)
     func projectName(_ key: String) throws -> String {
-      let names = Set(configuration.projectBindings.filter { $0.value == key }.keys.map {
-        URL(fileURLWithPath: $0).lastPathComponent
-      })
+      var names = Set(
+        configuration.projectBindings.filter { $0.value == key }.keys.map {
+          let directory = URL(fileURLWithPath: $0)
+          return directory.lastPathComponent == ".git"
+            ? directory.deletingLastPathComponent().lastPathComponent : directory.lastPathComponent
+        })
+      if names.isEmpty {
+        for path in Set(projectDirectories) {
+          let directory = URL(fileURLWithPath: path)
+          let git = Git(repo: directory, environment: ProcessInfo.processInfo.environment)
+          guard
+            let resolved = try? MemoryStore.projectKey(
+              cwd: directory, projectBindings: configuration.projectBindings), resolved == key,
+            let common = try? MemoryStore.projectBindingDirectory(cwd: directory),
+            let worktrees = try? git.data(["worktree", "list", "--porcelain", "-z"]),
+            let first = worktrees.split(separator: 0).first,
+            let record = String(data: Data(first), encoding: .utf8), record.hasPrefix("worktree ")
+          else { continue }
+          var root = URL(fileURLWithPath: String(record.dropFirst("worktree ".count)))
+            .resolvingSymlinksInPath()
+          if root.path == URL(fileURLWithPath: common).resolvingSymlinksInPath().path {
+            guard let ownGit = try? git.text(["rev-parse", "--absolute-git-dir"]),
+              URL(fileURLWithPath: ownGit).resolvingSymlinksInPath().path == root.path,
+              let top = try? git.text(["rev-parse", "--show-toplevel"])
+            else { continue }
+            root = URL(fileURLWithPath: top)
+          }
+          names.insert(root.lastPathComponent)
+        }
+      }
       guard names.count == 1, let name = names.first, !name.isEmpty else {
-        throw MemoryError("A project name is needed before this memory change can be shown.")
+        throw MemoryChangeDescriptionError.unidentifiedProject
       }
       return "for the \(name) project"
     }
@@ -149,7 +183,7 @@ package struct MemoryChangeDescription: Codable, Equatable {
     case .deviceProject(let device, let project) where device == configuration.deviceKey:
       scope = try projectName(project) + " on this device"
     default:
-      throw MemoryError("This device must be identified before its memory change can be shown.")
+      throw MemoryChangeDescriptionError.unidentifiedDevice
     }
   }
 }

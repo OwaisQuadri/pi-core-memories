@@ -387,7 +387,9 @@ package final class MemoryQueue {
       before: preview.before, after: preview.after, replacement: preview.replacement,
       isDetachRequired: checkout.isDetachRequired, checkoutCommit: checkout.commit,
       checkoutDigest: checkout.digest.rawValue, amendmentReason: selected.amendment?.reason)
-    presentation.change = try MemoryChangeDescription(before: preview.before, after: preview.after, path: finding.path, configuration: configuration)
+    presentation.change = try MemoryChangeDescription(
+      before: preview.before, after: preview.after, path: finding.path, configuration: configuration,
+      projectDirectories: finding.evidence.compactMap(\.projectScope))
     let display = MemoryQueueDisplay(
       presentation: presentation,
       displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(presentation)).rawValue)
@@ -422,7 +424,10 @@ package final class MemoryQueue {
       replacement: preview.replacement, isDetachRequired: checkout.isDetachRequired,
       checkoutCommit: checkout.commit, checkoutDigest: checkout.digest.rawValue,
       amendmentReason: amendment.reason)
-    replacement.change = try MemoryChangeDescription(before: preview.before, after: preview.after, path: presentation.finding.path, configuration: configuration)
+    replacement.change = try MemoryChangeDescription(
+      before: preview.before, after: preview.after, path: presentation.finding.path,
+      configuration: configuration,
+      projectDirectories: presentation.finding.evidence.compactMap(\.projectScope))
     let amended = MemoryQueueDisplay(
       presentation: replacement,
       displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(replacement)).rawValue)

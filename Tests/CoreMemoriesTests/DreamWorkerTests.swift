@@ -338,6 +338,13 @@ private enum PrivateMirrorError: Error, CustomReflectable {
   }
 }
 
+@Test func scopeDisplayFailureNamesTheUnresolvedIdentityWithoutPrivatePaths() {
+  #expect(dreamWorkerFailureName(MemoryChangeDescriptionError.unidentifiedProject)
+    == "MemoryChangeDescriptionError.unidentifiedProject")
+  #expect(dreamWorkerFailureName(MemoryChangeDescriptionError.unidentifiedDevice)
+    == "MemoryChangeDescriptionError.unidentifiedDevice")
+}
+
 @Test func dreamWorkerFailureDetailNamesErrorWithoutAssociatedValues() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

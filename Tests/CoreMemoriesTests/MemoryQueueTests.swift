@@ -9,6 +9,37 @@ func queueFixture(_ fixture: TransactionFixture, sources: DreamRunStore) throws 
     journal: fixture.root.appendingPathComponent("journal"), environment: [:])
 }
 
+@Test func queueProjectClaimUsesAdmittedSourceWithoutManualBinding() throws {
+  let fixture = try TransactionFixture()
+  defer { fixture.clean() }
+  let project = fixture.root.appendingPathComponent("Research")
+  try MemoryStore.initialize(repo: project, environment: [:])
+  try fixture.populate(cwd: project.path)
+  let sources = try fixture.store()
+  _ = try transactionCompleted(
+    sources.run(
+      selection: fixture.selection, prepare: { try fixture.prepare($0) },
+      call: { try transactionAdd($0, isProject: true) }))
+  let queue = try queueFixture(fixture, sources: sources)
+  defer { queue.release() }
+  let request = try MemoryQueueRequest(sessionID: "session", requestID: "request")
+  let row = try #require(queue.list(request: request).first {
+    $0.finding.path.hasPrefix("projects/")
+  })
+  let base = try fixture.main()
+  let display = try queue.claim(revision: row.finding.revision, request: request)
+  #expect(display.presentation.change?.scope == "for the Research project")
+  #expect(try fixture.main() == base)
+  try queue.presented(display, messageReference: "project-proposal")
+  let amended = try queue.amend(
+    display,
+    amendment: MemoryBatchAmendment(
+      replacement: String(decoding: row.finding.proposed, as: UTF8.self),
+      reason: "Keep the same wording."))
+  #expect(amended.presentation.change?.scope == "for the Research project")
+  #expect(try fixture.main() == base)
+}
+
 @Test func queueStaleBaseCannotPublishOrRecoverIntentAsConsent() throws {
   let fixture = try TransactionFixture()
   defer { fixture.clean() }

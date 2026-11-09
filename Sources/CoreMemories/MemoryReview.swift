@@ -251,6 +251,7 @@ package final class MemoryReviewController {
         candidateID: id, admissionHash: admissionHash, choice: .accept,
         identity: identity, instant: instant, amendment: amendment)
       let after = try Self.amendedBatchBytes(intent, proposal: original, before: before)
+      try Self.checkAddition(change, after: after, snapshot: target.snapshot)
       var replacement = target.bytes
       let insertion = change.operation == .add ? Self.addSeparator(target.bytes) + after : after
       replacement.replaceSubrange(target.range, with: insertion)
@@ -455,14 +456,7 @@ package final class MemoryReviewController {
       throw MemoryError("frozen target document changed")
     }
     let bytes = snapshot.documents.first(where: { $0.path == change.path })?.bytes ?? Data()
-    if change.operation == .add {
-      let wording = try MemoryDocument.displayText(change.after)
-      for entry in snapshot.reviewEntries() where entry.path == change.path {
-        if try MemoryDocument.displayText(entry.entry.bytes) == wording {
-          throw MemoryError("equivalent memory is already approved")
-        }
-      }
-    }
+    try Self.checkAddition(change, after: change.after, snapshot: snapshot)
     var range = change.locator.map { $0.start..<$0.end }
     if candidates[change.id.rawValue]?.1.recoveryCheckpointHash != nil {
       return try Self.recoveredTarget(change, frozen: frozen, snapshot: snapshot)
@@ -486,6 +480,18 @@ package final class MemoryReviewController {
         entry.isMutable, entry.identity == change.entryID
       else { throw MemoryError("selected native entry changed or is ambiguous") }
       return (snapshot, bytes, range, entry.locator)
+    }
+  }
+
+  static func checkAddition(
+    _ change: AtomicMemoryChange, after: Data, snapshot: ApprovedDecisionSnapshot
+  ) throws {
+    guard change.operation == .add else { return }
+    let wording = try MemoryDocument.displayText(after)
+    for entry in snapshot.reviewEntries() where entry.path == change.path {
+      if try MemoryDocument.displayText(entry.entry.bytes) == wording {
+        throw MemoryError("equivalent memory is already approved")
+      }
     }
   }
 
@@ -602,6 +608,7 @@ package final class MemoryReviewController {
       let target = try Self.recoveredTarget(change, frozen: frozen, snapshot: snapshot)
       guard target.range == payload.start..<payload.end else { throw DreamRunError.corruption }
     }
+    try Self.checkAddition(change, after: payload.after, snapshot: snapshot)
     switch change.operation {
     case .add:
       guard payload.start == bytes.count, payload.end == bytes.count, payload.before.isEmpty else {

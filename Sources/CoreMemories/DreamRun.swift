@@ -2628,9 +2628,11 @@ public final class DreamRunStore {
     try recoverAll()
     if enrollment != nil, receipts.count != outcome.plans.count {
       if isCommitted { throw DreamRunError.corruption }
-      return try pending(sealed, reason: .staleUnpublishedPlans, proposals: reports())
+      if try memory.approvedCommit() != sealed.run.approvedBase {
+        return try pending(sealed, reason: .staleUnpublishedPlans, proposals: reports())
+      }
     }
-    if !isCommitted, enrollment == nil {
+    if !isCommitted, enrollment == nil || receipts.count != outcome.plans.count {
       if try isMemoryChanged(sealed) || isRejectionChanged(sealed) {
         return try dropBatch(sealed, chain: chain)
       }

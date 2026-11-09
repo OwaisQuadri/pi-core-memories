@@ -155,6 +155,7 @@ extension MemoryReviewController {
     let original = try MemoryDocument.reviewedBytes(
       change.after, identity: intent.identity, instant: intent.instant)
     let after = try Self.amendedBatchBytes(intent, proposal: original, before: before)
+    try Self.checkAddition(change, after: after, snapshot: snapshot)
     return MemoryBatchEffect(
       itemID: item.itemID, path: change.path, start: target.lowerBound, end: target.upperBound,
       before: before, after: after, identity: intent.identity, originalReviewedProposal: original,

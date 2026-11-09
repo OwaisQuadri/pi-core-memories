@@ -175,7 +175,11 @@ package final class MemoryQueue {
   }
 
   private static func claimDigest(_ change: AtomicMemoryChange) -> String {
-    let text = String(decoding: change.after, as: UTF8.self)
+    claimDigest(change.after)
+  }
+
+  private static func claimDigest(_ bytes: Data) -> String {
+    let text = String(decoding: bytes, as: UTF8.self)
       .replacingOccurrences(of: #"\[source: [^\r\n\]]+\]"#, with: "", options: .regularExpression)
       .trimmingCharacters(in: .whitespacesAndNewlines)
     return SourceDigest(bytes: Data(text.utf8)).rawValue
@@ -287,8 +291,14 @@ package final class MemoryQueue {
 
   private static func blockReason(
     _ finding: MemoryQueueFinding, request: MemoryQueueRequest, rejected: Set<String>,
-    state: QueueLedger
+    state: QueueLedger, selectable: Set<String>
   ) -> String? {
+    func effectiveDigest(_ row: MemoryQueueFinding) -> String {
+      if let amendment = state.amendments?.first(where: { $0.revision == row.revision }) {
+        return claimDigest(Data(amendment.amendment.replacement.utf8))
+      }
+      return claimDigest(row.proposed)
+    }
     if finding.successor != nil, finding.suppressionEpoch == nil {
       return "blocked-successor: changed-evidence proof is absent or invalid"
     }
@@ -304,8 +314,9 @@ package final class MemoryQueue {
     if finding.operation == "add",
       let index = state.findings.firstIndex(where: { $0.revision == finding.revision }),
       let representative = state.findings[..<index].first(where: {
-        $0.operation == finding.operation && $0.path == finding.path
-          && $0.claimDigest == finding.claimDigest && $0.frozenBase == finding.frozenBase
+        selectable.contains($0.revision)
+          && $0.operation == finding.operation && $0.path == finding.path
+          && effectiveDigest($0) == effectiveDigest(finding) && $0.frozenBase == finding.frozenBase
           && $0.suppressionEpoch == finding.suppressionEpoch && !rejected.contains($0.revision)
       })
     {
@@ -365,17 +376,29 @@ package final class MemoryQueue {
         }
         return .pending
       }
-      let rejected = Set(zip(state.findings, dispositions).filter { $0.1 == .rejected }.map { $0.0.revision })
-        .union(state.intents.filter { intent in
-          intent.action == "reject" && !state.receipts.contains(where: {
-            $0.decisionID == intent.decisionID && $0.status != "rejected"
-          })
+      let rejected = Set(
+        zip(state.findings, dispositions).filter { $0.1 == .rejected }.map { $0.0.revision }
+      )
+      .union(
+        state.intents.filter { intent in
+          intent.action == "reject"
+            && !state.receipts.contains(where: {
+              $0.decisionID == intent.decisionID && $0.status != "rejected"
+            })
         }.map { $0.display.presentation.finding.revision })
+      var selectable: Set<String> = []
+      for (finding, disposition) in zip(state.findings, dispositions)
+      where [.pending, .deferred].contains(disposition) {
+        if try !reviewRoot.isPresent("outcome-\(finding.revision).json") {
+          selectable.insert(finding.revision)
+        }
+      }
       return try zip(state.findings, dispositions).compactMap { finding, disposition in
         guard !(try reviewRoot.isPresent("outcome-\(finding.revision).json")) else { return nil }
         return MemoryQueueRow(
           finding: finding, disposition: disposition.rawValue,
-          blockReason: blockReason(finding, request: request, rejected: rejected, state: state))
+          blockReason: blockReason(
+            finding, request: request, rejected: rejected, state: state, selectable: selectable))
       }
     }
     guard let rows else { throw DreamRunError.busy }
@@ -399,7 +422,12 @@ package final class MemoryQueue {
         return MemoryQueueRow(
           finding: finding, disposition: row.disposition.rawValue,
           blockReason: Self.blockReason(
-            finding, request: request, rejected: Self.rejectedRevisions(rows: rows, state: state), state: state)
+            finding, request: request, rejected: Self.rejectedRevisions(rows: rows, state: state),
+            state: state,
+            selectable: Set(
+              rows.filter {
+                [.pending, .deferred].contains($0.disposition) && $0.limitation == nil
+              }.map { $0.change.id.rawValue }))
             ?? row.limitation)
       }
     }
@@ -421,7 +449,11 @@ package final class MemoryQueue {
           let finding = state.findings.first(where: { $0.revision == revision }),
           Self.blockReason(
             finding, request: request, rejected: Self.rejectedRevisions(rows: rows, state: state),
-            state: state) == nil
+            state: state,
+            selectable: Set(
+              rows.filter {
+                [.pending, .deferred].contains($0.disposition) && $0.limitation == nil
+              }.map { $0.change.id.rawValue })) == nil
         else { throw MemoryError("finding is stale, blocked, or suppressed") }
         return (
           finding: finding,
@@ -672,8 +704,7 @@ package final class MemoryQueue {
     } catch DreamRunError.busy {
       throw DreamRunError.busy
     } catch {
-      if try recover(decisionID: intent.decisionID, review: review).status == "outcome-unresolved"
-      {
+      if try recover(decisionID: intent.decisionID, review: review).status == "outcome-unresolved" {
         try needsDecision(intent, review: review)
       }
       return

@@ -14,7 +14,34 @@ package final class MemoryQueue {
   var configureReview: (MemoryReviewController) -> Void = { _ in }
   package var isCancelled: () -> Bool = { false }
 
+  private final class FindingOwnership {
+    private let directory: DreamStateDirectory
+    private let descriptor: Int32
+
+    init(directory: DreamStateDirectory, findingID: String) throws {
+      guard MemoryDocument.isMatch(#"\A[0-9a-f]{64}\z"#, findingID) else {
+        throw DreamRunError.corruption
+      }
+      let claims = try directory.child("claims", isCreating: !directory.isPresent("claims"))
+      let root = try claims.child(findingID, isCreating: !claims.isPresent(findingID))
+      let descriptor = try root.openLock().descriptor
+      guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+        _ = close(descriptor)
+        throw DreamRunError.busy
+      }
+      do { try root.verifyLock(descriptor) } catch {
+        _ = close(descriptor)
+        throw error
+      }
+      self.directory = root
+      self.descriptor = descriptor
+    }
+
+    deinit { _ = close(descriptor) }
+  }
+
   private struct ActiveReview {
+    let ownership: FindingOwnership
     let controller: MemoryReviewController
     let preview: MemoryReviewPreview
     let checkout: MemoryReviewCheckoutPreview
@@ -62,10 +89,12 @@ package final class MemoryQueue {
     review.isCancelled = { [weak self] in self?.isCancelled() ?? true }
     configureReview(review)
     _ = close(try directory.openLock().descriptor)
-    try MemoryQueueAuthority.activate(
-      git: review.store.reviewGit, review: review.binding, queue: queueRoot)
-    try settleUnappliedDecisions(review)
-    return review
+    return try review.withWriterOwnership {
+      try MemoryQueueAuthority.activate(
+        git: review.store.reviewGit, review: review.binding, queue: queueRoot)
+      try settleUnappliedDecisions(review)
+      return review
+    }
   }
 
   private func settleUnappliedDecisions(_ review: MemoryReviewController) throws {
@@ -89,6 +118,15 @@ package final class MemoryQueue {
 
   func ledger<T>(
     _ review: MemoryReviewController, isWaiting: Bool = false,
+    _ operation: (inout QueueLedger) throws -> T
+  ) throws -> T {
+    try review.withWriterOwnership {
+      try lockedLedger(review, isWaiting: isWaiting, operation)
+    }
+  }
+
+  private func lockedLedger<T>(
+    _ review: MemoryReviewController, isWaiting: Bool,
     _ operation: (inout QueueLedger) throws -> T
   ) throws -> T {
     var held = stat()
@@ -263,6 +301,16 @@ package final class MemoryQueue {
       return
         "blocked-successor: rejected evidence or claim requires a versioned changed-evidence successor"
     }
+    if finding.operation == "add",
+      let index = state.findings.firstIndex(where: { $0.revision == finding.revision }),
+      let representative = state.findings[..<index].first(where: {
+        $0.operation == finding.operation && $0.path == finding.path
+          && $0.claimDigest == finding.claimDigest && $0.frozenBase == finding.frozenBase
+          && $0.suppressionEpoch == finding.suppressionEpoch && !rejected.contains($0.revision)
+      })
+    {
+      return "equivalent-pending:" + representative.revision
+    }
     if state.shown.contains(where: { shown in
       revisions.contains(shown.revision) && shown.request == request
         && !state.receipts.contains(where: {
@@ -336,7 +384,9 @@ package final class MemoryQueue {
 
   package func list(request: MemoryQueueRequest) throws -> [MemoryQueueRow] {
     let review = try controller()
-    return try importCandidates(review.list(), review: review, request: request)
+    return try review.withWriterOwnership {
+      try importCandidates(review.list(), review: review, request: request)
+    }
   }
 
   func importCandidates(
@@ -362,47 +412,54 @@ package final class MemoryQueue {
       throw MemoryError("release the active review first")
     }
     let review = try controller()
-    let rows = try review.list()
-    let selected = try ledger(review) { state in
-      try admit(rows, state: &state)
-      guard let row = rows.first(where: { $0.change.id.rawValue == revision }),
-        [.pending, .deferred].contains(row.disposition), row.limitation == nil,
-        let finding = state.findings.first(where: { $0.revision == revision }),
-        Self.blockReason(
-          finding, request: request, rejected: Self.rejectedRevisions(rows: rows, state: state), state: state) == nil
-      else { throw MemoryError("finding is stale, blocked, or suppressed") }
-      return (
-        finding: finding,
-        amendment: state.amendments?.first(where: { $0.revision == revision })?.amendment)
+    return try review.withWriterOwnership {
+      let rows = try review.list()
+      let selected = try ledger(review) { state in
+        try admit(rows, state: &state)
+        guard let row = rows.first(where: { $0.change.id.rawValue == revision }),
+          [.pending, .deferred].contains(row.disposition), row.limitation == nil,
+          let finding = state.findings.first(where: { $0.revision == revision }),
+          Self.blockReason(
+            finding, request: request, rejected: Self.rejectedRevisions(rows: rows, state: state),
+            state: state) == nil
+        else { throw MemoryError("finding is stale, blocked, or suppressed") }
+        return (
+          finding: finding,
+          amendment: state.amendments?.first(where: { $0.revision == revision })?.amendment
+        )
+      }
+      let finding = selected.finding
+      let ownership = try FindingOwnership(directory: directory, findingID: finding.findingID)
+      let row = rows.first { $0.change.id.rawValue == revision }!
+      let preview = try review.preview(
+        candidateID: row.change.id, clockDate: clockDate, amendment: selected.amendment)
+      let checkout = try review.checkoutPreview()
+      sequence += 1
+      var presentation = MemoryQueuePresentation(
+        claimID: UUID().uuidString, sequence: String(sequence), request: request, finding: finding,
+        previewDigest: preview.digest.rawValue, currentBase: preview.currentBase,
+        before: preview.before, after: preview.after, replacement: preview.replacement,
+        isDetachRequired: checkout.isDetachRequired, checkoutCommit: checkout.commit,
+        checkoutDigest: checkout.digest.rawValue, amendmentReason: selected.amendment?.reason)
+      presentation.change = try MemoryChangeDescription(
+        before: preview.before, after: preview.after, path: finding.path,
+        configuration: configuration,
+        projectDirectories: finding.evidence.compactMap(\.projectScope))
+      let display = MemoryQueueDisplay(
+        presentation: presentation,
+        displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(presentation)).rawValue)
+      try ledger(review) { state in
+        state.shown.append(
+          QueueShown(
+            findingID: finding.findingID, revision: revision, request: request,
+            displayDigest: display.displayDigest, messageReference: nil))
+      }
+      active = ActiveReview(
+        ownership: ownership, controller: review, preview: preview, checkout: checkout,
+        display: display,
+        clockDate: clockDate)
+      return display
     }
-    let finding = selected.finding
-    let row = rows.first { $0.change.id.rawValue == revision }!
-    let preview = try review.preview(
-      candidateID: row.change.id, clockDate: clockDate, amendment: selected.amendment)
-    let checkout = try review.checkoutPreview()
-    sequence += 1
-    var presentation = MemoryQueuePresentation(
-      claimID: UUID().uuidString, sequence: String(sequence), request: request, finding: finding,
-      previewDigest: preview.digest.rawValue, currentBase: preview.currentBase,
-      before: preview.before, after: preview.after, replacement: preview.replacement,
-      isDetachRequired: checkout.isDetachRequired, checkoutCommit: checkout.commit,
-      checkoutDigest: checkout.digest.rawValue, amendmentReason: selected.amendment?.reason)
-    presentation.change = try MemoryChangeDescription(
-      before: preview.before, after: preview.after, path: finding.path, configuration: configuration,
-      projectDirectories: finding.evidence.compactMap(\.projectScope))
-    let display = MemoryQueueDisplay(
-      presentation: presentation,
-      displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(presentation)).rawValue)
-    try ledger(review) { state in
-      state.shown.append(
-        QueueShown(
-          findingID: finding.findingID, revision: revision, request: request,
-          displayDigest: display.displayDigest, messageReference: nil))
-    }
-    active = ActiveReview(
-      controller: review, preview: preview, checkout: checkout, display: display,
-      clockDate: clockDate)
-    return display
   }
 
   package func amend(
@@ -411,48 +468,51 @@ package final class MemoryQueue {
     guard let current = active, current.display == display, current.messageReference != nil,
       sequence < UInt64.max
     else { throw MemoryError("amendment requires the exact live displayed review") }
-    active = nil
-    let presentation = display.presentation
-    let preview = try current.controller.preview(
-      candidateID: current.preview.change.id, clockDate: clockDate, amendment: amendment)
-    let checkout = try current.controller.checkoutPreview()
-    sequence += 1
-    var replacement = MemoryQueuePresentation(
-      claimID: presentation.claimID, sequence: String(sequence), request: presentation.request,
-      finding: presentation.finding, previewDigest: preview.digest.rawValue,
-      currentBase: preview.currentBase, before: preview.before, after: preview.after,
-      replacement: preview.replacement, isDetachRequired: checkout.isDetachRequired,
-      checkoutCommit: checkout.commit, checkoutDigest: checkout.digest.rawValue,
-      amendmentReason: amendment.reason)
-    replacement.change = try MemoryChangeDescription(
-      before: preview.before, after: preview.after, path: presentation.finding.path,
-      configuration: configuration,
-      projectDirectories: presentation.finding.evidence.compactMap(\.projectScope))
-    let amended = MemoryQueueDisplay(
-      presentation: replacement,
-      displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(replacement)).rawValue)
-    try ledger(current.controller) { state in
-      guard state.findings.contains(where: { $0.revision == presentation.finding.revision }),
-        let index = state.shown.firstIndex(where: { $0.displayDigest == display.displayDigest }),
-        state.shown[index].messageReference == current.messageReference,
-        !state.intents.contains(where: { $0.display.displayDigest == display.displayDigest })
-      else { throw MemoryError("amendment presentation is stale or already decided") }
-      var amendments = state.amendments ?? []
-      let draft = QueueAmendment(revision: presentation.finding.revision, amendment: amendment)
-      if let previous = amendments.firstIndex(where: { $0.revision == draft.revision }) {
-        amendments[previous] = draft
-      } else {
-        amendments.append(draft)
+    return try current.controller.withWriterOwnership {
+      active = nil
+      let presentation = display.presentation
+      let preview = try current.controller.preview(
+        candidateID: current.preview.change.id, clockDate: clockDate, amendment: amendment)
+      let checkout = try current.controller.checkoutPreview()
+      sequence += 1
+      var replacement = MemoryQueuePresentation(
+        claimID: presentation.claimID, sequence: String(sequence), request: presentation.request,
+        finding: presentation.finding, previewDigest: preview.digest.rawValue,
+        currentBase: preview.currentBase, before: preview.before, after: preview.after,
+        replacement: preview.replacement, isDetachRequired: checkout.isDetachRequired,
+        checkoutCommit: checkout.commit, checkoutDigest: checkout.digest.rawValue,
+        amendmentReason: amendment.reason)
+      replacement.change = try MemoryChangeDescription(
+        before: preview.before, after: preview.after, path: presentation.finding.path,
+        configuration: configuration,
+        projectDirectories: presentation.finding.evidence.compactMap(\.projectScope))
+      let amended = MemoryQueueDisplay(
+        presentation: replacement,
+        displayDigest: SourceDigest(bytes: try MemoryReviewEncoding.encode(replacement)).rawValue)
+      try ledger(current.controller) { state in
+        guard state.findings.contains(where: { $0.revision == presentation.finding.revision }),
+          let index = state.shown.firstIndex(where: { $0.displayDigest == display.displayDigest }),
+          state.shown[index].messageReference == current.messageReference,
+          !state.intents.contains(where: { $0.display.displayDigest == display.displayDigest })
+        else { throw MemoryError("amendment presentation is stale or already decided") }
+        var amendments = state.amendments ?? []
+        let draft = QueueAmendment(revision: presentation.finding.revision, amendment: amendment)
+        if let previous = amendments.firstIndex(where: { $0.revision == draft.revision }) {
+          amendments[previous] = draft
+        } else {
+          amendments.append(draft)
+        }
+        state.amendments = amendments
+        state.shown[index] = QueueShown(
+          findingID: presentation.finding.findingID, revision: presentation.finding.revision,
+          request: presentation.request, displayDigest: amended.displayDigest, messageReference: nil
+        )
       }
-      state.amendments = amendments
-      state.shown[index] = QueueShown(
-        findingID: presentation.finding.findingID, revision: presentation.finding.revision,
-        request: presentation.request, displayDigest: amended.displayDigest, messageReference: nil)
+      active = ActiveReview(
+        ownership: current.ownership, controller: current.controller, preview: preview,
+        checkout: checkout, display: amended, clockDate: clockDate)
+      return amended
     }
-    active = ActiveReview(
-      controller: current.controller, preview: preview, checkout: checkout, display: amended,
-      clockDate: clockDate)
-    return amended
   }
 
   package func presented(_ display: MemoryQueueDisplay, messageReference: String) throws {
@@ -487,29 +547,32 @@ package final class MemoryQueue {
       throw MemoryError(
         "checkout preparation requires a separate explicit choice and fresh preview")
     }
-    let intent = QueueDecisionIntent(
-      decisionID: decisionID, display: display, action: action, responseReference: responseReference,
-      isImmediate: true)
-    try ledger(current.controller, isWaiting: true) { state in
-      guard !state.intents.contains(where: { $0.decisionID == decisionID }) else {
-        throw MemoryError("decision key already used; recover its receipt")
+    return try current.controller.withWriterOwnership {
+      let intent = QueueDecisionIntent(
+        decisionID: decisionID, display: display, action: action,
+        responseReference: responseReference,
+        isImmediate: true)
+      try ledger(current.controller, isWaiting: true) { state in
+        guard !state.intents.contains(where: { $0.decisionID == decisionID }) else {
+          throw MemoryError("decision key already used; recover its receipt")
+        }
+        state.intents.append(intent)
       }
-      state.intents.append(intent)
+      defer { active = nil }
+      do {
+        try perform(
+          action, review: current.controller, preview: current.preview, checkout: current.checkout,
+          isWaitingForWriter: true)
+      } catch DreamRunError.busy {
+        throw DreamRunError.busy
+      } catch {
+        let recovered = try recover(
+          decisionID: decisionID, review: current.controller, isWaiting: true)
+        guard recovered.status == "outcome-unresolved" else { return recovered }
+        return try needsDecision(intent, review: current.controller)
+      }
+      return try recover(decisionID: decisionID, review: current.controller, isWaiting: true)
     }
-    defer { active = nil }
-    do {
-      try perform(
-        action, review: current.controller, preview: current.preview, checkout: current.checkout,
-        isWaitingForWriter: true)
-    } catch DreamRunError.busy {
-      throw DreamRunError.busy
-    } catch {
-      let recovered = try recover(
-        decisionID: decisionID, review: current.controller, isWaiting: true)
-      guard recovered.status == "outcome-unresolved" else { return recovered }
-      return try needsDecision(intent, review: current.controller)
-    }
-    return try recover(decisionID: decisionID, review: current.controller, isWaiting: true)
   }
 
   private func perform(

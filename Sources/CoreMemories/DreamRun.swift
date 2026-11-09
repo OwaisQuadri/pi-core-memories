@@ -585,11 +585,13 @@ public final class DreamRunStore {
   private func enrolledRecovery(_ sealed: SealedRun, outcome: Outcome) throws
     -> DreamRunEncoding.RecoveryCheckpoint?
   {
-    guard try sealed.directory.isPresent("recovery.json") else { return nil }
-    let bytes = try sealed.directory.read("recovery.json", maximum: limits.maximumFrozenBytes)
+    let isPublication = try sealed.directory.isPresent("publication.json")
+    let name = isPublication ? "publication.json" : "recovery.json"
+    guard try sealed.directory.isPresent(name) else { return nil }
+    let bytes = try sealed.directory.read(name, maximum: limits.maximumFrozenBytes)
     let checkpoint = try DreamRunEncoding.decode(
       DreamRunEncoding.RecoveryCheckpoint.self, bytes: bytes)
-    guard
+    guard !isPublication || checkpoint.confirmedMain == sealed.run.approvedBase,
       checkpoint
         == (try recoveryCheckpoint(sealed, outcome: outcome, main: checkpoint.confirmedMain)),
       bytes == (try bounded(checkpoint))
@@ -700,11 +702,16 @@ public final class DreamRunStore {
     }
   }
 
-  package func recoverRelocationDecision(role: DreamRelocationRole, decisionID: String) throws -> DreamRelocationDecision? {
+  package func recoverRelocationDecision(role: DreamRelocationRole, decisionID: String) throws
+    -> DreamRelocationDecision?
+  {
     guard operationLock.try() else { throw DreamRunError.busy }
     defer { operationLock.unlock() }
     let lock = try root.openReadLock()
-    defer { _ = flock(lock, LOCK_UN); _ = close(lock) }
+    defer {
+      _ = flock(lock, LOCK_UN)
+      _ = close(lock)
+    }
     guard flock(lock, LOCK_SH | LOCK_NB) == 0 else { throw DreamRunError.busy }
     try root.verifyLock(lock)
     guard try root.isPresent(role.recordName) else { return nil }
@@ -1605,7 +1612,11 @@ public final class DreamRunStore {
   }
 
   private func isMemoryChanged(_ sealed: SealedRun) throws -> Bool {
-    guard !(try sealed.directory.isPresent("decisions.json")) else { return false }
+    if try sealed.directory.isPresent("publication.json")
+      || sealed.directory.isPresent("recovery.json")
+    {
+      return false
+    }
     return try MemoryStore(repo: memoryRepository).approvedCommit() != sealed.run.approvedBase
   }
 
@@ -2370,7 +2381,8 @@ public final class DreamRunStore {
               recoveryCheckpointHash: try completion.recoveryCheckpointHash.map {
                 try SourceDigest($0)
               },
-              recoveryCheckpoint: try enrolledRecovery(sealed, outcome: outcome)))
+              recoveryCheckpoint: try completion.recoveryCheckpointHash == nil
+                ? nil : enrolledRecovery(sealed, outcome: outcome)))
         }
       }
       let hash = SourceDigest(bytes: bytes)
@@ -2535,7 +2547,9 @@ public final class DreamRunStore {
     guard !isOverflow else { throw DreamRunError.staleGeneration }
     let decisions = try DreamRunEncoding.decode(
       DreamRunEncoding.Decisions.self, bytes: decisionsBytes)
-    let enrollment = try enrolledRecovery(sealed, outcome: outcome)
+    let enrollment =
+      try sealed.directory.isPresent("recovery.json")
+      ? enrolledRecovery(sealed, outcome: outcome) : nil
     return DreamRunEncoding.Completion(
       schemaVersion: enrollment == nil ? 2 : 3, admissionHash: sealed.admissionHash.rawValue,
       decisionsHash: SourceDigest(bytes: decisionsBytes).rawValue,
@@ -2616,32 +2630,27 @@ public final class DreamRunStore {
       if isCommitted { throw DreamRunError.corruption }
       return try pending(sealed, reason: .staleUnpublishedPlans, proposals: reports())
     }
-    if !isCommitted, receipts.count != outcome.plans.count, try isRejectionChanged(sealed) {
-      return try dropBatch(sealed, chain: chain)
-    }
-    for plan in outcome.plans where receipts[plan.path] == nil {
-      if isCommitted { throw DreamRunError.corruption }
-      if isCancelled() { return try pending(sealed, reason: .cancelled, proposals: reports()) }
-      guard try memory.approvedCommit() == sealed.run.approvedBase else {
-        try recoverAll()
-        if receipts.count == outcome.plans.count { break }
+    if !isCommitted, enrollment == nil {
+      if try isMemoryChanged(sealed) || isRejectionChanged(sealed) {
         return try dropBatch(sealed, chain: chain)
       }
-      try beforePublication?(plan.path)
+      if isCancelled() { return try pending(sealed, reason: .cancelled, proposals: reports()) }
+      for plan in outcome.plans { try beforePublication?(plan.path) }
+      let checkpoint = try recoveryCheckpoint(
+        sealed, outcome: outcome, main: sealed.run.approvedBase)
       do {
-        _ = try memory.propose(
-          base: plan.base, path: plan.path, replacement: plan.replacement,
-          reason: plan.reason, contradictions: plan.contradictions)
+        try memory.publishSavedProposals(outcome.plans, observedMain: sealed.run.approvedBase) {
+          try self.install(checkpoint, name: "publication.json", directory: sealed.directory)
+        }
       } catch {
-        try recoverAll()
-        if receipts.count != outcome.plans.count,
+        if try !sealed.directory.isPresent("publication.json"),
           try memory.approvedCommit() != sealed.run.approvedBase
         {
           return try dropBatch(sealed, chain: chain)
         }
-        if receipts[plan.path] == nil { throw error }
+        throw error
       }
-      try recover(plan)
+      try recoverAll()
     }
     guard receipts.count == outcome.plans.count else { throw DreamRunError.corruption }
     if !isCommitted, isCancelled() {

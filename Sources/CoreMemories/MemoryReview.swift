@@ -61,6 +61,8 @@ package final class MemoryReviewController {
   private let repositoryDevice: dev_t
   private let stateDevice: dev_t
   private let writer: Int32
+  private let writerLock = NSRecursiveLock()
+  private var writerDepth = 0
   private let operationLock = NSLock()
   var candidates: [String: (AtomicMemoryChange, ReviewAdmission, [String])] = [:]
   var batchPublications: [String: VerifiedMemoryPublication] = [:]
@@ -158,6 +160,7 @@ package final class MemoryReviewController {
       self.binding = binding
       self.repositoryDevice = repoStatus.st_dev
       self.stateDevice = stateStatus.st_dev
+      _ = flock(lock, LOCK_UN)
     } catch {
       _ = flock(lock, LOCK_UN)
       _ = close(lock)
@@ -165,9 +168,24 @@ package final class MemoryReviewController {
     }
   }
 
-  deinit {
-    _ = flock(writer, LOCK_UN)
-    _ = close(writer)
+  deinit { _ = close(writer) }
+
+  func withWriterOwnership<T>(_ operation: () throws -> T) throws -> T {
+    guard writerLock.try() else { throw DreamRunError.busy }
+    defer { writerLock.unlock() }
+    if writerDepth == 0 {
+      guard flock(writer, LOCK_EX | LOCK_NB) == 0 else { throw DreamRunError.busy }
+      do { try root.verifyLock(writer) } catch {
+        _ = flock(writer, LOCK_UN)
+        throw error
+      }
+    }
+    writerDepth += 1
+    defer {
+      writerDepth -= 1
+      if writerDepth == 0 { _ = flock(writer, LOCK_UN) }
+    }
+    return try operation()
   }
 
   package func list() throws -> [MemoryReviewCandidate] {
@@ -437,6 +455,14 @@ package final class MemoryReviewController {
       throw MemoryError("frozen target document changed")
     }
     let bytes = snapshot.documents.first(where: { $0.path == change.path })?.bytes ?? Data()
+    if change.operation == .add {
+      let wording = try MemoryDocument.displayText(change.after)
+      for entry in snapshot.reviewEntries() where entry.path == change.path {
+        if try MemoryDocument.displayText(entry.entry.bytes) == wording {
+          throw MemoryError("equivalent memory is already approved")
+        }
+      }
+    }
     var range = change.locator.map { $0.start..<$0.end }
     if candidates[change.id.rawValue]?.1.recoveryCheckpointHash != nil {
       return try Self.recoveredTarget(change, frozen: frozen, snapshot: snapshot)
@@ -777,9 +803,11 @@ package final class MemoryReviewController {
   }
 
   func withBatchOwnership<T>(_ operation: () throws -> T) throws -> T {
-    guard operationLock.try() else { throw DreamRunError.busy }
-    defer { operationLock.unlock() }
-    return try operation()
+    try withWriterOwnership {
+      guard operationLock.try() else { throw DreamRunError.busy }
+      defer { operationLock.unlock() }
+      return try operation()
+    }
   }
 
   func withBatchSources<T>(
@@ -794,12 +822,14 @@ package final class MemoryReviewController {
   }
 
   func locked<T>(_ operation: () throws -> T) throws -> T {
-    guard operationLock.try() else { throw DreamRunError.busy }
-    defer { operationLock.unlock() }
-    return try store.reviewGit.reviewCheckout().withLeaseState { state in
-      checkoutState = state
-      defer { checkoutState = nil }
-      return try operation()
+    try withWriterOwnership {
+      guard operationLock.try() else { throw DreamRunError.busy }
+      defer { operationLock.unlock() }
+      return try store.reviewGit.reviewCheckout().withLeaseState { state in
+        checkoutState = state
+        defer { checkoutState = nil }
+        return try operation()
+      }
     }
   }
 

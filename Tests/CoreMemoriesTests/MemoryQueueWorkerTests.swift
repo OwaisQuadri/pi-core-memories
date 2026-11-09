@@ -158,7 +158,7 @@ private final class QueueWorkerFixture {
   }
 }
 
-private func queueWorkerConfig(_ fixture: TransactionFixture) throws -> URL {
+func queueWorkerConfig(_ fixture: TransactionFixture) throws -> URL {
   var configuration = MemoryConfiguration.defaults
   configuration.roots = DreamControlRoots(
     state: fixture.state.path, sessions: fixture.sessions.path, memory: fixture.memory.path,
@@ -191,7 +191,10 @@ func queueWorkerReadsCommittedProposalsWhileAWriterIsActive(owner: String) throw
     owner == "review" ? review : owner == "dream" ? fixture.state : queueURL,
     isCreating: false)
   let lock = try root.openReadLock()
-  defer { _ = flock(lock, LOCK_UN); _ = close(lock) }
+  defer {
+    _ = flock(lock, LOCK_UN)
+    _ = close(lock)
+  }
   try #require(flock(lock, LOCK_EX | LOCK_NB) == 0)
   let queueFile = queueURL.appendingPathComponent("queue.json")
   let before = try Data(contentsOf: queueFile)
